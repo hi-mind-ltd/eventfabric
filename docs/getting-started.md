@@ -34,36 +34,54 @@ pnpm build
 
 ## Database setup
 
-### 1. Create the schema
+### Option A: Automatic migration (recommended)
 
-EventFabric stores all data in a dedicated PostgreSQL schema called
-`eventfabric`. Connect to your database and run:
+Call `migrate()` on app startup. It creates all tables, indexes, and the
+`eventfabric` schema automatically. Already-applied migrations are skipped,
+so it's safe to run every time.
 
-```sql
-CREATE SCHEMA IF NOT EXISTS eventfabric;
+```typescript
+import { Pool } from "pg";
+import { migrate } from "@eventfabric/postgres";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+await migrate(pool);
 ```
 
-### 2. Run migrations
+To enable [table partitioning](./partitioning.md) (optional, for large-scale deployments):
 
-The migration files live in `packages/postgres/migrations/`. Apply them in
-order:
+```typescript
+await migrate(pool, {
+  partitioning: { enabled: true, partitionSize: 1_000_000n }
+});
+```
+
+### Option B: Manual SQL
+
+Apply the migration files in `packages/postgres/migrations/` in order:
 
 ```bash
 psql "$DATABASE_URL" -f packages/postgres/migrations/001_init.sql
 psql "$DATABASE_URL" -f packages/postgres/migrations/002_projection_checkpoints.sql
 psql "$DATABASE_URL" -f packages/postgres/migrations/003_outbox_and_dlq.sql
 psql "$DATABASE_URL" -f packages/postgres/migrations/004_snapshots.sql
+psql "$DATABASE_URL" -f packages/postgres/migrations/005_stream_versions.sql
+psql "$DATABASE_URL" -f packages/postgres/migrations/006_performance.sql
 ```
 
-After the migrations complete you will have five tables:
+### Result
+
+After migration you will have these tables:
 
 | Table                                | Purpose                        |
 | ------------------------------------ | ------------------------------ |
 | `eventfabric.events`                 | Append-only event log          |
+| `eventfabric.stream_versions`        | Concurrency gatekeeper         |
 | `eventfabric.projection_checkpoints` | Catch-up / async checkpoints   |
 | `eventfabric.outbox`                 | Transactional outbox           |
 | `eventfabric.outbox_dead_letters`    | Dead letter queue              |
 | `eventfabric.snapshots`              | Aggregate snapshot cache       |
+| `eventfabric.schema_migrations`      | Migration tracking             |
 
 See [Schema Reference](./schema-reference.md) for the full column-level
 documentation.
@@ -156,11 +174,13 @@ maps, and testing patterns.
 ```typescript
 // app.ts
 import { Pool } from "pg";
-import { PgEventStore, SessionFactory } from "@eventfabric/postgres";
+import { PgEventStore, SessionFactory, migrate } from "@eventfabric/postgres";
 import { CounterAggregate } from "./domain/counter.aggregate";
 import type { CounterEvent } from "./domain/counter.events";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+await migrate(pool); // creates all tables on first run, no-op after
+
 const store = new PgEventStore<CounterEvent>();
 
 // Configure the factory once at startup.
@@ -197,13 +217,7 @@ docker run --name ef-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:1
 # Set the connection string
 export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/postgres"
 
-# Run migrations
-psql "$DATABASE_URL" -f packages/postgres/migrations/001_init.sql
-psql "$DATABASE_URL" -f packages/postgres/migrations/002_projection_checkpoints.sql
-psql "$DATABASE_URL" -f packages/postgres/migrations/003_outbox_and_dlq.sql
-psql "$DATABASE_URL" -f packages/postgres/migrations/004_snapshots.sql
-
-# Build and run
+# Build and run (migrations run automatically on startup)
 pnpm install
 pnpm build
 cd examples/banking-api

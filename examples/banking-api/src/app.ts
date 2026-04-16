@@ -8,7 +8,8 @@ import {
   createAsyncProjectionRunner,
   createCatchUpProjector,
   SessionFactory,
-  query
+  query,
+  migrate
 } from "@eventfabric/postgres";
 import { sleep, withConcurrencyRetry } from "@eventfabric/core";
 import { AccountAggregate, type AccountState } from "./domain/account.aggregate";
@@ -26,6 +27,7 @@ import {
 import { depositAuditProjection } from "./projections/deposit-audit";
 import { createDlqRouter } from "./ops/dlq-router";
 import { createOutboxOpsRouter } from "./ops/outbox-ops-router";
+import { createPartitionOpsRouter } from "./ops/partition-ops-router";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 // The upcaster is applied to every loaded event payload. Historical
@@ -555,9 +557,25 @@ app.get("/accounts/with-customers", async (req, res) => {
 // ========== Operations Endpoints ==========
 app.use("/ops/dlq", createDlqRouter(dlq));
 app.use("/ops/outbox", createOutboxOpsRouter(outboxStats));
+app.use("/ops/partitions", createPartitionOpsRouter(pool));
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`🏦 Banking API listening on :${PORT}`);
-  console.log(`📧 Email notifications enabled`);
+
+async function start() {
+  const result = await migrate(pool);
+  if (result.applied.length > 0) {
+    console.log(`Applied migrations: ${result.applied.join(", ")}`);
+  }
+  if (result.partitioned) {
+    console.log("Events table is partitioned");
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Banking API listening on :${PORT}`);
+  });
+}
+
+start().catch((err) => {
+  console.error("Failed to start:", err);
+  process.exit(1);
 });

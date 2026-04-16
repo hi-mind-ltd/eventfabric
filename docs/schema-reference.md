@@ -14,21 +14,32 @@ Run this before any migration. Migration `001_init.sql` includes this statement.
 
 ## Migration file listing
 
-| File                            | Creates                                                        |
+| File                            | Creates / Modifies                                             |
 | ------------------------------- | -------------------------------------------------------------- |
 | `001_init.sql`                  | `eventfabric` schema, `eventfabric.events` table, 2 indexes   |
 | `002_projection_checkpoints.sql`| `eventfabric.projection_checkpoints` table                     |
 | `003_outbox_and_dlq.sql`        | `eventfabric.outbox` table (3 indexes), `eventfabric.outbox_dead_letters` table (1 index) |
 | `004_snapshots.sql`             | `eventfabric.snapshots` table, 1 index                         |
+| `005_stream_versions.sql`       | `eventfabric.stream_versions` table (concurrency gatekeeper), backfills from existing events |
+| `006_performance.sql`           | Partial index on outbox, aggressive autovacuum on outbox, covering index on events |
+| `007_partitioning.sql`          | Drops UNIQUE constraints on events table (required for partitioning) |
 
-All migrations are idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF
-NOT EXISTS`). Apply them in numeric order:
+All migrations are idempotent. Apply them in numeric order, or use `migrate(pool)`:
 
 ```bash
 psql "$DATABASE_URL" -f packages/postgres/migrations/001_init.sql
 psql "$DATABASE_URL" -f packages/postgres/migrations/002_projection_checkpoints.sql
 psql "$DATABASE_URL" -f packages/postgres/migrations/003_outbox_and_dlq.sql
 psql "$DATABASE_URL" -f packages/postgres/migrations/004_snapshots.sql
+psql "$DATABASE_URL" -f packages/postgres/migrations/005_stream_versions.sql
+psql "$DATABASE_URL" -f packages/postgres/migrations/006_performance.sql
+```
+
+Or programmatically:
+
+```typescript
+import { migrate } from "@eventfabric/postgres";
+await migrate(pool);
 ```
 
 ---
@@ -61,15 +72,56 @@ The append-only event log. Every domain event ever recorded lives here.
 | Constraint                                              | Type       | Description                                                     |
 | ------------------------------------------------------- | ---------- | --------------------------------------------------------------- |
 | `events_pkey` (implicit)                                | PRIMARY KEY | `(global_position)`. Guarantees global ordering.               |
-| `events_event_id_key` (implicit)                        | UNIQUE     | `(event_id)`. Prevents duplicate event IDs.                    |
-| `events_aggregate_name_aggregate_id_aggregate_version_key` | UNIQUE | `(aggregate_name, aggregate_id, aggregate_version)`. Enforces optimistic concurrency -- two events cannot claim the same version slot in the same stream. |
+
+The following UNIQUE constraints are created by `001_init.sql` but **dropped by `007_partitioning.sql`** when preparing for table partitioning. They are not the concurrency mechanism — the `stream_versions` table handles that (see below).
+
+| Constraint (dropped by 007)                             | Type       | Description                                                     |
+| ------------------------------------------------------- | ---------- | --------------------------------------------------------------- |
+| `events_event_id_key`                                   | UNIQUE     | `(event_id)`. Defense-in-depth; UUIDs are globally unique.     |
+| `events_aggregate_name_aggregate_id_aggregate_version_key` | UNIQUE | `(aggregate_name, aggregate_id, aggregate_version)`. Superseded by `stream_versions` since migration 005. |
 
 ### Indexes
 
-| Index name          | Columns                                                    | Purpose                                                          |
-| ------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------- |
-| `events_stream_idx` | `(aggregate_name, aggregate_id, aggregate_version)`        | Fast stream loads (`loadStream`). Covers the common query `WHERE aggregate_name = $1 AND aggregate_id = $2 AND aggregate_version >= $3 ORDER BY aggregate_version ASC`. |
-| `events_global_idx` | `(global_position)`                                        | Fast global position reads (`loadGlobal`). Covers the query `WHERE global_position > $1 ORDER BY global_position ASC LIMIT $2`. |
+| Index name                      | Columns                                                    | Purpose                                                          |
+| ------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------- |
+| `events_stream_covering_idx` (006) | `(aggregate_name, aggregate_id, aggregate_version)` INCLUDE `(event_id, type, version, payload, occurred_at, dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id)` | **Covering index** for `loadStream`. Enables index-only scans — no heap access for the most common read path. Replaces the original `events_stream_idx`. |
+| `events_global_idx`             | `(global_position)`                                        | Fast global position reads (`loadGlobal`). Covers the query `WHERE global_position > $1 ORDER BY global_position ASC LIMIT $2`. |
+
+---
+
+## Table: eventfabric.stream_versions
+
+The concurrency gatekeeper. One row per aggregate stream, tracking the current
+version. Every `append()` call performs an atomic `UPDATE ... WHERE current_version = expected`
+on this table before inserting events. Created by `005_stream_versions.sql`.
+
+### Columns
+
+| Column              | Type          | Nullable | Default  | Description                                                       |
+| ------------------- | ------------- | -------- | -------- | ----------------------------------------------------------------- |
+| `aggregate_name`    | `TEXT`        | NOT NULL | --       | The static `aggregateName` of the aggregate class. Part of the composite primary key. |
+| `aggregate_id`      | `TEXT`        | NOT NULL | --       | The identity of the aggregate instance. Part of the composite primary key. |
+| `current_version`   | `INT`         | NOT NULL | `0`      | The latest committed `aggregate_version` for this stream. Updated atomically on every append. |
+| `created_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`  | Timestamp when the stream was first created.                     |
+| `updated_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`  | Timestamp of the last append to this stream.                     |
+
+### Constraints
+
+| Constraint                 | Type        | Description                                                     |
+| -------------------------- | ----------- | --------------------------------------------------------------- |
+| `stream_versions_pkey`     | PRIMARY KEY | `(aggregate_name, aggregate_id)`. One row per stream. PK violation on INSERT catches duplicate stream creation. |
+
+### Design notes
+
+This table is intentionally **small and unpartitioned** — it holds one row per
+aggregate stream, not one row per event. It serves as the single atomic
+concurrency gate, replacing the previous `SELECT MAX(version)` + UNIQUE
+constraint approach. See [Concurrency](./concurrency.md) for the full
+explanation.
+
+This pattern is used by Marten DB (`mt_streams`), SQLStreamStore (`Streams`),
+and EventStoreDB (internal stream metadata). Keeping it separate from the events
+table enables [Partitioning](./partitioning.md) of the events table.
 
 ---
 
@@ -124,11 +176,21 @@ runners claim rows, process them, and delete them on success.
 
 ### Indexes
 
-| Index name          | Columns                                       | Purpose                                                    |
-| ------------------- | --------------------------------------------- | ---------------------------------------------------------- |
-| `outbox_ready_idx`  | `(dead_lettered_at, locked_at, id)`            | Claiming unprocessed rows. The `claimBatch` query filters `WHERE dead_lettered_at IS NULL AND locked_at IS NULL ORDER BY id LIMIT $1`. |
-| `outbox_topic_idx`  | `(topic)`                                      | Filtering by topic when claiming with a topic constraint.  |
-| `outbox_global_idx` | `(global_position)`                            | Looking up the event for a given outbox row.               |
+| Index name                | Columns                                       | Purpose                                                    |
+| ------------------------- | --------------------------------------------- | ---------------------------------------------------------- |
+| `outbox_claimable_idx` (006) | `(id ASC) WHERE dead_lettered_at IS NULL AND locked_at IS NULL` | **Partial index** for `claimBatch`. Only indexes the "claimable" subset of rows — typically a tiny fraction of the table. Replaces the original `outbox_ready_idx`. |
+| `outbox_topic_idx`        | `(topic)`                                      | Filtering by topic when claiming with a topic constraint.  |
+| `outbox_global_idx`       | `(global_position)`                            | Looking up the event for a given outbox row.               |
+
+### Performance tuning (006)
+
+The outbox table has aggressive autovacuum settings applied by `006_performance.sql`:
+
+| Setting | Value | Default | Why |
+|---------|-------|---------|-----|
+| `autovacuum_vacuum_scale_factor` | `0.01` | `0.2` | Trigger vacuum after 1% dead tuples (vs 20%). The outbox has heavy UPDATE/DELETE churn from claim/ack. |
+| `autovacuum_analyze_scale_factor` | `0.005` | `0.1` | Re-analyze after 0.5% changes. Keeps the planner's statistics fresh. |
+| `autovacuum_vacuum_cost_delay` | `0` | `2ms` | No throttling. The outbox is transient and must stay compact for `FOR UPDATE SKIP LOCKED` performance. |
 
 ---
 
@@ -237,8 +299,10 @@ the events table during outbox operations.
 
 ## Related documentation
 
-- [Getting Started](./getting-started.md) -- Running migrations
-- [Event Store](./event-store.md) -- `PgEventStore` API that reads/writes `eventfabric.events`
-- [Snapshots](./snapshots.md) -- `PgSnapshotStore` API for `eventfabric.snapshots`
-- [Core Concepts](./core-concepts.md) -- Transactional outbox pattern
-- [Sessions](./sessions.md) -- How the session integrates with these tables
+- [Getting Started](./getting-started.md) — Running migrations
+- [Event Store](./event-store.md) — `PgEventStore` API that reads/writes `eventfabric.events`
+- [Concurrency](./concurrency.md) — How `stream_versions` ensures consistency
+- [Partitioning](./partitioning.md) — Range partitioning the events table
+- [Snapshots](./snapshots.md) — `PgSnapshotStore` API for `eventfabric.snapshots`
+- [Core Concepts](./core-concepts.md) — Transactional outbox pattern
+- [Sessions](./sessions.md) — How the session integrates with these tables

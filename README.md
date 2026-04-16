@@ -41,7 +41,11 @@ class Account extends AggregateRoot<{ balance: number }, AccountEvent> {
 }
 
 // 3. Use it
+import { migrate } from "@eventfabric/postgres";
+
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+await migrate(pool); // creates all tables on first run, no-op after
+
 const store = new PgEventStore<AccountEvent>();
 const factory = new SessionFactory(pool, store);
 factory.registerAggregate(Account, ["Opened", "Deposited"]);
@@ -91,6 +95,7 @@ await session.saveChangesAsync();
 
 - [Observability](docs/observability.md) — runner observers, OpenTelemetry adapter, custom hooks
 - [Schema Reference](docs/schema-reference.md) — all `eventfabric.*` tables, columns, indexes
+- [Partitioning](docs/partitioning.md) — range partitioning, `PgPartitionManager`, archival
 
 ### Architecture
 
@@ -98,15 +103,12 @@ await session.saveChangesAsync();
 
 ## Database Schema
 
-EventFabric uses a dedicated PostgreSQL schema. Create it before running migrations:
-
-```sql
-CREATE SCHEMA IF NOT EXISTS eventfabric;
-```
+`migrate(pool)` creates all tables automatically. For manual setup, see [Getting Started](docs/getting-started.md).
 
 | Table | Purpose |
 |---|---|
 | `eventfabric.events` | Append-only event log with global ordering |
+| `eventfabric.stream_versions` | Concurrency gatekeeper (one row per stream) |
 | `eventfabric.outbox` | Transactional outbox for at-least-once async delivery |
 | `eventfabric.outbox_dead_letters` | Dead-letter queue for poison messages |
 | `eventfabric.projection_checkpoints` | Per-projection progress tracking |
