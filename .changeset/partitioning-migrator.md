@@ -1,7 +1,7 @@
 ---
-"@eventfabric/core": minor
-"@eventfabric/postgres": minor
-"@eventfabric/opentelemetry": minor
+"@eventfabric/core": patch
+"@eventfabric/postgres": patch
+"@eventfabric/opentelemetry": patch
 ---
 
 Add partitioning, migrator, and performance optimizations
