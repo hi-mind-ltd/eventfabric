@@ -195,8 +195,8 @@ describe("Session", () => {
       factory.registerAggregate(AccountAggregate, [
         "AccountOpened",
         "AccountDeposited"
-      ]);
-      factory.registerAggregate(TransactionAggregate, ["TransactionStarted"]);
+      ], "account");
+      factory.registerAggregate(TransactionAggregate, ["TransactionStarted"], "transaction");
     }).not.toThrow();
   });
 
@@ -210,7 +210,7 @@ describe("Session", () => {
     // unused-directive check fails and CI signals the regression.
 
     // Exhaustive: compiles and passes exhaustiveness check
-    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"]);
+    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account");
 
     // Missing "AccountDeposited"
     // @ts-expect-error — tuple is missing AccountDeposited
@@ -246,7 +246,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ]);
+    ], "account");
 
     const session = factory.createSession();
 
@@ -293,7 +293,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ]);
+    ], "account");
 
     const accountId = "acc-1";
     
@@ -334,7 +334,7 @@ describe("Session", () => {
     const store = new PgEventStore<TestEvent>();
     const factory = new SessionFactory(pool, store);
 
-    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"]);
+    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account");
 
     const accountId = "acc-double-load";
 
@@ -403,8 +403,8 @@ describe("Session", () => {
     const store = new PgEventStore<TestEvent>();
     const factory = new SessionFactory(pool, store);
 
-    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"]);
-    factory.registerAggregate(TransactionAggregate, ["TransactionStarted"]);
+    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account");
+    factory.registerAggregate(TransactionAggregate, ["TransactionStarted"], "transaction");
 
     const session = factory.createSession();
 
@@ -438,7 +438,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ]);
+    ], "account");
 
     const session = factory.createSession();
 
@@ -522,7 +522,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ]);
+    ], "account");
 
     const session = factory.createSession();
 
@@ -575,7 +575,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ]);
+    ], "account");
 
     const session = factory.createSession();
 
@@ -599,12 +599,12 @@ describe("Session", () => {
     );
     expect(events.rowCount).toBe(1);
 
-    // Verify events were automatically enqueued to outbox (topic is null)
+    // Verify events were automatically enqueued to outbox with registered topic
     const outbox = await pool.query(
       `SELECT * FROM eventfabric.outbox ORDER BY global_position`
     );
     expect(outbox.rowCount).toBe(1);
-    expect(outbox.rows[0].topic).toBeNull();
+    expect(outbox.rows[0].topic).toBe("account");
   });
 
   it("should automatically enqueue to outbox when appending to stream", async () => {
@@ -614,7 +614,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ]);
+    ], "account");
 
     const session = factory.createSession();
 
@@ -645,13 +645,75 @@ describe("Session", () => {
     session.append(accountId, 1, accountDeposited);
     await session.saveChangesAsync();
 
-    // Verify events were automatically enqueued to outbox (topic is null)
+    // Verify events were automatically enqueued to outbox with registered topic
     const outbox = await pool.query(
       `SELECT * FROM eventfabric.outbox ORDER BY global_position`
     );
     expect(outbox.rowCount).toBe(2); // Both events should be in outbox
-    expect(outbox.rows[0].topic).toBeNull();
-    expect(outbox.rows[1].topic).toBeNull();
+    expect(outbox.rows[0].topic).toBe("account");
+    expect(outbox.rows[1].topic).toBe("account");
+  });
+
+  it("should set outbox topic from registerAggregate config", async () => {
+    const store = new PgEventStore<TestEvent>();
+    const factory = new SessionFactory(pool, store);
+
+    factory.registerAggregate(AccountAggregate, [
+      "AccountOpened",
+      "AccountDeposited"
+    ], "account");
+
+    const session = factory.createSession();
+    session.startStream("acc-topic", {
+      type: "AccountOpened",
+      version: 1,
+      accountId: "acc-topic",
+      customerId: "cust-1",
+      initialBalance: 100,
+      currency: "USD"
+    } as AccountOpenedV1);
+    await session.saveChangesAsync();
+
+    const outbox = await pool.query(
+      `SELECT topic FROM eventfabric.outbox ORDER BY global_position`
+    );
+    expect(outbox.rowCount).toBe(1);
+    expect(outbox.rows[0].topic).toBe("account");
+  });
+
+  it("should set outbox topic when saving tracked aggregate changes", async () => {
+    const store = new PgEventStore<TestEvent>();
+    const factory = new SessionFactory(pool, store);
+
+    factory.registerAggregate(AccountAggregate, [
+      "AccountOpened",
+      "AccountDeposited"
+    ], "account");
+
+    // Seed
+    const session1 = factory.createSession();
+    session1.startStream("acc-topic-2", {
+      type: "AccountOpened",
+      version: 1,
+      accountId: "acc-topic-2",
+      customerId: "cust-1",
+      initialBalance: 100,
+      currency: "USD"
+    } as AccountOpenedV1);
+    await session1.saveChangesAsync();
+
+    // Load, mutate, save
+    const session2 = factory.createSession();
+    const account = await session2.loadAggregateAsync<AccountAggregate>("acc-topic-2");
+    account.deposit(50);
+    await session2.saveChangesAsync();
+
+    const outbox = await pool.query(
+      `SELECT topic FROM eventfabric.outbox ORDER BY global_position`
+    );
+    expect(outbox.rowCount).toBe(2);
+    expect(outbox.rows[0].topic).toBe("account");
+    expect(outbox.rows[1].topic).toBe("account");
   });
 
   it("should use snapshot store when registered and loading aggregate", async () => {
@@ -662,7 +724,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ], snapshotStore);
+    ], "account", { snapshotStore });
 
     const accountId = "acc-1";
     
@@ -735,7 +797,7 @@ describe("Session", () => {
       factory.registerAggregate(AccountAggregate, [
         "AccountOpened",
         "AccountDeposited"
-      ], snapshotStore);
+      ], "account", { snapshotStore });
     }).not.toThrow();
   });
 
@@ -747,7 +809,7 @@ describe("Session", () => {
       factory.registerAggregate(AccountAggregate, [
         "AccountOpened",
         "AccountDeposited"
-      ]); // No snapshot store provided
+      ], "account"); // No snapshot store provided
     }).not.toThrow();
   });
 
@@ -760,7 +822,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ], snapshotStore);
+    ], "account", { snapshotStore });
 
     const accountId = "acc-1";
     
@@ -813,7 +875,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ]); // No snapshot store
+    ], "account"); // No snapshot store
 
     const accountId = "acc-1";
     
@@ -848,12 +910,12 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ], accountSnapshotStore);
+    ], "account", { snapshotStore: accountSnapshotStore });
 
     // Register Transaction with different snapshot store
     factory.registerAggregate(TransactionAggregate, [
       "TransactionStarted"
-    ], transactionSnapshotStore);
+    ], "transaction", { snapshotStore: transactionSnapshotStore });
 
     const accountId = "acc-1";
     const transactionId = "tx-1";
@@ -902,7 +964,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ]);
+    ], "account");
 
     const inlineProjector = new InlineProjector<TestEvent, PgTx>([
       {
@@ -970,7 +1032,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ], snapshotStore, { everyNEvents: 1 }, 1);
+    ], "account", { snapshotStore, snapshotPolicy: { everyNEvents: 1 }, snapshotSchemaVersion: 1 });
 
     const accountId = "acc-snap-policy";
 
@@ -1019,7 +1081,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ], snapshotStore, { everyNEvents: 1 }, 1);
+    ], "account", { snapshotStore, snapshotPolicy: { everyNEvents: 1 }, snapshotSchemaVersion: 1 });
 
     const accountId = "acc-live";
 
@@ -1055,7 +1117,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ], snapshotStore, { everyNEvents: 1 }, 1);
+    ], "account", { snapshotStore, snapshotPolicy: { everyNEvents: 1 }, snapshotSchemaVersion: 1 });
 
     const accountId = "acc-snapshot";
 
@@ -1089,7 +1151,7 @@ describe("Session", () => {
     factory.registerAggregate(AccountAggregate, [
       "AccountOpened",
       "AccountDeposited"
-    ]);
+    ], "account");
 
     const accountId = "acc-append-unsafe";
 

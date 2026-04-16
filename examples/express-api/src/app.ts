@@ -2,7 +2,8 @@ import express from "express";
 import { Pool } from "pg";
 import { PgEventStore, PgSnapshotStore, PgDlqService, PgOutboxStatsService, SessionFactory } from "@eventfabric/postgres";
 import { UserAggregate, type UserState } from "./domain/user.aggregate";
-import type { UserEvent, UserRegisteredV2, UserEmailChangedV1 } from "./domain/user.events";
+import type { UserEvent } from "./domain/user.events";
+import { UserRegistered } from "./domain/user.events";
 import { createDlqRouter } from "./ops/dlq-router.example";
 import { createOutboxOpsRouter } from "./ops/outbox-ops-router.example";
 
@@ -17,7 +18,7 @@ const sessionFactory = new SessionFactory<UserEvent>(pool, store);
 sessionFactory.registerAggregate(UserAggregate, [
   "UserRegistered",
   "UserEmailChanged"
-], snapshotStore);
+], "user", { snapshotStore });
 
 const dlq = new PgDlqService(pool);
 const outboxStats = new PgOutboxStatsService(pool);
@@ -32,17 +33,8 @@ app.post("/users/:id/register", async (req, res) => {
     const id = req.params.id;
     const { email, displayName } = req.body;
     
-    // Marten-style API: Start a new stream with typed events
-    const userRegistered: UserRegisteredV2 = {
-      type: "UserRegistered",
-      version: 2,
-      userId: id,
-      email,
-      displayName
-    };
-    
     // Start a new stream and commit
-    session.startStream(id, userRegistered);
+    session.startStream(id, UserRegistered({ userId: id, email, displayName }));
     await session.saveChangesAsync();
     
     res.json({ ok: true, userId: id, email, displayName });

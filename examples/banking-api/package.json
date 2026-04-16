@@ -13,11 +13,13 @@
     "@types/express": "^4.17.21",
     "@types/node": "^20.17.10",
     "@types/pg": "^8.11.10",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
   },
   "scripts": {
     "start": "node --enable-source-maps dist/app.js",
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx watch src/app.ts"
+    "dev": "tsx watch src/app.ts",
+    "test": "vitest run"
   }
 }

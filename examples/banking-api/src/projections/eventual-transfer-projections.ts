@@ -1,7 +1,9 @@
 import type { CatchUpProjection, EventEnvelope } from "@eventfabric/core";
 import type { BankingEvent } from "../domain/events";
 import type { AccountEvent } from "../domain/account.events";
+import { WithdrawalCompleted, DepositCompleted } from "../domain/account.events";
 import type { TransactionEvent } from "../domain/transaction.events";
+import { TransactionFailed, TransactionCompleted } from "../domain/transaction.events";
 import type { PgTx } from "@eventfabric/postgres";
 import { PgEventStore } from "@eventfabric/postgres";
 import { AccountAggregate } from "../domain/account.aggregate";
@@ -56,15 +58,12 @@ export function createWithdrawalProjection(
         );
 
         transaction.fail(`Insufficient funds in account ${event.fromAccountId}`);
-        const failEvents = transaction.pullPendingEvents();
-        if (failEvents.length > 0) {
-          await eventStore.append(tx, {
-            aggregateName: "Transaction",
-            aggregateId: transaction.id,
-            expectedAggregateVersion: transaction.version,
-            events: failEvents
-          });
-        }
+        await eventStore.append(tx, {
+          aggregateName: "Transaction",
+          aggregateId: transaction.id,
+          expectedAggregateVersion: transaction.version,
+          events: transaction.pullPendingEvents()
+        });
         return;
       }
 
@@ -85,21 +84,17 @@ export function createWithdrawalProjection(
 
       // Emit WithdrawalCompleted — the deposit projection's handler will
       // pick this up on its next catch-up tick (no outbox, no topic).
-      const withdrawalCompletedEvent: BankingEvent = {
-        type: "WithdrawalCompleted",
-        version: 1,
-        accountId: event.fromAccountId,
-        transactionId: event.transactionId,
-        amount: event.amount,
-        balance: newBalance,
-        completedAt: new Date().toISOString()
-      };
-
       await eventStore.append(tx, {
         aggregateName: "Account",
         aggregateId: account.id,
         expectedAggregateVersion: account.version,
-        events: [withdrawalCompletedEvent]
+        events: [WithdrawalCompleted({
+          accountId: event.fromAccountId,
+          transactionId: event.transactionId,
+          amount: event.amount,
+          balance: newBalance,
+          completedAt: new Date().toISOString()
+        })]
       });
     }
   };
@@ -147,21 +142,17 @@ export function createDepositProjection(
         account.version = result.nextAggregateVersion;
       }
 
-      const depositCompletedEvent: BankingEvent = {
-        type: "DepositCompleted",
-        version: 1,
-        accountId: transaction.state.toAccountId,
-        transactionId: event.transactionId,
-        amount: event.amount,
-        balance: newBalance,
-        completedAt: new Date().toISOString()
-      };
-
       await eventStore.append(tx, {
         aggregateName: "Account",
         aggregateId: account.id,
         expectedAggregateVersion: account.version,
-        events: [depositCompletedEvent]
+        events: [DepositCompleted({
+          accountId: transaction.state.toAccountId!,
+          transactionId: event.transactionId,
+          amount: event.amount,
+          balance: newBalance,
+          completedAt: new Date().toISOString()
+        })]
       });
     }
   };

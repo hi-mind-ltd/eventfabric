@@ -46,7 +46,7 @@ export class TransactionAggregate extends AggregateRoot<TransactionState, Transa
   }
 
   initiate(fromAccountId: string, toAccountId: string, amount: number, currency: string = "USD", description?: string) {
-    if (this.state.status !== "pending" && this.state.fromAccountId) {
+    if (this.state.fromAccountId) {
       throw new Error("Transaction already initiated");
     }
     if (amount <= 0) {
@@ -115,7 +115,7 @@ export class TransactionAggregate extends AggregateRoot<TransactionState, Transa
   }
 
   fail(reason: string) {
-    if (this.state.status !== "pending") {
+    if (this.state.status !== "pending" && this.state.status !== "started") {
       throw new Error(`Cannot fail transaction in ${this.state.status} status`);
     }
     this.raise({
