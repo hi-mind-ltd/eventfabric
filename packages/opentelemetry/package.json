@@ -7,7 +7,7 @@
     "url": "https://github.com/hi-mind-ltd/eventfabric",
     "directory": "packages/opentelemetry"
   },
-  "version": "0.1.2",
+  "version": "0.1.4",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

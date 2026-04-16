@@ -1,5 +1,12 @@
 # @eventfabric/postgres
 
+## 0.1.4
+
+### Patch Changes
+
+- Updated dependencies [3ba92d4]
+  - @eventfabric/core@0.1.4
+
 ## 0.1.3
 
 ### Patch Changes
