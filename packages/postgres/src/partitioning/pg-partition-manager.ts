@@ -133,7 +133,7 @@ export class PgPartitionManager {
    * Use this to pre-create partitions before the current one fills up.
    */
   async createPartition(pool: Pool, from: bigint, to: bigint): Promise<string> {
-    const name = `${this.table}_p_${from}_${to}`;
+    const name = this.assertSafeIdentifier(`${this.table}_p_${from}_${to}`, "partition name");
     await pool.query(`
       CREATE TABLE IF NOT EXISTS ${this.schema}.${name}
         PARTITION OF ${this.qualifiedTable}
@@ -147,9 +147,10 @@ export class PgPartitionManager {
    * standalone table that can be archived, moved to cold storage, or dropped.
    */
   async detachPartition(pool: Pool, partitionName: string): Promise<void> {
+    const safePartitionName = this.assertSafeIdentifier(partitionName, "partition name");
     await pool.query(`
       ALTER TABLE ${this.qualifiedTable}
-        DETACH PARTITION ${this.schema}.${partitionName}
+        DETACH PARTITION ${this.schema}.${safePartitionName}
     `);
   }
 
@@ -212,5 +213,12 @@ export class PgPartitionManager {
       `SELECT COALESCE(MAX(global_position), 0)::bigint AS max_pos FROM ${this.qualifiedTable}`
     );
     return BigInt(res.rows[0].max_pos);
+  }
+
+  private assertSafeIdentifier(value: string, label: string): string {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+      throw new Error(`Invalid ${label}: ${value}`);
+    }
+    return value;
   }
 }
