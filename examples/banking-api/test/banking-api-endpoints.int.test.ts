@@ -12,6 +12,18 @@ import {
 } from "@eventfabric/postgres";
 import type { PgTx } from "@eventfabric/postgres";
 import { withConcurrencyRetry } from "@eventfabric/core";
+import {
+  BasicTracerProvider,
+  InMemorySpanExporter,
+  SimpleSpanProcessor
+} from "@opentelemetry/sdk-trace-base";
+import {
+  MeterProvider,
+  InMemoryMetricExporter,
+  PeriodicExportingMetricReader,
+  AggregationTemporality
+} from "@opentelemetry/sdk-metrics";
+import { createCatchUpObserver } from "@eventfabric/opentelemetry";
 import { AccountAggregate, type AccountState } from "../src/domain/account.aggregate";
 import { TransactionAggregate, type TransactionState } from "../src/domain/transaction.aggregate";
 import { CustomerAggregate, type CustomerState } from "../src/domain/customer.aggregate";
@@ -567,7 +579,7 @@ describe("eventual transfer (POST /transfers/eventual)", () => {
 
     const start = Date.now();
     let prev = -1;
-    let current = await countEvents();
+    let current: number;
     while (Date.now() - start < 10000) {
       await projector.catchUpAll(projections, { batchSize: 100 });
       current = await countEvents();
@@ -1232,4 +1244,136 @@ describe("ops: outbox stats service", () => {
     const result = await stats.getBacklogStats();
     expect(result).toBeDefined();
   });
+});
+
+// ============================================================================
+// OpenTelemetry: catch-up observer produces spans and metrics
+// ============================================================================
+
+describe("opentelemetry: catch-up observer", () => {
+  it("produces spans when the catch-up projector processes events", async () => {
+    await createAccount("acc-otel-span", "cust-1", 100);
+
+    const session = sessionFactory.createSession();
+    const acc = await session.loadAggregateAsync<AccountAggregate>("acc-otel-span");
+    acc.deposit(50);
+    await session.saveChangesAsync();
+
+    // Set up OTel tracer with in-memory exporter
+    const spanExporter = new InMemorySpanExporter();
+    const tracerProvider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(spanExporter)]
+    });
+
+    const observer = createCatchUpObserver({
+      tracer: tracerProvider.getTracer("test")
+    });
+
+    // Run deposit audit projection with observer
+    const projector = createCatchUpProjector<BankingEvent>(pool, store);
+    await projector.catchUpAll([depositAuditProjection], { batchSize: 100, observer });
+
+    const spans = spanExporter.getFinishedSpans();
+    expect(spans.length).toBeGreaterThan(0);
+
+    // All spans should be named after the projection
+    const auditSpans = spans.filter(s => s.name === "deposit-audit.handle");
+    expect(auditSpans.length).toBeGreaterThan(0);
+
+    // Span should have the correct attributes
+    const span = auditSpans[0]!;
+    expect(span.attributes["eventfabric.projection"]).toBe("deposit-audit");
+    expect(span.attributes["eventfabric.runner"]).toBe("catch_up");
+  });
+
+  it("produces metrics when the catch-up projector processes events", async () => {
+    await createAccount("acc-otel-metric", "cust-1", 200);
+
+    const session = sessionFactory.createSession();
+    const acc = await session.loadAggregateAsync<AccountAggregate>("acc-otel-metric");
+    acc.deposit(75);
+    await session.saveChangesAsync();
+
+    // Set up OTel meter with in-memory exporter
+    const spanExporter = new InMemorySpanExporter();
+    const tracerProvider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(spanExporter)]
+    });
+    const metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const metricReader = new PeriodicExportingMetricReader({
+      exporter: metricExporter,
+      exportIntervalMillis: 60_000
+    });
+    const meterProvider = new MeterProvider({ readers: [metricReader] });
+
+    const observer = createCatchUpObserver({
+      tracer: tracerProvider.getTracer("test"),
+      meter: meterProvider.getMeter("test")
+    });
+
+    const projector = createCatchUpProjector<BankingEvent>(pool, store);
+    await projector.catchUpAll([depositAuditProjection], { batchSize: 100, observer });
+
+    // Force flush metrics
+    await metricReader.forceFlush();
+    const allMetrics = metricExporter
+      .getMetrics()
+      .flatMap(m => m.scopeMetrics.flatMap(s => s.metrics));
+
+    const handled = allMetrics.find(m => m.descriptor.name === "eventfabric.catch_up.events_handled");
+    expect(handled).toBeDefined();
+
+    const batchesLoaded = allMetrics.find(m => m.descriptor.name === "eventfabric.catch_up.batches_loaded");
+    expect(batchesLoaded).toBeDefined();
+  });
+
+  it("records spans for the full transfer chain", async () => {
+    await createAccount("acc-otel-chain-A", "cust-A", 500);
+    await createAccount("acc-otel-chain-B", "cust-B", 50);
+    await createTransaction("tx-otel-chain", "acc-otel-chain-A", "acc-otel-chain-B", 100);
+
+    const session = sessionFactory.createSession();
+    const tx = await session.loadAggregateAsync<TransactionAggregate>("tx-otel-chain");
+    tx.start();
+    await session.saveChangesAsync();
+
+    const spanExporter = new InMemorySpanExporter();
+    const tracerProvider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(spanExporter)]
+    });
+
+    const observer = createCatchUpObserver({
+      tracer: tracerProvider.getTracer("test")
+    });
+
+    // Drive the catch-up projector with observer until fixed point
+    const projections = [
+      createWithdrawalProjection(store),
+      createDepositProjection(store),
+      createTransactionCompletionProjection(store)
+    ];
+    const projector = createCatchUpProjector<BankingEvent>(pool, store);
+
+    const countEvents = async () => {
+      const { rows } = await pool.query(`SELECT COUNT(*)::int AS c FROM eventfabric.events`);
+      return rows[0]?.c ?? 0;
+    };
+
+    const start = Date.now();
+    let prev = -1;
+    let current: number;
+    while (Date.now() - start < 10000) {
+      await projector.catchUpAll(projections, { batchSize: 100, observer });
+      current = await countEvents();
+      if (current === prev) break;
+      prev = current;
+    }
+
+    const spans = spanExporter.getFinishedSpans();
+    // Should have spans for withdrawal-handler, deposit-handler, and transaction-completion-handler
+    const projectionNames = [...new Set(spans.map(s => s.attributes["eventfabric.projection"]))];
+    expect(projectionNames).toContain("withdrawal-handler");
+    expect(projectionNames).toContain("deposit-handler");
+    expect(projectionNames).toContain("transaction-completion-handler");
+  }, 15000);
 });
