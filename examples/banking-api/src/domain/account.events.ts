@@ -104,3 +104,28 @@ export type AccountEvent =
   | AccountTransferredOutV1
   | AccountTransferredInV1
   | AccountClosedV1;
+
+// Factory functions — type and version are baked in
+export const AccountOpened = (data: Omit<AccountOpenedV2, "type" | "version">): AccountOpenedV2 =>
+  ({ type: "AccountOpened", version: 2, ...data });
+
+export const AccountDeposited = (data: Omit<AccountDepositedV1, "type" | "version">): AccountDepositedV1 =>
+  ({ type: "AccountDeposited", version: 1, ...data });
+
+export const AccountWithdrawn = (data: Omit<AccountWithdrawnV1, "type" | "version">): AccountWithdrawnV1 =>
+  ({ type: "AccountWithdrawn", version: 1, ...data });
+
+export const WithdrawalCompleted = (data: Omit<WithdrawalCompletedV1, "type" | "version">): WithdrawalCompletedV1 =>
+  ({ type: "WithdrawalCompleted", version: 1, ...data });
+
+export const DepositCompleted = (data: Omit<DepositCompletedV1, "type" | "version">): DepositCompletedV1 =>
+  ({ type: "DepositCompleted", version: 1, ...data });
+
+export const AccountTransferredOut = (data: Omit<AccountTransferredOutV1, "type" | "version">): AccountTransferredOutV1 =>
+  ({ type: "AccountTransferredOut", version: 1, ...data });
+
+export const AccountTransferredIn = (data: Omit<AccountTransferredInV1, "type" | "version">): AccountTransferredInV1 =>
+  ({ type: "AccountTransferredIn", version: 1, ...data });
+
+export const AccountClosed = (data: Omit<AccountClosedV1, "type" | "version">): AccountClosedV1 =>
+  ({ type: "AccountClosed", version: 1, ...data });

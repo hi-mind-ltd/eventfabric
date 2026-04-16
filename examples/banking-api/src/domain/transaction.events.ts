@@ -47,3 +47,16 @@ export type TransactionEvent =
   | TransactionStartedV1
   | TransactionCompletedV1
   | TransactionFailedV1;
+
+// Factory functions — type and version are baked in
+export const TransactionInitiated = (data: Omit<TransactionInitiatedV1, "type" | "version">): TransactionInitiatedV1 =>
+  ({ type: "TransactionInitiated", version: 1, ...data });
+
+export const TransactionStarted = (data: Omit<TransactionStartedV1, "type" | "version">): TransactionStartedV1 =>
+  ({ type: "TransactionStarted", version: 1, ...data });
+
+export const TransactionCompleted = (data: Omit<TransactionCompletedV1, "type" | "version">): TransactionCompletedV1 =>
+  ({ type: "TransactionCompleted", version: 1, ...data });
+
+export const TransactionFailed = (data: Omit<TransactionFailedV1, "type" | "version">): TransactionFailedV1 =>
+  ({ type: "TransactionFailed", version: 1, ...data });

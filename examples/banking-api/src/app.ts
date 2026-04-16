@@ -16,7 +16,9 @@ import { AccountAggregate, type AccountState } from "./domain/account.aggregate"
 import { TransactionAggregate, type TransactionState } from "./domain/transaction.aggregate";
 import { CustomerAggregate, type CustomerState } from "./domain/customer.aggregate";
 import type { BankingEvent } from "./domain/events";
-import type { AccountOpenedV2, AccountDepositedV1 } from "./domain/account.events";
+import { AccountOpened, AccountDeposited } from "./domain/account.events";
+import { TransactionInitiated, TransactionStarted, TransactionCompleted } from "./domain/transaction.events";
+import { CustomerRegistered } from "./domain/customer.events";
 import { accountEventUpcaster } from "./domain/account.upcasters";
 import { emailNotificationProjection } from "./projections/email-projection";
 import {
@@ -53,18 +55,18 @@ sessionFactory.registerAggregate(AccountAggregate, [
   "AccountTransferredOut",
   "AccountTransferredIn",
   "AccountClosed"
-], accountSnapshotStore);
+], "account", { snapshotStore: accountSnapshotStore });
 sessionFactory.registerAggregate(TransactionAggregate, [
   "TransactionInitiated",
   "TransactionStarted",
   "TransactionCompleted",
   "TransactionFailed"
-], transactionSnapshotStore);
+], "transaction", { snapshotStore: transactionSnapshotStore });
 sessionFactory.registerAggregate(CustomerAggregate, [
   "CustomerRegistered",
   "CustomerEmailUpdated",
   "CustomerPhoneUpdated"
-], customerSnapshotStore);
+], "customer", { snapshotStore: customerSnapshotStore });
 
 // ===== Projection wiring =====
 //
@@ -183,8 +185,7 @@ app.post("/customers/:id/register", async (req, res) => {
   try {
     const id = req.params.id;
     const { email, name, phone } = req.body;
-    const customer = await session.loadAggregateAsync<CustomerAggregate>(id);
-    customer.register(email, name, phone);
+    session.startStream(id, CustomerRegistered({ customerId: id, email, name, phone }));
     await session.saveChangesAsync();
     res.json({ ok: true, customerId: id });
   } catch (error: any) {
@@ -227,11 +228,12 @@ app.post("/accounts/:id/open", async (req, res) => {
   const session = sessionFactory.createSession();
   try {
     const id = req.params.id;
-    const { customerId, initialBalance, currency } = req.body;
-    const account = await session.loadAggregateAsync<AccountAggregate>(id);
-    account.open(customerId, initialBalance || 0, currency || "USD");
+    const { customerId, initialBalance, currency, region } = req.body;
+    const bal = initialBalance || 0;
+    const cur = currency || "USD";
+    session.startStream(id, AccountOpened({ accountId: id, customerId, initialBalance: bal, currency: cur, region: region ?? "unknown" }));
     await session.saveChangesAsync();
-    res.json({ ok: true, accountId: id, balance: account.balance });
+    res.json({ ok: true, accountId: id, balance: bal });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
   }
@@ -247,26 +249,13 @@ app.post("/accounts/:id/open-with-stream", async (req, res) => {
     // Marten-style API: Start a new stream with typed events
     // TypeScript infers the aggregate from the event types!
     // Similar to: session.Events.StartStream(questId, started, joined1)
-    const accountOpened: AccountOpenedV2 = {
-      type: "AccountOpened",
-      version: 2,
-      accountId: id,
-      customerId,
-      initialBalance: initialBalance || 0,
-      currency: currency || "USD",
-      region: req.body.region ?? "unknown"
-    };
-    
-    const accountDeposited: AccountDepositedV1 = {
-      type: "AccountDeposited",
-      version: 1,
-      accountId: id,
-      amount: initialBalance || 0,
-      balance: initialBalance || 0
-    };
-    
+    const bal = initialBalance || 0;
+
     // Start stream - operations are queued until saveChangesAsync is called
-    session.startStream(id, accountOpened, accountDeposited);
+    session.startStream(id,
+      AccountOpened({ accountId: id, customerId, initialBalance: bal, currency: currency || "USD", region: req.body.region ?? "unknown" }),
+      AccountDeposited({ accountId: id, amount: bal, balance: bal })
+    );
     await session.saveChangesAsync();
     
     // Load the account to return its state
@@ -357,10 +346,17 @@ app.post("/transactions/:id/initiate", async (req, res) => {
   try {
     const id = req.params.id;
     const { fromAccountId, toAccountId, amount, currency, description } = req.body;
-    const transaction = await session.loadAggregateAsync<TransactionAggregate>(id);
-    transaction.initiate(fromAccountId, toAccountId, amount, currency || "USD", description);
+    if (amount <= 0) {
+      res.status(400).json({ error: "Transaction amount must be positive" });
+      return;
+    }
+    if (fromAccountId === toAccountId) {
+      res.status(400).json({ error: "Cannot transfer to the same account" });
+      return;
+    }
+    session.startStream(id, TransactionInitiated({ transactionId: id, fromAccountId, toAccountId, amount, currency: currency || "USD", description }));
     await session.saveChangesAsync();
-    res.json({ ok: true, transactionId: id, status: transaction.status });
+    res.json({ ok: true, transactionId: id, status: "pending" });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
   }
@@ -414,25 +410,31 @@ app.post("/transfers/eventual", async (req, res) => {
   try {
     const { transactionId, fromAccountId, toAccountId, amount, description } = req.body;
 
-    // Load transaction aggregate
-    const transaction = await session.loadAggregateAsync<TransactionAggregate>(transactionId);
+    if (amount <= 0) {
+      res.status(400).json({ error: "Transaction amount must be positive" });
+      return;
+    }
+    if (fromAccountId === toAccountId) {
+      res.status(400).json({ error: "Cannot transfer to the same account" });
+      return;
+    }
 
-    // Initiate and start the transaction
-    transaction.initiate(fromAccountId, toAccountId, amount, "USD", description);
-    transaction.start(); // Raises TransactionStarted event
-
-    // Save transaction - TransactionStarted event goes to outbox
+    // Start a new transaction stream with both initiate and start events.
     // The async projections will handle the rest:
     // 1. WithdrawalProjection processes TransactionStarted → performs withdrawal → raises WithdrawalCompleted
     // 2. DepositProjection processes WithdrawalCompleted → performs deposit → raises DepositCompleted
     // 3. CompletionProjection processes DepositCompleted → completes transaction → raises TransactionCompleted
+    session.startStream(transactionId,
+      TransactionInitiated({ transactionId, fromAccountId, toAccountId, amount, currency: "USD", description }),
+      TransactionStarted({ transactionId, fromAccountId, toAccountId, amount, currency: "USD", description, startedAt: new Date().toISOString() })
+    );
     await session.saveChangesAsync();
 
     res.json({
       ok: true,
       transactionId,
       message: "Transfer initiated. Processing will complete asynchronously.",
-      status: transaction.status
+      status: "started"
     });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
@@ -441,42 +443,33 @@ app.post("/transfers/eventual", async (req, res) => {
 
 // ========== Transfer Endpoint (atomic - immediate consistency) ==========
 app.post("/transfers", async (req, res) => {
-  const session = sessionFactory.createSession();
   try {
     const { transactionId, fromAccountId, toAccountId, amount, description } = req.body;
 
-    // Load all aggregates
-    const transaction = await session.loadAggregateAsync<TransactionAggregate>(transactionId);
+    // Load existing accounts and create the transaction + transfer in one session
+    const session = sessionFactory.createSession();
     const fromAccount = await session.loadAggregateAsync<AccountAggregate>(fromAccountId);
     const toAccount = await session.loadAggregateAsync<AccountAggregate>(toAccountId);
 
-    // Initiate transaction
-    transaction.initiate(fromAccountId, toAccountId, amount, "USD", description);
+    // Validate transfer before creating the transaction stream
+    fromAccount.transferOut(toAccountId, amount, transactionId);
+    toAccount.transferIn(fromAccountId, amount, transactionId);
 
-    try {
-      // Perform transfer (these are in-memory operations, no side effects yet)
-      fromAccount.transferOut(toAccountId, amount, transactionId);
-      toAccount.transferIn(fromAccountId, amount, transactionId);
-      transaction.complete();
+    // Create the transaction stream as initiated + completed atomically
+    session.startStream(transactionId,
+      TransactionInitiated({ transactionId, fromAccountId, toAccountId, amount, currency: "USD", description }),
+      TransactionCompleted({ transactionId, fromAccountId, toAccountId, amount, completedAt: new Date().toISOString() })
+    );
 
-      // Save all aggregates atomically in a single transaction
-      // Session automatically tracks all loaded aggregates and saves them together
-      await session.saveChangesAsync(); // All operations committed atomically
+    // Save all aggregates atomically in a single transaction
+    await session.saveChangesAsync();
 
-      res.json({
-        ok: true,
-        transactionId,
-        fromAccount: { id: fromAccountId, balance: fromAccount.balance },
-        toAccount: { id: toAccountId, balance: toAccount.balance }
-      });
-    } catch (error: any) {
-      // If transfer fails, mark transaction as failed
-      // Note: We need to reload the transaction to get the current state
-      const failedTransaction = await session.loadAggregateAsync<TransactionAggregate>(transactionId);
-      failedTransaction.fail(error.message);
-      await session.saveChangesAsync();
-      throw error;
-    }
+    res.json({
+      ok: true,
+      transactionId,
+      fromAccount: { id: fromAccountId, balance: fromAccount.balance },
+      toAccount: { id: toAccountId, balance: toAccount.balance }
+    });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
   }
