@@ -1,5 +1,6 @@
 {
   "name": "@eventfabric/postgres",
+  "license": "MIT",
   "author": "Hi-Mind Limited",
   "repository": {
     "type": "git",
@@ -19,7 +20,8 @@
   "files": [
     "dist",
     "migrations",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
     "access": "public"

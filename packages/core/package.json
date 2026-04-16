@@ -1,5 +1,6 @@
 {
   "name": "@eventfabric/core",
+  "license": "MIT",
   "author": "Hi-Mind Limited",
   "repository": {
     "type": "git",
@@ -18,7 +19,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
     "access": "public"

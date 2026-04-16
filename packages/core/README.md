@@ -3,9 +3,12 @@
 Framework-agnostic, **type-safe event sourcing core** for Node.js/TypeScript.
 
 Includes:
-- `AggregateRoot` — users implement only event handlers + domain methods that `raise()` events.
-- `Repository` — loads/saves a single aggregate type, optionally snapshots + inline projections.
+- `AggregateRoot` — implement event handlers + domain methods that `raise()` events.
+- `SessionFactory` / `Session` — load/save aggregates with identity map, atomic multi-aggregate saves, snapshots, and outbox routing (via `@eventfabric/postgres`).
 - `InlineProjector` — transactional projections (runs inside the same adapter transaction).
+- `CatchUpProjector` — checkpoint-based projections for internal state transitions.
+- `AsyncProjectionRunner` — outbox-based at-least-once delivery with topic filtering, retry, and DLQ.
+- Event factory functions — define `type` and `version` once, never repeat them.
 
 Persistence adapters live in separate packages (e.g. `@eventfabric/postgres`).
 
@@ -15,26 +18,22 @@ Persistence adapters live in separate packages (e.g. `@eventfabric/postgres`).
 pnpm add @eventfabric/core
 ```
 
-## Usage (high level)
+## Usage
 
 ```ts
-const userRepo = new Repository<UserAggregate, UserState, UserEvent, Tx>(
-  "User",
-  uow,
-  eventStore,
-  (id, snap) => new UserAggregate(id, snap),
-  { 
-    inlineProjector, 
-    snapshotStore, 
-    snapshotPolicy: { everyNEvents: 50 },
-    asyncProcessor: { enabled: true, topic: "user" }
-  }
-);
+import { SessionFactory, PgEventStore, PgSnapshotStore } from "@eventfabric/postgres";
 
-const user = await userRepo.load("user-1");
+const factory = new SessionFactory(pool, store);
+
+factory.registerAggregate(UserAggregate, [
+  "UserRegistered", "UserEmailChanged"
+], "user", { snapshotStore });
+
+// Per request:
+const session = factory.createSession();
+const user = await session.loadAggregateAsync<UserAggregate>("user-1");
 user.changeEmail("new@mail.com");
-
-await userRepo.save(user);
+await session.saveChangesAsync();
 ```
 
 See `@eventfabric/postgres` README for a full Postgres example.
