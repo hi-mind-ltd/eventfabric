@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Build, Typecheck, Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Testcontainers manages its own Postgres containers via Docker.
+    # ubuntu-latest has Docker pre-installed — no service container needed.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages (dependency order)
+        run: pnpm -r build
+
+      - name: Typecheck all packages
+        run: |
+          pnpm --filter @eventfabric/core exec tsc --noEmit
+          pnpm --filter @eventfabric/postgres exec tsc -p tsconfig.json --noEmit
+          pnpm --filter @eventfabric/opentelemetry exec tsc -p tsconfig.json --noEmit
+
+      - name: Typecheck examples
+        run: |
+          pnpm --filter banking-api exec tsc --noEmit
+          pnpm --filter express-api exec tsc --noEmit
+
+      - name: Test core
+        run: pnpm --filter @eventfabric/core test
+
+      - name: Test postgres
+        run: pnpm --filter @eventfabric/postgres test
+
+      - name: Test opentelemetry
+        run: pnpm --filter @eventfabric/opentelemetry test
+
+      - name: Test banking-api example
+        run: pnpm --filter banking-api test

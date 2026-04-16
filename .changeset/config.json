@@ -1,0 +1,16 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.0.0/schema.json",
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "fixed": [],
+  "linked": [
+    ["@eventfabric/core", "@eventfabric/postgres", "@eventfabric/opentelemetry"]
+  ],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": [],
+  "___experimentalUnsafeOptions_ONLY_EVER_TOUCH_THESE_IF_YOU_REALLY_NEED_TO": {
+    "onlyUpdatePeerDependentsWhenOutOfRange": true
+  }
+}
