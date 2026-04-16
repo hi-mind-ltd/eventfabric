@@ -88,27 +88,21 @@ sessionFactory.registerAggregate(CustomerAggregate, [
 // claims rows from eventfabric.outbox; the catch-up projector reads forward from
 // its checkpoint.
 
-// Observability — a tiny console observer showing the hook shape. In
-// production you'd swap this for the OTel adapter:
-//
-//   import { createAsyncRunnerObserver } from "@eventfabric/opentelemetry";
-//   const observer = createAsyncRunnerObserver({
-//     tracer: trace.getTracer("banking-api"),
-//     meter: metrics.getMeter("banking-api")
-//   });
-//
-// The rest of the runner wiring stays the same. The OTel adapter wraps
-// handler execution in an active span (so pg/http child spans attach
-// automatically) and emits counters + a duration histogram per projection.
-import type { AsyncRunnerObserver } from "@eventfabric/core";
-const consoleObserver: AsyncRunnerObserver = {
-  onEventFailed: (i) =>
-    console.error(`[${i.workerId}] ${i.projection} failed @${i.globalPosition}:`, i.error.message),
-  onMessageDeadLettered: (i) =>
-    console.warn(
-      `[${i.workerId}] DLQ outboxId=${i.outboxId} attempts=${i.attempts}: ${i.reason}`
-    )
-};
+// Observability via OpenTelemetry. The OTel adapter wraps handler execution
+// in an active span (so pg/http child spans attach automatically) and emits
+// counters + a duration histogram per projection.
+import { trace, metrics } from "@opentelemetry/api";
+import { createAsyncRunnerObserver, createCatchUpObserver } from "@eventfabric/opentelemetry";
+
+const asyncObserver = createAsyncRunnerObserver({
+  tracer: trace.getTracer("banking-api"),
+  meter: metrics.getMeter("banking-api")
+});
+
+const catchUpObserver = createCatchUpObserver({
+  tracer: trace.getTracer("banking-api"),
+  meter: metrics.getMeter("banking-api")
+});
 
 // Outbox runner: email notifications (external delivery)
 const emailRunner = createAsyncProjectionRunner(pool, store, [emailNotificationProjection], {
@@ -123,7 +117,7 @@ const emailRunner = createAsyncProjectionRunner(pool, store, [emailNotificationP
     factor: 2,
     jitter: 0.1
   },
-  observer: consoleObserver
+  observer: asyncObserver
 });
 
 // Catch-up projector: transfer chain (internal state transitions) plus a
@@ -151,7 +145,7 @@ emailRunner.start(abortController.signal).catch((err) => {
   const idleMs = 500;
   while (!abortController.signal.aborted) {
     try {
-      await catchUpProjector.catchUpAll(catchUpProjections, { batchSize: 100 });
+      await catchUpProjector.catchUpAll(catchUpProjections, { batchSize: 100, observer: catchUpObserver });
     } catch (err) {
       console.error("Transfer catch-up projector error:", err);
     }
