@@ -205,7 +205,6 @@ describe("migrate() — data integrity across all tables", () => {
 
     const uow = new PgUnitOfWork(pool);
     const store = new PgEventStore<E>();
-    const outbox = new PgOutboxStore();
     const snapshots = new PgSnapshotStore<{ n: number }>();
     const checkpoints = new PgProjectionCheckpointStore();
 
