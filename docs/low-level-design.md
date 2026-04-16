@@ -404,14 +404,14 @@ class Session<E extends AnyEvent> {
 ### JSONB Mode
 
 ```
-  query<T>(pool, "es_snapshots", { jsonb: "state" })
+  query<T>(pool, "eventfabric.snapshots", { jsonb: "state" })
     .where("balance", ">", 100)         → WHERE (state->>'balance')::numeric > $1
     .orderBy("balance", "desc")         → ORDER BY state->'balance' DESC
                                                     ↑ single arrow preserves numeric sort
     .toList()
       │
       ▼
-  SELECT state FROM es_snapshots WHERE ... ORDER BY ...
+  SELECT state FROM eventfabric.snapshots WHERE ... ORDER BY ...
     │
     ▼
   unwrapRows(rows) → rows.map(r => r.state) → T[]

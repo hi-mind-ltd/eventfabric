@@ -4,64 +4,81 @@ EventFabric uses **optimistic concurrency control** to prevent conflicting write
 
 ## How EventFabric implements optimistic concurrency
 
-Every event in an aggregate stream has an `aggregate_version` -- a monotonically increasing integer that starts at 1. When appending events, the caller provides an `expectedAggregateVersion` representing the version they believe the stream is currently at.
+Every event in an aggregate stream has an `aggregate_version` — a monotonically increasing integer that starts at 1. When appending events, the caller provides an `expectedAggregateVersion` representing the version they believe the stream is currently at.
 
-The concurrency check has two layers:
+### The stream_versions gate
 
-### Layer 1: read-time version check
+The `eventfabric.stream_versions` table is the **single source of truth** for stream versions. It has one row per aggregate stream, with a composite primary key of `(aggregate_name, aggregate_id)`.
 
-Before inserting, `PgEventStore.append()` queries the current maximum version:
+Every `PgEventStore.append()` call performs an **atomic version check** on this table before inserting any events. Both the version check and the event insert happen in the same database transaction.
 
-```sql
-SELECT COALESCE(MAX(aggregate_version), 0) AS v
-FROM eventfabric.events
-WHERE aggregate_name = $1 AND aggregate_id = $2
-```
-
-If the result doesn't match `expectedAggregateVersion`, the append fails immediately with a `ConcurrencyError`:
-
-```typescript
-if (currentVersion !== params.expectedAggregateVersion) {
-  throw new ConcurrencyError(
-    `Expected version ${params.expectedAggregateVersion} but stream is at ${currentVersion}`
-  );
-}
-```
-
-This catches the common case where the caller's state is clearly stale.
-
-### Layer 2: insert-time UNIQUE constraint
-
-The events table has a composite unique constraint:
+#### New stream (expectedVersion = 0)
 
 ```sql
-UNIQUE (aggregate_name, aggregate_id, aggregate_version)
+INSERT INTO eventfabric.stream_versions
+  (aggregate_name, aggregate_id, current_version)
+VALUES ($1, $2, $3)
 ```
 
-This catches the **TOCTOU race** (time-of-check-to-time-of-use) that exists under PostgreSQL's `READ COMMITTED` isolation level. Here is the scenario:
+If the stream already exists, the PRIMARY KEY violation is caught and translated into a `ConcurrencyError`:
 
-1. Transaction A reads `MAX(aggregate_version) = 3`, passes the check.
-2. Transaction B reads `MAX(aggregate_version) = 3`, passes the check.
-3. Transaction A inserts version 4 and commits.
-4. Transaction B tries to insert version 4 -- the UNIQUE constraint rejects it with PostgreSQL error code `23505`.
-
-EventFabric translates this raw database error into a `ConcurrencyError`:
-
-```typescript
-try {
-  ins = await tx.client.query(`INSERT INTO ... VALUES ...`, values);
-} catch (err: any) {
-  if (err?.code === "23505" && String(err?.constraint ?? "").includes("aggregate_version")) {
-    throw new ConcurrencyError(
-      `Concurrent append to ${params.aggregateName}:${params.aggregateId} ` +
-      `at expected version ${params.expectedAggregateVersion}`
-    );
-  }
-  throw err;
-}
+```
+ConcurrencyError: Cannot start stream: Account:acc-1 already exists
 ```
 
-Together, the two layers guarantee that exactly one concurrent writer succeeds for any given version, regardless of transaction isolation level or timing.
+#### Existing stream (expectedVersion > 0)
+
+```sql
+UPDATE eventfabric.stream_versions
+SET current_version = $3, updated_at = now()
+WHERE aggregate_name = $1
+  AND aggregate_id = $2
+  AND current_version = $4   -- ← atomic check
+```
+
+If `rowCount === 0`, another writer has already moved the version forward:
+
+```
+ConcurrencyError: Expected version 3 but stream Account:acc-1 is at 5
+```
+
+Only after the version gate passes does the INSERT into `eventfabric.events` happen.
+
+### Why this is stronger than a UNIQUE constraint
+
+EventFabric previously used a `UNIQUE (aggregate_name, aggregate_id, aggregate_version)` constraint on the events table as a fallback concurrency check. The stream_versions approach replaces this and is strictly stronger:
+
+| | UNIQUE constraint (old) | stream_versions (current) |
+|---|---|---|
+| **Mechanism** | INSERT events → constraint catches duplicates after the fact | Atomic UPDATE on stream_versions → then INSERT events |
+| **Race window** | TOCTOU gap between `SELECT MAX(version)` and `INSERT` under READ COMMITTED | None — a single `UPDATE ... WHERE current_version = expected` is atomic |
+| **Error clarity** | Raw PostgreSQL 23505 error, requires translation | Clean `ConcurrencyError` with expected vs actual version |
+| **Partitioning** | Blocks it (UNIQUE must include the partition key) | Enables it (stream_versions is a separate unpartitioned table) |
+
+This pattern is used by [Marten DB](https://martendb.io/) (`mt_streams`), [SQLStreamStore](https://github.com/SQLStreamStore/SQLStreamStore) (`Streams`), and [EventStoreDB](https://www.eventstore.com/) (internal stream metadata).
+
+### Sequence diagram
+
+```
+Writer A                    stream_versions              events
+   │                              │                        │
+   ├─ UPDATE WHERE v=3 ─────────►│                        │
+   │  ◄── rowCount=1 (locked) ───┤                        │
+   │                              │                        │
+Writer B                          │                        │
+   ├─ UPDATE WHERE v=3 ─────────►│                        │
+   │  (blocks — row locked by A)  │                        │
+   │                              │                        │
+Writer A                          │                        │
+   ├─ INSERT events ─────────────────────────────────────►│
+   ├─ COMMIT ─────────────────────┤                        │
+   │                              │                        │
+Writer B (unblocks)               │                        │
+   │  ◄── rowCount=0 ────────────┤                        │
+   │  → ConcurrencyError         │                        │
+```
+
+Under PostgreSQL's default `READ COMMITTED` isolation, the `UPDATE` acquires a row-level lock. Writer B blocks until Writer A commits (or rolls back). After A commits, B's `WHERE current_version = 3` no longer matches (A bumped it), so B gets `rowCount = 0` and throws `ConcurrencyError`.
 
 ## ConcurrencyError
 
@@ -76,11 +93,11 @@ export class ConcurrencyError extends Error {
 }
 ```
 
-The `name` property is set to `"ConcurrencyError"`, which is how the retry helper identifies it (see below). This design decouples `@eventfabric/core` from `@eventfabric/postgres` -- the core package matches on `err.name === "ConcurrencyError"` without importing the class.
+The `name` property is set to `"ConcurrencyError"`, which is how the retry helper identifies it (see below). This design decouples `@eventfabric/core` from `@eventfabric/postgres` — the core package matches on `err.name === "ConcurrencyError"` without importing the class.
 
 ## `withConcurrencyRetry(fn, opts)`
 
-The `withConcurrencyRetry` helper runs a function and retries it if a `ConcurrencyError` is thrown. The caller is responsible for doing a complete **load -> decide -> save** cycle inside `fn` -- retry re-invokes the entire function, so the aggregate must be re-loaded from the store and the command re-run against the fresh state.
+The `withConcurrencyRetry` helper runs a function and retries it if a `ConcurrencyError` is thrown. The caller is responsible for doing a complete **load -> decide -> save** cycle inside `fn` — retry re-invokes the entire function, so the aggregate must be re-loaded from the store and the command re-run against the fresh state.
 
 ```typescript
 // @eventfabric/core
@@ -118,7 +135,7 @@ while (true) {
 }
 ```
 
-On each retry, `fn` is called from scratch. The caller must re-load the aggregate inside `fn` to get the latest state -- otherwise the retry will fail with the same stale version.
+On each retry, `fn` is called from scratch. The caller must re-load the aggregate inside `fn` to get the latest state — otherwise the retry will fail with the same stale version.
 
 ## Example: deposit endpoint with concurrency retry
 
@@ -134,7 +151,7 @@ app.post("/accounts/:id/deposit", async (req, res) => {
 
     const balance = await withConcurrencyRetry(
       async () => {
-        // Fresh session on every attempt -- re-loads the aggregate
+        // Fresh session on every attempt — re-loads the aggregate
         const session = sessionFactory.createSession();
         const account = await session.loadAggregateAsync<AccountAggregate>(id);
         account.deposit(amount, transactionId);
@@ -167,11 +184,11 @@ Retrying a concurrency error is **not always correct**. Consider these scenarios
 ### Safe to retry
 
 - **Deposit**: The command is "add $100 to the balance." If a concurrent deposit changed the balance from $500 to $600, the retry re-loads the aggregate at $600 and deposits $100 to get $700. The business decision (deposit) is valid regardless of the starting state.
-- **Increment counter**: Same reasoning -- the operation is commutative and makes sense at any starting state.
+- **Increment counter**: Same reasoning — the operation is commutative and makes sense at any starting state.
 
 ### Unsafe to retry
 
-- **Business decision invalidation**: "Transfer $100 if balance >= $200." If a concurrent withdrawal reduced the balance to $150, the retry re-loads the aggregate and the business rule rejects the transfer. The retry is safe in this case -- it will throw a domain error, not a concurrency error -- but the caller should understand that retrying doesn't guarantee success.
+- **Business decision invalidation**: "Transfer $100 if balance >= $200." If a concurrent withdrawal reduced the balance to $150, the retry re-loads the aggregate and the business rule rejects the transfer. The retry is safe in this case — it will throw a domain error, not a concurrency error — but the caller should understand that retrying doesn't guarantee success.
 - **Side effects already fired**: If the function sends an email or calls an external API before the write, retrying would send the email twice. Move external side effects to [Async Projections](./projections/async-projections.md) instead.
 - **User-visible operations**: If the function returned a confirmation to the user before the write (which it shouldn't, but sometimes happens), retrying silently changes what the user was told.
 
@@ -202,6 +219,8 @@ Jitter prevents thundering-herd effects when multiple clients retry simultaneous
 
 ## Related docs
 
-- [Projections Overview](./projections/overview.md) -- how concurrency relates to projection tiers
-- [Async Projections](./projections/async-projections.md) -- backoff strategy in the async runner
-- [Schema Evolution](./schema-evolution.md) -- how event versions interact with aggregate versioning
+- [Partitioning](./partitioning.md) — how stream_versions enables table partitioning
+- [Projections Overview](./projections/overview.md) — how concurrency relates to projection tiers
+- [Async Projections](./projections/async-projections.md) — backoff strategy in the async runner
+- [Schema Evolution](./schema-evolution.md) — how event versions interact with aggregate versioning
+- [Schema Reference](./schema-reference.md) — stream_versions table definition

@@ -18,21 +18,26 @@ pnpm add @eventfabric/postgres pg
 pnpm add @eventfabric/core
 ```
 
-## Migrations
+## Database Setup
 
-This package ships migrations under `migrations/`.
-Run them with your preferred migration tool.
+Call `migrate()` on app startup — it applies all migrations automatically:
 
-Tables:
-- `es_events`
-- `es_projection_checkpoints`
-- `es_outbox`
-- `es_outbox_dead_letters`
-- `es_snapshots` (latest-only)
+```typescript
+import { migrate } from "@eventfabric/postgres";
+await migrate(pool);
+```
+
+Tables created in the `eventfabric` schema:
+- `eventfabric.events`
+- `eventfabric.stream_versions`
+- `eventfabric.projection_checkpoints`
+- `eventfabric.outbox`
+- `eventfabric.outbox_dead_letters`
+- `eventfabric.snapshots`
 
 ## Usage
 
-The recommended way to use this library is through the **Session API** (see below). The Session API provides a Marten DB-like interface that automatically manages transactions and tracks aggregates.
+The recommended way to use this library is through the **Session API** (see below). The Session API provides an interface that automatically manages transactions and tracks aggregates.
 
 ## Async projections (outbox)
 
@@ -48,11 +53,11 @@ const runner = new PgAsyncProjectionRunner<AppEvent>(pool, store, [projection], 
 await runner.start(new AbortController().signal);
 ```
 
-## Marten-style Session API
+## Session API
 
-The `SessionFactory` and `Session` classes provide a fluent, Marten DB-like API for event sourcing operations. The factory holds configuration (aggregate registrations, snapshot stores, inline projections), while each session instance tracks per-request state (loaded aggregates, pending operations).
+The `SessionFactory` and `Session` classes provide a fluent API for event sourcing operations. The factory holds configuration (aggregate registrations, snapshot stores, inline projections), while each session instance tracks per-request state (loaded aggregates, pending operations).
 
-**Important**: Sessions should NOT be singletons. Create a new session per request/unit of work, similar to Marten DB's pattern.
+**Important**: Sessions should NOT be singletons. Create a new session per request/unit of work.
 
 ### Basic Usage
 
@@ -63,7 +68,7 @@ import { SessionFactory, PgSnapshotStore, InlineProjector } from "@eventfabric/p
 const factory = new SessionFactory(pool, store);
 
 // Register aggregates with their event types and optional snapshot stores (done once)
-const snapshotStore = new PgSnapshotStore<AccountState>("es_snapshots", 1);
+const snapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
 factory.registerAggregate(AccountAggregate, [
   "AccountOpened",
   "AccountDeposited",
@@ -142,7 +147,7 @@ Snapshots improve performance by avoiding replaying all events. Configure snapsh
 
 ```ts
 // Register aggregate with snapshot store and policy
-const snapshotStore = new PgSnapshotStore<AccountState>("es_snapshots", 1);
+const snapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
 factory.registerAggregate(
   AccountAggregate,
   ["AccountOpened", "AccountDeposited", "AccountWithdrawn"],
@@ -207,7 +212,7 @@ import {
 const factory = new SessionFactory(pool, store);
 
 // 1. Register aggregates with snapshots and policies
-const accountSnapshotStore = new PgSnapshotStore<AccountState>("es_snapshots", 1);
+const accountSnapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
 factory.registerAggregate(
   AccountAggregate,
   ["AccountOpened", "AccountDeposited", "AccountWithdrawn"],
