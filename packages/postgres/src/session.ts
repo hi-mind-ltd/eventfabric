@@ -49,6 +49,7 @@ class SessionConfig<E extends AnyEvent> {
   readonly snapshotStoreRegistry: Map<string, { load(tx: PgTx, aggregateName: string, aggregateId: string): Promise<{ state: any; aggregateVersion: number } | null>; save(tx: PgTx, snapshot: any): Promise<void> }> = new Map();
   readonly snapshotPolicyRegistry: Map<string, SnapshotPolicy> = new Map();
   readonly snapshotSchemaVersionRegistry: Map<string, number> = new Map();
+  readonly outboxTopicRegistry: Map<string, string | null> = new Map();
   inlineProjector?: InlineProjector<E, PgTx>;
 }
 
@@ -58,7 +59,7 @@ class SessionConfig<E extends AnyEvent> {
  * 
  * @example
  * const factory = new SessionFactory(pool, store);
- * factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited", ...]);
+ * factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited", ...], "account");
  * 
  * // In each request handler:
  * const session = factory.createSession();
@@ -75,14 +76,19 @@ export class SessionFactory<E extends AnyEvent> {
   }
 
   /**
-   * Register an aggregate class with its event types and optional snapshot store.
+   * Register an aggregate class with its event types, outbox topic, and optional configuration.
    * This configuration is shared across all sessions created from this factory.
-   * 
+   *
    * @param AggregateClass - The aggregate class to register
    * @param eventTypes - Array of event type strings that belong to this aggregate
-   * @param snapshotStore - Optional snapshot store for this aggregate (for performance)
-   * @param snapshotPolicy - Optional snapshot policy (e.g., { everyNEvents: 50 })
-   * @param snapshotSchemaVersion - Optional snapshot schema version (defaults to 1)
+   * @param outboxTopic - Topic string for outbox routing (used by async projection topic filters)
+   * @param opts - Optional configuration for snapshots
+   *
+   * @example
+   * factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account", {
+   *   snapshotStore,
+   *   snapshotPolicy: { everyNEvents: 50 }
+   * });
    */
   registerAggregate<
     EAgg extends E,
@@ -90,35 +96,41 @@ export class SessionFactory<E extends AnyEvent> {
   >(
     AggregateClass: { aggregateName: string } & (new (...args: any[]) => AggregateRoot<any, EAgg>),
     eventTypes: ExhaustiveEventTypes<EAgg, TTypes>,
-    snapshotStore?: { load(tx: PgTx, aggregateName: string, aggregateId: string): Promise<{ state: any; aggregateVersion: number } | null>; save(tx: PgTx, snapshot: any): Promise<void> },
-    snapshotPolicy?: SnapshotPolicy,
-    snapshotSchemaVersion?: number
+    outboxTopic: string,
+    opts?: {
+      snapshotStore?: { load(tx: PgTx, aggregateName: string, aggregateId: string): Promise<{ state: any; aggregateVersion: number } | null>; save(tx: PgTx, snapshot: any): Promise<void> };
+      snapshotPolicy?: SnapshotPolicy;
+      snapshotSchemaVersion?: number;
+    }
   ): void {
     if (!AggregateClass || !AggregateClass.aggregateName) {
       throw new Error(`AggregateClass must have a static aggregateName property`);
     }
-    
+
     // Store aggregate class in registry
     this.config.aggregateClassRegistry.set(AggregateClass.aggregateName, AggregateClass);
-    
+
     // Map event types to aggregate class
     for (const eventType of eventTypes) {
       this.config.eventTypeRegistry[eventType] = AggregateClass;
     }
 
+    // Register outbox topic
+    this.config.outboxTopicRegistry.set(AggregateClass.aggregateName, outboxTopic);
+
     // Register snapshot store if provided
-    if (snapshotStore) {
-      this.config.snapshotStoreRegistry.set(AggregateClass.aggregateName, snapshotStore);
+    if (opts?.snapshotStore) {
+      this.config.snapshotStoreRegistry.set(AggregateClass.aggregateName, opts.snapshotStore);
     }
 
     // Register snapshot policy if provided
-    if (snapshotPolicy) {
-      this.config.snapshotPolicyRegistry.set(AggregateClass.aggregateName, snapshotPolicy);
+    if (opts?.snapshotPolicy) {
+      this.config.snapshotPolicyRegistry.set(AggregateClass.aggregateName, opts.snapshotPolicy);
     }
 
     // Register snapshot schema version if provided
-    if (snapshotSchemaVersion !== undefined) {
-      this.config.snapshotSchemaVersionRegistry.set(AggregateClass.aggregateName, snapshotSchemaVersion);
+    if (opts?.snapshotSchemaVersion !== undefined) {
+      this.config.snapshotSchemaVersionRegistry.set(AggregateClass.aggregateName, opts.snapshotSchemaVersion);
     }
   }
 
@@ -151,7 +163,7 @@ export class SessionFactory<E extends AnyEvent> {
  * 
  * @example
  * const factory = new SessionFactory(pool, store);
- * factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited", ...]);
+ * factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited", ...], "account");
  * 
  * const session = factory.createSession();
  * const account = await session.loadAggregateAsync<AccountAggregate>("acc-1");
@@ -272,7 +284,7 @@ export class Session<E extends AnyEvent> {
    * @example
    * // First register the aggregate with optional snapshot store:
    * const snapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
-   * factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited", ...], snapshotStore);
+   * factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited", ...], "account", { snapshotStore });
    * 
    * // Then load:
    * const session = factory.createSession();
@@ -536,7 +548,7 @@ export class Session<E extends AnyEvent> {
             expectedAggregateVersion: 0,
             events: op.events,
             enqueueOutbox: true,
-            outboxTopic: null
+            outboxTopic: this.config.outboxTopicRegistry.get(op.aggregateName) ?? null
           });
 
           allAppendedEvents.push(...result.appended);
@@ -563,7 +575,7 @@ export class Session<E extends AnyEvent> {
             expectedAggregateVersion: expectedVersion,
             events: op.events,
             enqueueOutbox: true,
-            outboxTopic: null
+            outboxTopic: this.config.outboxTopicRegistry.get(op.aggregateName) ?? null
           });
           
           allAppendedEvents.push(...result.appended);
