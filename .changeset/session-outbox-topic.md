@@ -1,5 +1,5 @@
 ---
-"@eventfabric/postgres": minor
+"@eventfabric/postgres": patch
 ---
 
 Refactor `registerAggregate` from positional args to options bag and add required `outboxTopic` parameter. Session now sets per-aggregate outbox topics on every event, fixing silent routing failures where topic-filtered async projections would never match events saved through Session.
