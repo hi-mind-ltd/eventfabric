@@ -1,5 +1,11 @@
 # @eventfabric/core
 
+## 0.1.4
+
+### Patch Changes
+
+- 3ba92d4: Align package versions across all linked packages. Add OpenTelemetry README with usage details for async runner and catch-up observers. Update core README to show Session API instead of deprecated Repository pattern.
+
 ## 0.1.2
 
 ### Patch Changes
