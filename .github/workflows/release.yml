@@ -11,14 +11,14 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
-  id-token: write # OIDC for npm Trusted Publishing
+  id-token: write
 
 jobs:
   release:
     name: Version & Publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: npm # links to the GitHub Environment for npm Trusted Publishing
+    environment: npm
 
     steps:
       - name: Checkout
@@ -32,9 +32,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -46,7 +45,7 @@ jobs:
         id: changesets
         uses: changesets/action@v1
         with:
-          publish: pnpm changeset publish --provenance
+          publish: pnpm changeset publish
           version: pnpm changeset version
           title: "chore: version packages"
           commit: "chore: version packages"
