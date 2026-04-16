@@ -579,7 +579,7 @@ describe("eventual transfer (POST /transfers/eventual)", () => {
 
     const start = Date.now();
     let prev = -1;
-    let current = await countEvents();
+    let current: number;
     while (Date.now() - start < 10000) {
       await projector.catchUpAll(projections, { batchSize: 100 });
       current = await countEvents();
@@ -1361,7 +1361,7 @@ describe("opentelemetry: catch-up observer", () => {
 
     const start = Date.now();
     let prev = -1;
-    let current = await countEvents();
+    let current: number;
     while (Date.now() - start < 10000) {
       await projector.catchUpAll(projections, { batchSize: 100, observer });
       current = await countEvents();
