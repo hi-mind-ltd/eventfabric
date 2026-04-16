@@ -4,7 +4,6 @@ import { Pool } from "pg";
 import { migrate } from "../src/pg-migrator";
 import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore } from "../src/pg-event-store";
-import { PgOutboxStore } from "../src/outbox/pg-outbox-store";
 import { PgSnapshotStore } from "../src/snapshots/pg-snapshot-store";
 import { PgProjectionCheckpointStore } from "../src/projections/pg-projection-checkpoint-store";
 import { PgPartitionManager } from "../src/partitioning/pg-partition-manager";
