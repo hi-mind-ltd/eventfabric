@@ -190,6 +190,7 @@ describe("PgPartitionManager", () => {
         AND indexname = 'events_stream_covering_idx'
     `);
     // Parent-level index entry exists for partitioned tables
+    expect(result.rowCount).toBe(1);
     // The actual indexes live on the partitions
     const partitionIndexes = await pool.query(`
       SELECT indexname
