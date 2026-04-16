@@ -1,6 +1,11 @@
 {
   "name": "@eventfabric/core",
   "author": "Hi-Mind Limited",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hi-mind-ltd/eventfabric",
+    "directory": "packages/core"
+  },
   "version": "0.1.1",
   "type": "module",
   "main": "./dist/index.js",
