@@ -430,14 +430,14 @@ describe("multi-tenancy: EventEnvelope tenantId", () => {
     session.startStream("acc-env", { type: "AccountOpened", version: 1, accountId: "acc-env", owner: "XYZ", balance: 42 } as TestEvent);
     await session.saveChangesAsync();
 
-    // Load via store directly to check the envelope
+    // loadStream filters by tx.tenantId — using default tenant should NOT find tenant-xyz events
     const uow = new PgUnitOfWork(pool);
-    const events = await uow.withTransaction(tx =>
+    const wrongTenantEvents = await uow.withTransaction(tx =>
       store.loadStream(tx, { aggregateName: "Account", aggregateId: "acc-env" })
     );
+    expect(wrongTenantEvents).toHaveLength(0);
 
-    // loadStream filters by tenant_id from tx (default), so it won't find tenant-xyz events.
-    // Use loadGlobal which is cross-tenant.
+    // loadGlobal is cross-tenant — should find the event with tenantId on the envelope
     const allEvents = await uow.withTransaction(tx =>
       store.loadGlobal(tx, { fromGlobalPositionExclusive: 0n, limit: 100 })
     );
