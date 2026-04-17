@@ -20,6 +20,7 @@ export class RowShapeError extends Error {
  *  or unknown — parsing happens in `mapRow` after validation. */
 type PgEventRow = {
   event_id: string;
+  tenant_id: string;
   aggregate_name: string;
   aggregate_id: string;
   aggregate_version: number | string;
@@ -202,7 +203,7 @@ export class PgEventStore<E extends AnyEvent> {
       `INSERT INTO ${this.eventsTable}
         (event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at, correlation_id, causation_id)
        VALUES ${rowsSql}
-       RETURNING global_position, event_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+       RETURNING global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
                  dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id`,
       values
     );
@@ -309,7 +310,7 @@ export class PgEventStore<E extends AnyEvent> {
 
     const from = fromVersion ?? 1;
     const res = await tx.client.query(
-      `SELECT global_position, event_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+      `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
               dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
        FROM ${this.eventsTable}
        WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3 AND aggregate_version >= $4
@@ -323,13 +324,13 @@ export class PgEventStore<E extends AnyEvent> {
 
   async loadGlobal(tx: PgTx, p: LoadGlobalParams): Promise<EventEnvelope<E>[]> {
     const res = await tx.client.query(
-      `SELECT global_position, event_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+      `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
               dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
        FROM ${this.eventsTable}
-       WHERE tenant_id = $1 AND global_position > $2
+       WHERE global_position > $1
        ORDER BY global_position ASC
-       LIMIT $3`,
-      [tx.tenantId, p.fromGlobalPositionExclusive.toString(), p.limit]
+       LIMIT $2`,
+      [p.fromGlobalPositionExclusive.toString(), p.limit]
     );
     const envs = res.rows.map((r) => this.mapRow(r));
     return p.includeDismissed ? envs : envs.filter(e => !e.dismissed);
@@ -337,16 +338,13 @@ export class PgEventStore<E extends AnyEvent> {
 
   async loadByGlobalPositions(tx: PgTx, positions: bigint[]): Promise<EventEnvelope<E>[]> {
     if (positions.length === 0) return [];
-    const params: any[] = [tx.tenantId];
-    const placeholders = positions.map((p, i) => {
-      params.push(p.toString());
-      return `$${i+2}`;
-    }).join(",");
+    const params = positions.map(p => p.toString());
+    const placeholders = params.map((_, i) => `$${i+1}`).join(",");
     const res = await tx.client.query(
-      `SELECT global_position, event_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+      `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
               dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
        FROM ${this.eventsTable}
-       WHERE tenant_id = $1 AND global_position IN (${placeholders})
+       WHERE global_position IN (${placeholders})
        ORDER BY global_position ASC`,
       params
     );
@@ -374,6 +372,7 @@ export class PgEventStore<E extends AnyEvent> {
       : (r.payload as E);
     return {
       eventId: r.event_id,
+      tenantId: r.tenant_id ?? "default",
       aggregateName: r.aggregate_name,
       aggregateId: r.aggregate_id,
       aggregateVersion: Number(r.aggregate_version),

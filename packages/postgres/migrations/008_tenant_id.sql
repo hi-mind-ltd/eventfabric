@@ -19,25 +19,16 @@ ALTER TABLE eventfabric.stream_versions ADD COLUMN IF NOT EXISTS tenant_id TEXT 
 ALTER TABLE eventfabric.stream_versions DROP CONSTRAINT IF EXISTS stream_versions_pkey;
 ALTER TABLE eventfabric.stream_versions ADD PRIMARY KEY (tenant_id, aggregate_name, aggregate_id);
 
--- outbox: add column, rebuild claimable index
+-- outbox: add column (tenant_id tracks origin for DLQ inspection, not for claim filtering)
 ALTER TABLE eventfabric.outbox ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
-DROP INDEX IF EXISTS eventfabric.outbox_claimable_idx;
-CREATE INDEX outbox_claimable_idx
-  ON eventfabric.outbox (tenant_id, id ASC)
-  WHERE dead_lettered_at IS NULL AND locked_at IS NULL;
 
 -- outbox_dead_letters: add column
 ALTER TABLE eventfabric.outbox_dead_letters ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
-DROP INDEX IF EXISTS eventfabric.outbox_dlq_global_idx;
-CREATE INDEX outbox_dlq_global_idx
-  ON eventfabric.outbox_dead_letters (tenant_id, global_position);
 
 -- snapshots: add column, rebuild PK
 ALTER TABLE eventfabric.snapshots ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE eventfabric.snapshots DROP CONSTRAINT IF EXISTS snapshots_pkey;
 ALTER TABLE eventfabric.snapshots ADD PRIMARY KEY (tenant_id, aggregate_name, aggregate_id);
 
--- projection_checkpoints: add column, rebuild PK
+-- projection_checkpoints: add column (no PK change — projections are cross-tenant)
 ALTER TABLE eventfabric.projection_checkpoints ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
-ALTER TABLE eventfabric.projection_checkpoints DROP CONSTRAINT IF EXISTS projection_checkpoints_pkey;
-ALTER TABLE eventfabric.projection_checkpoints ADD PRIMARY KEY (tenant_id, projection_name);

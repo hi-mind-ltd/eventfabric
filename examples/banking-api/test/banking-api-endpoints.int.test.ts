@@ -920,6 +920,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-1",
+      tenantId: "default",
       aggregateId: "tx-email-1",
       aggregateName: "Transaction",
       aggregateVersion: 1,
@@ -957,6 +958,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-2",
+      tenantId: "default",
       aggregateId: "tx-email-2",
       aggregateName: "Transaction",
       aggregateVersion: 1,
@@ -988,6 +990,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-3",
+      tenantId: "default",
       aggregateId: "acc-dep-email",
       aggregateName: "Account",
       aggregateVersion: 2,
@@ -1017,6 +1020,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-4",
+      tenantId: "default",
       aggregateId: "acc-wd-email",
       aggregateName: "Account",
       aggregateVersion: 3,
@@ -1045,6 +1049,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-5",
+      tenantId: "default",
       aggregateId: "acc-open-email",
       aggregateName: "Account",
       aggregateVersion: 1,
@@ -1075,6 +1080,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-6",
+      tenantId: "default",
       aggregateId: "cust-reg",
       aggregateName: "Customer",
       aggregateVersion: 1,
@@ -1113,6 +1119,7 @@ describe("deposit audit projection (forEventType)", () => {
     // It logs to console — we verify it doesn't throw and only fires for the right type.
     const depositEnv = {
       eventId: "evt-audit-1",
+      tenantId: "default",
       aggregateId: "acc-audit",
       aggregateName: "Account",
       aggregateVersion: 2,
@@ -1137,6 +1144,7 @@ describe("deposit audit projection (forEventType)", () => {
   it("skips non-AccountDeposited events without error", async () => {
     const otherEnv = {
       eventId: "evt-audit-2",
+      tenantId: "default",
       aggregateId: "acc-audit-2",
       aggregateName: "Account",
       aggregateVersion: 1,
@@ -1162,6 +1170,7 @@ describe("deposit audit projection (forEventType)", () => {
   it("processes deposits without transactionId", async () => {
     const env = {
       eventId: "evt-audit-3",
+      tenantId: "default",
       aggregateId: "acc-audit-3",
       aggregateName: "Account",
       aggregateVersion: 2,
