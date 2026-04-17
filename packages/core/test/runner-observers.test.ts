@@ -7,18 +7,26 @@ import type { AsyncRunnerObserver } from "../src/projections/async-runner-observ
 import { CatchUpProjector, type CatchUpOptions } from "../src/projections/catch-up-projector";
 import type { CatchUpProjectorObserver } from "../src/projections/catch-up-observer";
 import type { EventEnvelope, Transaction, UnitOfWork, EventStore } from "../src/types";
+import type { TenantScopedUnitOfWorkFactory } from "../src/projections/catch-up-projector";
 import type { OutboxStore, OutboxRow } from "../src/outbox/outbox-store";
-import type { ProjectionCheckpointStore } from "../src/projections/projection-checkpoint-store";
+import type { ProjectionCheckpointStore, ProjectionCheckpoint } from "../src/projections/projection-checkpoint-store";
 import type { AsyncProjection } from "../src/projections/async-projection";
 import type { CatchUpProjection } from "../src/projections/catch-up-projection";
 
 type E = { type: "Tick"; version: 1; n: number };
 
-class MockTx implements Transaction {}
+type MockTx = Transaction & { tenantId: string };
 
-class MockUow implements UnitOfWork<MockTx> {
-  async withTransaction<T>(fn: (tx: MockTx) => Promise<T>): Promise<T> {
-    return fn(new MockTx());
+class MockUow implements TenantScopedUnitOfWorkFactory<MockTx> {
+  forTenant(tenantId: string): UnitOfWork<MockTx> {
+    return {
+      async withTransaction<T>(fn: (tx: MockTx) => Promise<T>): Promise<T> {
+        return fn({ tenantId });
+      }
+    };
+  }
+  narrow(tx: MockTx, tenantId: string): MockTx {
+    return { ...tx, tenantId };
   }
 }
 
@@ -29,11 +37,22 @@ class MockEventStore implements EventStore<E, MockTx> {
   }
   async loadGlobal(
     _tx: MockTx,
-    p: { fromGlobalPositionExclusive: bigint; limit: number; includeDismissed?: boolean }
+    p: { fromGlobalPositionExclusive: bigint; limit: number; includeDismissed?: boolean; tenantId?: string }
   ): Promise<EventEnvelope<E>[]> {
     return this.events
       .filter((e) => e.globalPosition > p.fromGlobalPositionExclusive)
+      .filter((e) => p.tenantId === undefined || e.tenantId === p.tenantId)
       .slice(0, p.limit);
+  }
+  async discoverActiveTenants(
+    _tx: MockTx,
+    p: { fromGlobalPositionExclusive: bigint; limit?: number }
+  ): Promise<string[]> {
+    const tenants = new Set<string>();
+    for (const e of this.events) {
+      if (e.globalPosition > p.fromGlobalPositionExclusive) tenants.add(e.tenantId);
+    }
+    return [...tenants].sort();
   }
   async append(): Promise<{ appended: EventEnvelope<E>[]; nextAggregateVersion: number }> {
     return { appended: [], nextAggregateVersion: 0 };
@@ -65,21 +84,26 @@ class MockOutbox implements OutboxStore<MockTx> {
 
 class MockCheckpoints implements ProjectionCheckpointStore<MockTx> {
   map = new Map<string, bigint>();
-  async get(_tx: MockTx, name: string) {
+  private key(name: string, tenantId: string): string {
+    return `${name}|${tenantId}`;
+  }
+  async get(_tx: MockTx, name: string, tenantId: string): Promise<ProjectionCheckpoint> {
     return {
       projectionName: name,
-      lastGlobalPosition: this.map.get(name) ?? 0n,
+      tenantId,
+      lastGlobalPosition: this.map.get(this.key(name, tenantId)) ?? 0n,
       updatedAt: new Date().toISOString()
     };
   }
-  async set(_tx: MockTx, name: string, pos: bigint): Promise<void> {
-    this.map.set(name, pos);
+  async set(_tx: MockTx, name: string, tenantId: string, pos: bigint): Promise<void> {
+    this.map.set(this.key(name, tenantId), pos);
   }
 }
 
 function mkEvent(n: number): EventEnvelope<E> {
   return {
     eventId: `evt-${n}`,
+    tenantId: "default",
     aggregateName: "A",
     aggregateId: "1",
     aggregateVersion: n,
@@ -277,7 +301,7 @@ describe("CatchUpProjector observers", () => {
     expect(runHandler).toHaveBeenCalledTimes(2);
   });
 
-  it("fires onEventFailed and onProjectorError on handler throw", async () => {
+  it("fires onEventFailed and onProjectorError on handler throw and isolates the failure per tenant", async () => {
     const onEventFailed = vi.fn();
     const onProjectorError = vi.fn();
     const uow = new MockUow();
@@ -292,12 +316,15 @@ describe("CatchUpProjector observers", () => {
     };
     store.events = [mkEvent(1)];
 
+    // Per-tenant failures are isolated: the projector reports them via
+    // onProjectorError but does NOT propagate. Other tenants (none here, but
+    // in general) keep processing. The promise resolves.
     await expect(
       projector.catchUpProjection(projection, {
         batchSize: 10,
         observer: { onEventFailed, onProjectorError }
       })
-    ).rejects.toThrow("cp-boom");
+    ).resolves.toBeUndefined();
 
     expect(onEventFailed).toHaveBeenCalledTimes(1);
     expect(onEventFailed.mock.calls[0]![0].error.message).toBe("cp-boom");

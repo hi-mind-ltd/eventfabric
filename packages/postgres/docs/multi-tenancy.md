@@ -117,15 +117,30 @@ const session = factory.createSession();
 | Remove tenant | `DELETE WHERE tenant_id = $1` | `DROP DATABASE` |
 | Connection overhead | One pool | One pool per tenant |
 
-## Async Projections with Tenancy
+## Projections with Tenancy
 
-### Conjoined
+### Catch-up projections (per-tenant fan-out)
 
-Outbox rows carry `tenant_id`. The async projection runner processes all tenants from the same outbox table — the `tenant_id` filter is applied automatically during `claimBatch`.
+For conjoined tenancy, the catch-up projector fans each projection out per tenant:
+
+- **Per-tenant checkpoints.** `projection_checkpoints` is keyed by `(projection_name, tenant_id)`. Each tenant tracks its own progress, so a stuck handler in tenant A holds back only A, not B.
+- **Tenant discovery every round.** The projector asks the event store which tenants have events past the lowest checkpoint (`SELECT DISTINCT tenant_id FROM events WHERE global_position > …`) at the start of every round. Tenants onboarded at runtime are picked up automatically — no extra configuration.
+- **Round-robin fairness.** Each round gives every tenant a batch before moving on. A tenant generating 10k events in an hour cannot starve tenants with a handful of events.
+- **Per-tenant fault isolation.** If a handler throws, only that tenant's transaction rolls back. Its checkpoint stays put; other tenants continue processing. The error is reported via the observer's `onProjectorError` hook.
+- **Tenant-scoped tx inside handlers.** `tx.tenantId` matches the envelope's tenant, so `loadStream` / `append` inside the handler filter the correct tenant's data with no manual narrowing in user code.
+
+**Ordering contract.** Within a tenant, events are delivered in `global_position` order. Across tenants there is no cross-tenant ordering guarantee — rounds are fanned out independently, by design, so that ordering cannot become a coupling point.
+
+### Async (outbox) projections
+
+Outbox claim, ack, and dead-letter are cross-tenant queue operations (the outbox is a single shared queue keyed by `global_position`). The runner runs them on a default-scoped transaction. For each claimed event:
+
+- The runner **narrows the transaction** to that event's tenant id before invoking the handler, so loads and appends inside the handler see the correct tenant's data.
+- **Checkpoints are per-tenant** (same as catch-up): a retry storm on tenant A cannot advance past unprocessed events in tenant B.
 
 ### Per-Database
 
-Each tenant's database has its own outbox. You need one runner per tenant:
+Each tenant's database has its own outbox and its own set of tenants (always `"default"`). You typically run one runner per tenant:
 
 ```typescript
 for (const [tenantId, pool] of resolver.pools) {

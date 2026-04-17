@@ -1,8 +1,9 @@
-import type { AnyEvent, EventEnvelope, Transaction, UnitOfWork, EventStore } from "../types";
+import type { AnyEvent, EventEnvelope, Transaction, EventStore } from "../types";
 import type { OutboxStore, OutboxRow } from "../outbox/outbox-store";
 import type { ProjectionCheckpointStore } from "./projection-checkpoint-store";
 import type { AsyncProjection } from "./async-projection";
 import type { AsyncRunnerObserver, AsyncHandlerInfo } from "./async-runner-observer";
+import type { TenantScopedUnitOfWorkFactory } from "./catch-up-projector";
 import { matchesTopic } from "./topic-filter";
 import { computeBackoffMs, sleep, type BackoffOptions } from "../resilience/backoff";
 
@@ -25,17 +26,30 @@ function toError(err: unknown): Error {
 
 /**
  * Core orchestration logic for running asynchronous projections.
- * This class is database-agnostic and works with any implementation of the required interfaces.
+ *
+ * Multi-tenancy: the runner holds a `TenantScopedUnitOfWorkFactory`. Outbox
+ * claim/ack/dead-letter operations run in a "default"-scoped UoW — the
+ * outbox is a cross-tenant queue keyed by `global_position`, so these ops
+ * don't need tenant filtering. Handler invocations narrow the tx to the
+ * event's tenant so `loadStream`/`append` inside the handler read/write the
+ * correct tenant's data. Per-tenant checkpoints let one tenant's failing
+ * handler advance independently of other tenants.
  */
 export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction = Transaction> {
+  private readonly uow: { withTransaction<T>(fn: (tx: TTx) => Promise<T>): Promise<T> };
+
   constructor(
-    private readonly uow: UnitOfWork<TTx>,
+    private readonly uowFactory: TenantScopedUnitOfWorkFactory<TTx>,
     private readonly eventStore: EventStore<E, TTx>,
     private readonly outbox: OutboxStore<TTx>,
     private readonly checkpoints: ProjectionCheckpointStore<TTx>,
     private readonly projections: AsyncProjection<E, TTx>[],
     private readonly opts: AsyncRunnerOptions
-  ) {}
+  ) {
+    // Outbox claim/ack/dead-letter ops are cross-tenant (the outbox is a
+    // single queue). Use the default-tenant UoW for the outer batch tx.
+    this.uow = uowFactory.forTenant("default");
+  }
 
   /** Fire a synchronous lifecycle hook. Never lets observer errors escape. */
   private fireHook<I>(hook: ((info: I) => void) | undefined, info: I): void {
@@ -174,14 +188,24 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
             continue;
           }
 
+          // Narrow tx to the event's tenant so the handler's loadStream /
+          // append calls filter by the correct tenant. Same pg client
+          // (same tx), just tenant metadata swapped for scope filtering.
+          const scopedTx = this.uowFactory.narrow(tx, env.tenantId);
+
           for (const p of this.projections) {
             if (!matchesTopic(p.topicFilter, row.topic)) continue;
 
-            const cp = await this.checkpoints.get(tx, p.name);
+            // Checkpoints are per-tenant — use the envelope's tenantId, not
+            // the outer tx's. The outer tx writes the checkpoint row even
+            // though it's for a different tenant; that's fine because
+            // projection_checkpoints is keyed by (projection_name, tenant_id)
+            // and the writes don't conflict across tenants.
+            const cp = await this.checkpoints.get(tx, p.name, env.tenantId);
             if (env.globalPosition <= cp.lastGlobalPosition) continue;
 
-            await this.runProjectionHandler(p, tx, env, row.attempts);
-            await this.checkpoints.set(tx, p.name, env.globalPosition);
+            await this.runProjectionHandler(p, scopedTx, env, row.attempts);
+            await this.checkpoints.set(tx, p.name, env.tenantId, env.globalPosition);
           }
 
           await this.outbox.ack(tx, row.id);
@@ -257,14 +281,16 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
           return;
         }
 
+        const scopedTx = this.uowFactory.narrow(tx, env.tenantId);
+
         for (const p of this.projections) {
           if (!matchesTopic(p.topicFilter, row.topic)) continue;
 
-          const cp = await this.checkpoints.get(tx, p.name);
+          const cp = await this.checkpoints.get(tx, p.name, env.tenantId);
           if (env.globalPosition <= cp.lastGlobalPosition) continue;
 
-          await this.runProjectionHandler(p, tx, env, row.attempts);
-          await this.checkpoints.set(tx, p.name, env.globalPosition);
+          await this.runProjectionHandler(p, scopedTx, env, row.attempts);
+          await this.checkpoints.set(tx, p.name, env.tenantId, env.globalPosition);
         }
 
         await this.outbox.ack(tx, row.id);

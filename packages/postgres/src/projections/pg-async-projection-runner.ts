@@ -8,8 +8,14 @@ import { PgOutboxStore } from "../outbox/pg-outbox-store";
 import type { PgTx } from "../unitofwork/pg-transaction";
 
 /**
- * Factory function to create a PostgreSQL-specific async projection runner.
- * This wires up all the PostgreSQL implementations with the core orchestration logic.
+ * Factory for a PostgreSQL-backed async projection runner.
+ *
+ * The runner is tenant-aware: the outer batch tx runs in the "default"
+ * tenant (outbox claim/ack/dead-letter are cross-tenant queue ops), and the
+ * handler invocation for each event narrows the tx to that event's tenant
+ * so `loadStream` / `append` inside the handler see the right tenant's
+ * data. Per-tenant checkpoints let one tenant's retry backoff advance
+ * independently of other tenants' progress.
  */
 export function createAsyncProjectionRunner<E extends AnyEvent>(
   pool: Pool,
@@ -33,7 +39,6 @@ export function createAsyncProjectionRunner<E extends AnyEvent>(
 
 /**
  * @deprecated Use createAsyncProjectionRunner instead.
- * This class is kept for backward compatibility but will be removed in a future version.
  */
 export class PgAsyncProjectionRunner<E extends AnyEvent> {
   private readonly runner: AsyncProjectionRunner<E, PgTx>;

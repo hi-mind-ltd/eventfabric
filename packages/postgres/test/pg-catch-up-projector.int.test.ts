@@ -70,7 +70,7 @@ describe("PgCatchUpProjector", () => {
     // Verify checkpoint was updated
     const checkpoints = new PgProjectionCheckpointStore();
     const cp = await uow.withTransaction(async (tx) => {
-      return checkpoints.get(tx, "test-projection");
+      return checkpoints.get(tx, "test-projection", "default");
     });
     expect(cp.lastGlobalPosition).toBeGreaterThan(0n);
   });
@@ -256,7 +256,7 @@ describe("PgCatchUpProjector", () => {
 
     // Set checkpoint to first event
     await uow.withTransaction(async (tx) => {
-      await checkpoints.set(tx, "resume-test", firstGlobalPos);
+      await checkpoints.set(tx, "resume-test", "default", firstGlobalPos);
     });
 
     const handled: EventEnvelope<E>[] = [];
@@ -321,10 +321,10 @@ describe("PgCatchUpProjector", () => {
     
     // Verify both checkpoints were updated
     const cp1 = await uow.withTransaction(async (tx) => {
-      return checkpoints.get(tx, "multi-1");
+      return checkpoints.get(tx, "multi-1", "default");
     });
     const cp2 = await uow.withTransaction(async (tx) => {
-      return checkpoints.get(tx, "multi-2");
+      return checkpoints.get(tx, "multi-2", "default");
     });
     expect(cp1.lastGlobalPosition).toBeGreaterThan(0n);
     expect(cp2.lastGlobalPosition).toBeGreaterThan(0n);
@@ -388,7 +388,7 @@ describe("PgCatchUpProjector", () => {
     // Verify checkpoint is set to last event's global position
     const checkpoints = new PgProjectionCheckpointStore();
     const cp = await uow.withTransaction(async (tx) => {
-      return checkpoints.get(tx, "checkpoint-test");
+      return checkpoints.get(tx, "checkpoint-test", "default");
     });
     expect(cp.lastGlobalPosition).toBe(lastGlobalPos);
   });

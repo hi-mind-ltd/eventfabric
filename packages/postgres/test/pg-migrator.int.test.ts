@@ -35,6 +35,7 @@ describe("migrate() — fresh database", () => {
       "005_stream_versions",
       "006_performance",
       "008_tenant_id",
+      "009_per_tenant_projection_checkpoints",
     ]);
     expect(result.partitioned).toBe(false);
   });
@@ -147,6 +148,7 @@ describe("migrate() — partitioning from scratch", () => {
       "005_stream_versions",
       "006_performance",
       "008_tenant_id",
+      "009_per_tenant_projection_checkpoints",
       "007_partitioning",
     ]);
     expect(result.partitioned).toBe(true);
@@ -242,8 +244,8 @@ describe("migrate() — data integrity across all tables", () => {
 
     // Seed projection checkpoints
     await uow.withTransaction(async (tx) => {
-      await checkpoints.set(tx, "test-projection-a", BigInt(TOTAL_EVENTS - 10));
-      await checkpoints.set(tx, "test-projection-b", BigInt(TOTAL_EVENTS));
+      await checkpoints.set(tx, "test-projection-a", "default", BigInt(TOTAL_EVENTS - 10));
+      await checkpoints.set(tx, "test-projection-b", "default", BigInt(TOTAL_EVENTS));
     });
 
     // Verify counts
