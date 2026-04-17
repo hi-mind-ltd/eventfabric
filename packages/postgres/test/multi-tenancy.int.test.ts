@@ -554,6 +554,30 @@ describe("multi-tenancy: dismiss isolation", () => {
     );
     expect(afterB[0].dismissed_at).toBeNull();
   });
+
+  it("dismiss with wrong tenant is a no-op", async () => {
+    const factory = createFactory();
+
+    const sA = factory.createSession("tenant-a");
+    sA.startStream("acc-dismiss2", { type: "AccountOpened", version: 1, accountId: "acc-dismiss2", owner: "A", balance: 50 } as TestEvent);
+    await sA.saveChangesAsync();
+
+    // Get tenant-A's event_id
+    const { rows } = await pool.query(
+      `SELECT event_id FROM eventfabric.events WHERE tenant_id = 'tenant-a' AND aggregate_id = 'acc-dismiss2'`
+    );
+    const eventId = rows[0].event_id;
+
+    // Try to dismiss from tenant-b's context — should be a no-op
+    const uowB = new PgUnitOfWork(pool, "tenant-b");
+    await uowB.withTransaction(tx => store.dismiss(tx, eventId, { reason: "wrong tenant" }));
+
+    // Event is still NOT dismissed
+    const { rows: after } = await pool.query(
+      `SELECT dismissed_at FROM eventfabric.events WHERE event_id = $1`, [eventId]
+    );
+    expect(after[0].dismissed_at).toBeNull();
+  });
 });
 
 // ============================================================================
@@ -818,12 +842,28 @@ describe("multi-tenancy: projection side-effect scenarios", () => {
     expect(succeeded).toContain("tenant-1");
     expect(succeeded).not.toContain("tenant-2");
 
-    // Tenant-2's event should be in DLQ (or released with error)
-    // The outbox for tenant-1 should be empty (acked)
+    // Tenant-1's outbox entry should be acked (deleted)
     const { rows: outboxRows } = await pool.query(
       `SELECT tenant_id FROM eventfabric.outbox WHERE dead_lettered_at IS NULL`
     );
     const tenant1InOutbox = outboxRows.filter((r: any) => r.tenant_id === "tenant-1");
-    expect(tenant1InOutbox).toHaveLength(0); // tenant-1 was acked
+    expect(tenant1InOutbox).toHaveLength(0);
+
+    // Tenant-2's event should be in DLQ with its tenant_id preserved
+    const { rows: dlqRows } = await pool.query(
+      `SELECT tenant_id FROM eventfabric.outbox_dead_letters`
+    );
+    expect(dlqRows.length).toBeGreaterThanOrEqual(1);
+    expect(dlqRows.some((r: any) => r.tenant_id === "tenant-2")).toBe(true);
+
+    // DLQ service scoped to tenant-2 should see the item
+    const dlq2 = new PgDlqService(pool, undefined, undefined, "tenant-2");
+    const dlqResult = await dlq2.list({});
+    expect(dlqResult.total).toBeGreaterThanOrEqual(1);
+
+    // DLQ service scoped to tenant-1 should see nothing
+    const dlq1 = new PgDlqService(pool, undefined, undefined, "tenant-1");
+    const dlqResult1 = await dlq1.list({});
+    expect(dlqResult1.total).toBe(0);
   }, 10000);
 });
