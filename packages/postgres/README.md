@@ -11,6 +11,7 @@ Includes:
 - Projection checkpoints
 - Snapshots (latest-only) with schema versioning/upcasting
 - Automatic database migrations
+- [Multi-tenancy](docs/multi-tenancy.md) — conjoined (shared database) or per-database isolation
 
 ## Install
 
