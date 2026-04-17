@@ -1,5 +1,7 @@
 ---
+"@eventfabric/core": patch
 "@eventfabric/postgres": patch
+"@eventfabric/opentelemetry": patch
 ---
 
 Add conjoined multi-tenancy support with `TenantResolver`. All tables now include a `tenant_id` column (DEFAULT 'default' for backwards compatibility). `SessionFactory` accepts a `Pool` (single-tenant) or a `TenantResolver` (multi-tenant). `PgEventStore` and `PgSnapshotStore` constructors refactored to options bag.
