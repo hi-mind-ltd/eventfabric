@@ -6,6 +6,7 @@ import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore } from "../src/pg-event-store";
 import { PgSnapshotStore } from "../src/snapshots/pg-snapshot-store";
 import { createAsyncProjectionRunner } from "../src/projections/pg-async-projection-runner";
+import { migrate } from "../src/pg-migrator";
 import type { PgTx } from "../src/unitofwork/pg-transaction";
 
 // User Events - Define event metadata once
@@ -79,76 +80,13 @@ class UserAggregate extends AggregateRoot<UserState, UserEvent> {
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
+beforeAll(async () => {
+  container = await new PostgreSqlContainer("postgres:16-alpine").start();
+  pool = new Pool({ connectionString: container.getConnectionUri() });
+  await migrate(pool);
+
+  // Extra search table for inline projection
   await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-    CREATE TABLE IF NOT EXISTS eventfabric.stream_versions (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      current_version INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-    CREATE TABLE IF NOT EXISTS eventfabric.events (
-      global_position BIGSERIAL PRIMARY KEY,
-      event_id UUID NOT NULL UNIQUE,
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      type TEXT NOT NULL,
-      version INT NOT NULL,
-      payload JSONB NOT NULL,
-      occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      dismissed_at TIMESTAMPTZ NULL,
-      dismissed_reason TEXT NULL,
-      dismissed_by TEXT NULL,
-      correlation_id TEXT NULL,
-      causation_id TEXT NULL,
-      UNIQUE (aggregate_name, aggregate_id, aggregate_version)
-    );
-    CREATE INDEX IF NOT EXISTS events_global_idx ON eventfabric.events (global_position);
-
-    CREATE TABLE IF NOT EXISTS eventfabric.projection_checkpoints (
-      projection_name TEXT PRIMARY KEY,
-      last_global_position BIGINT NOT NULL DEFAULT 0,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-
-    CREATE TABLE IF NOT EXISTS eventfabric.outbox (
-      id BIGSERIAL PRIMARY KEY,
-      global_position BIGINT NOT NULL UNIQUE,
-      topic TEXT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      locked_at TIMESTAMPTZ NULL,
-      locked_by TEXT NULL,
-      attempts INT NOT NULL DEFAULT 0,
-      last_error TEXT NULL,
-      dead_lettered_at TIMESTAMPTZ NULL,
-      dead_letter_reason TEXT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS eventfabric.outbox_dead_letters (
-      id BIGSERIAL PRIMARY KEY,
-      outbox_id BIGINT NOT NULL,
-      global_position BIGINT NOT NULL,
-      topic TEXT NULL,
-      attempts INT NOT NULL,
-      last_error TEXT NULL,
-      dead_lettered_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-
-    CREATE TABLE IF NOT EXISTS eventfabric.snapshots (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL,
-      snapshot_schema_version INT NOT NULL,
-      state JSONB NOT NULL,
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-
-    -- Search table for inline projection
     CREATE TABLE IF NOT EXISTS user_search (
       user_id TEXT PRIMARY KEY,
       email TEXT NOT NULL,
@@ -159,12 +97,6 @@ async function migrate() {
     CREATE INDEX IF NOT EXISTS user_search_email_idx ON user_search (email);
     CREATE INDEX IF NOT EXISTS user_search_display_name_idx ON user_search (display_name);
   `);
-}
-
-beforeAll(async () => {
-  container = await new PostgreSqlContainer("postgres:16-alpine").start();
-  pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
 }, 60000);
 
 afterAll(async () => {
@@ -187,7 +119,7 @@ describe("User Integration Test", () => {
   it("registers and activates user in same transaction, creates snapshot, updates search table, and processes async email", async () => {
     const uow = new PgUnitOfWork(pool);
     const eventStore = new PgEventStore<UserEvent>();
-    const snapshotStore = new PgSnapshotStore<UserState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<UserState>();
 
     // Inline projection: Update search table
     const inlineProjector = new InlineProjector<UserEvent, PgTx>([
@@ -344,7 +276,7 @@ describe("User Integration Test", () => {
   it("loads user from snapshot and replays remaining events", async () => {
     const uow = new PgUnitOfWork(pool);
     const eventStore = new PgEventStore<UserEvent>();
-    const snapshotStore = new PgSnapshotStore<UserState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<UserState>();
 
     const inlineProjector = new InlineProjector<UserEvent, PgTx>([]);
     const userRepo = new Repository<UserAggregate, UserState, UserEvent, PgTx>(
@@ -388,7 +320,7 @@ describe("User Integration Test", () => {
   it("handles multiple events in single transaction with inline projection", async () => {
     const uow = new PgUnitOfWork(pool);
     const eventStore = new PgEventStore<UserEvent>();
-    const snapshotStore = new PgSnapshotStore<UserState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<UserState>();
 
     let projectionCalls: string[] = [];
     const inlineProjector = new InlineProjector<UserEvent, PgTx>([
@@ -426,7 +358,7 @@ describe("User Integration Test", () => {
   it("retries failed email sending 3 times then moves to DLQ and removes from outbox", async () => {
     const uow = new PgUnitOfWork(pool);
     const eventStore = new PgEventStore<UserEvent>();
-    const snapshotStore = new PgSnapshotStore<UserState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<UserState>();
 
     const inlineProjector = new InlineProjector<UserEvent, PgTx>([]);
     const userRepo = new Repository<UserAggregate, UserState, UserEvent, PgTx>(

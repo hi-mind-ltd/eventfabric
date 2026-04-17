@@ -3,25 +3,15 @@ import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
 import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgProjectionCheckpointStore } from "../src/projections/pg-projection-checkpoint-store";
+import { migrate } from "../src/pg-migrator";
 
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
-  await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-    CREATE TABLE IF NOT EXISTS eventfabric.projection_checkpoints (
-      projection_name TEXT PRIMARY KEY,
-      last_global_position BIGINT NOT NULL DEFAULT 0,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-}
-
 beforeAll(async () => {
   container = await new PostgreSqlContainer("postgres:16-alpine").start();
   pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
+  await migrate(pool);
 }, 60000);
 
 afterAll(async () => {

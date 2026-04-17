@@ -34,6 +34,7 @@ describe("migrate() — fresh database", () => {
       "004_snapshots",
       "005_stream_versions",
       "006_performance",
+      "008_tenant_id",
     ]);
     expect(result.partitioned).toBe(false);
   });
@@ -145,6 +146,7 @@ describe("migrate() — partitioning from scratch", () => {
       "004_snapshots",
       "005_stream_versions",
       "006_performance",
+      "008_tenant_id",
       "007_partitioning",
     ]);
     expect(result.partitioned).toBe(true);

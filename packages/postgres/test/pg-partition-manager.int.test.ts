@@ -4,62 +4,17 @@ import { Pool } from "pg";
 import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore } from "../src/pg-event-store";
 import { PgPartitionManager } from "../src/partitioning/pg-partition-manager";
+import { migrate } from "../src/pg-migrator";
 
 type E = { type: "Tick"; version: 1; n: number };
 
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
-  await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-
-    CREATE TABLE IF NOT EXISTS eventfabric.stream_versions (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      current_version INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS eventfabric.events (
-      global_position BIGSERIAL PRIMARY KEY,
-      event_id UUID NOT NULL,
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      type TEXT NOT NULL,
-      version INT NOT NULL,
-      payload JSONB NOT NULL,
-      occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      dismissed_at TIMESTAMPTZ NULL,
-      dismissed_reason TEXT NULL,
-      dismissed_by TEXT NULL,
-      correlation_id TEXT NULL,
-      causation_id TEXT NULL
-    );
-    CREATE INDEX IF NOT EXISTS events_global_idx ON eventfabric.events (global_position);
-
-    CREATE TABLE IF NOT EXISTS eventfabric.outbox (
-      id BIGSERIAL PRIMARY KEY,
-      global_position BIGINT NOT NULL UNIQUE,
-      topic TEXT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      locked_at TIMESTAMPTZ NULL,
-      locked_by TEXT NULL,
-      attempts INT NOT NULL DEFAULT 0,
-      last_error TEXT NULL,
-      dead_lettered_at TIMESTAMPTZ NULL,
-      dead_letter_reason TEXT NULL
-    );
-  `);
-}
-
 beforeAll(async () => {
   container = await new PostgreSqlContainer("postgres:16-alpine").start();
   pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
+  await migrate(pool);
 }, 120000);
 
 afterAll(async () => {
@@ -191,12 +146,14 @@ describe("PgPartitionManager", () => {
     `);
     // Parent-level index entry exists for partitioned tables
     expect(result.rowCount).toBe(1);
+    // The index should include tenant_id as the leading column
+    expect(result.rows[0].indexdef).toContain("tenant_id");
     // The actual indexes live on the partitions
     const partitionIndexes = await pool.query(`
       SELECT indexname
       FROM pg_indexes
       WHERE schemaname = 'eventfabric'
-        AND indexdef LIKE '%aggregate_name%aggregate_id%aggregate_version%'
+        AND indexdef LIKE '%tenant_id%aggregate_name%aggregate_id%aggregate_version%'
         AND indexdef LIKE '%INCLUDE%payload%'
     `);
     expect(partitionIndexes.rowCount).toBeGreaterThan(0);
@@ -212,45 +169,7 @@ describe("PgPartitionManager with pre-existing data", () => {
     pool2 = new Pool({ connectionString: container2.getConnectionUri() });
 
     // Create schema with data BEFORE partitioning
-    await pool2.query(`
-      CREATE SCHEMA IF NOT EXISTS eventfabric;
-      CREATE TABLE IF NOT EXISTS eventfabric.stream_versions (
-        aggregate_name TEXT NOT NULL,
-        aggregate_id TEXT NOT NULL,
-        current_version INT NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        PRIMARY KEY (aggregate_name, aggregate_id)
-      );
-      CREATE TABLE IF NOT EXISTS eventfabric.events (
-        global_position BIGSERIAL PRIMARY KEY,
-        event_id UUID NOT NULL,
-        aggregate_name TEXT NOT NULL,
-        aggregate_id TEXT NOT NULL,
-        aggregate_version INT NOT NULL,
-        type TEXT NOT NULL,
-        version INT NOT NULL,
-        payload JSONB NOT NULL,
-        occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        dismissed_at TIMESTAMPTZ NULL,
-        dismissed_reason TEXT NULL,
-        dismissed_by TEXT NULL,
-        correlation_id TEXT NULL,
-        causation_id TEXT NULL
-      );
-      CREATE TABLE IF NOT EXISTS eventfabric.outbox (
-        id BIGSERIAL PRIMARY KEY,
-        global_position BIGINT NOT NULL UNIQUE,
-        topic TEXT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        locked_at TIMESTAMPTZ NULL,
-        locked_by TEXT NULL,
-        attempts INT NOT NULL DEFAULT 0,
-        last_error TEXT NULL,
-        dead_lettered_at TIMESTAMPTZ NULL,
-        dead_letter_reason TEXT NULL
-      );
-    `);
+    await migrate(pool2);
 
     // Seed 15 events across 3 streams
     const store = new PgEventStore<E>();

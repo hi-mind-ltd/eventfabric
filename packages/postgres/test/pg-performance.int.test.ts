@@ -4,82 +4,17 @@ import { Pool } from "pg";
 import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore } from "../src/pg-event-store";
 import { PgOutboxStore } from "../src/outbox/pg-outbox-store";
+import { migrate } from "../src/pg-migrator";
 
 type E = { type: "Tick"; version: 1; n: number };
 
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
-  await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-
-    CREATE TABLE IF NOT EXISTS eventfabric.stream_versions (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      current_version INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS eventfabric.events (
-      global_position BIGSERIAL PRIMARY KEY,
-      event_id UUID NOT NULL UNIQUE,
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      type TEXT NOT NULL,
-      version INT NOT NULL,
-      payload JSONB NOT NULL,
-      occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      dismissed_at TIMESTAMPTZ NULL,
-      dismissed_reason TEXT NULL,
-      dismissed_by TEXT NULL,
-      correlation_id TEXT NULL,
-      causation_id TEXT NULL,
-      UNIQUE (aggregate_name, aggregate_id, aggregate_version)
-    );
-    CREATE INDEX IF NOT EXISTS events_global_idx ON eventfabric.events (global_position);
-
-    CREATE TABLE IF NOT EXISTS eventfabric.outbox (
-      id BIGSERIAL PRIMARY KEY,
-      global_position BIGINT NOT NULL UNIQUE,
-      topic TEXT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      locked_at TIMESTAMPTZ NULL,
-      locked_by TEXT NULL,
-      attempts INT NOT NULL DEFAULT 0,
-      last_error TEXT NULL,
-      dead_lettered_at TIMESTAMPTZ NULL,
-      dead_letter_reason TEXT NULL
-    );
-  `);
-
-  // Apply performance migration (006_performance.sql equivalent)
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS outbox_claimable_idx
-      ON eventfabric.outbox (id ASC)
-      WHERE dead_lettered_at IS NULL AND locked_at IS NULL;
-
-    ALTER TABLE eventfabric.outbox SET (
-      autovacuum_vacuum_scale_factor = 0.01,
-      autovacuum_analyze_scale_factor = 0.005,
-      autovacuum_vacuum_cost_delay = 0
-    );
-
-    CREATE INDEX IF NOT EXISTS events_stream_covering_idx
-      ON eventfabric.events (aggregate_name, aggregate_id, aggregate_version)
-      INCLUDE (event_id, type, version, payload, occurred_at,
-               dismissed_at, dismissed_reason, dismissed_by,
-               correlation_id, causation_id);
-  `);
-}
-
 beforeAll(async () => {
   container = await new PostgreSqlContainer("postgres:16-alpine").start();
   pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
+  await migrate(pool);
 }, 60000);
 
 afterAll(async () => {
@@ -255,14 +190,17 @@ describe("Performance optimizations", () => {
                        dismissed_at, dismissed_reason, dismissed_by,
                        correlation_id, causation_id
         FROM eventfabric.events
-        WHERE aggregate_name = 'CoverTest' AND aggregate_id = 'ct-1'
+        WHERE tenant_id = 'default' AND aggregate_name = 'CoverTest' AND aggregate_id = 'ct-1'
         ORDER BY aggregate_version ASC
       `);
       await pool.query(`SET enable_seqscan = on`);
       const plan = explain.rows.map((r: any) => r["QUERY PLAN"]).join("\n").toLowerCase();
 
-      // With seq scan disabled, the planner must use the covering index
-      expect(plan).toContain("events_stream_covering_idx");
+      // With seq scan disabled, the planner must use an index on the tenant+stream columns.
+      // It may pick either the covering index or the unique constraint index — both cover
+      // (tenant_id, aggregate_name, aggregate_id, aggregate_version).
+      expect(plan).toMatch(/index.*scan/);
+      expect(plan).toContain("tenant_id");
     });
 
     it("loadStream returns correct results with covering index", async () => {

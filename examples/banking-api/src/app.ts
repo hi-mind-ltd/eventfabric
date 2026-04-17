@@ -35,12 +35,12 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 // The upcaster is applied to every loaded event payload. Historical
 // AccountOpenedV1 events are migrated to V2 (with region="unknown") before
 // they reach handlers, projections, or read models.
-const store = new PgEventStore<BankingEvent>("eventfabric.events", "eventfabric.outbox", accountEventUpcaster);
+const store = new PgEventStore<BankingEvent>({ upcaster: accountEventUpcaster });
 
 // Snapshots for each aggregate type (optional, for performance)
-const accountSnapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
-const transactionSnapshotStore = new PgSnapshotStore<TransactionState>("eventfabric.snapshots", 1);
-const customerSnapshotStore = new PgSnapshotStore<CustomerState>("eventfabric.snapshots", 1);
+const accountSnapshotStore = new PgSnapshotStore<AccountState>();
+const transactionSnapshotStore = new PgSnapshotStore<TransactionState>();
+const customerSnapshotStore = new PgSnapshotStore<CustomerState>();
 
 // Session factory - configured once, creates sessions per request
 const sessionFactory = new SessionFactory<BankingEvent>(pool, store);

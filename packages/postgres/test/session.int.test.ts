@@ -6,6 +6,7 @@ import { PgSnapshotStore } from "../src/snapshots/pg-snapshot-store";
 import { SessionFactory } from "../src/session";
 import type { PgTx } from "../src/unitofwork/pg-transaction";
 import { AggregateRoot, InlineProjector } from "@eventfabric/core";
+import { migrate } from "../src/pg-migrator";
 
 // Test Events
 type AccountOpenedV1 = {
@@ -103,60 +104,13 @@ class TransactionAggregate extends AggregateRoot<TransactionState, TransactionEv
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
+beforeAll(async () => {
+  container = await new PostgreSqlContainer("postgres:16-alpine").start();
+  pool = new Pool({ connectionString: container.getConnectionUri() });
+  await migrate(pool);
+
+  // Extra read model table for inline projection verification
   await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-    CREATE TABLE IF NOT EXISTS eventfabric.stream_versions (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      current_version INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-    CREATE TABLE IF NOT EXISTS eventfabric.events (
-      global_position BIGSERIAL PRIMARY KEY,
-      event_id UUID NOT NULL UNIQUE,
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      type TEXT NOT NULL,
-      version INT NOT NULL,
-      payload JSONB NOT NULL,
-      occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      dismissed_at TIMESTAMPTZ NULL,
-      dismissed_reason TEXT NULL,
-      dismissed_by TEXT NULL,
-      correlation_id TEXT NULL,
-      causation_id TEXT NULL,
-      UNIQUE (aggregate_name, aggregate_id, aggregate_version)
-    );
-    CREATE INDEX IF NOT EXISTS events_global_idx ON eventfabric.events (global_position);
-
-    CREATE TABLE IF NOT EXISTS eventfabric.outbox (
-      id BIGSERIAL PRIMARY KEY,
-      global_position BIGINT NOT NULL UNIQUE,
-      topic TEXT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      locked_at TIMESTAMPTZ NULL,
-      locked_by TEXT NULL,
-      attempts INT NOT NULL DEFAULT 0,
-      last_error TEXT NULL,
-      dead_lettered_at TIMESTAMPTZ NULL,
-      dead_letter_reason TEXT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS eventfabric.snapshots (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      snapshot_schema_version INT NOT NULL,
-      state JSONB NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-
-    -- Simple read model table for inline projection verification
     CREATE TABLE IF NOT EXISTS account_read (
       account_id TEXT PRIMARY KEY,
       customer_id TEXT,
@@ -165,12 +119,6 @@ async function migrate() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-}
-
-beforeAll(async () => {
-  container = await new PostgreSqlContainer("postgres:16-alpine").start();
-  pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
 }, 120000);
 
 afterAll(async () => {
@@ -718,7 +666,7 @@ describe("Session", () => {
 
   it("should use snapshot store when registered and loading aggregate", async () => {
     const store = new PgEventStore<TestEvent>();
-    const snapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<AccountState>();
     const factory = new SessionFactory(pool, store);
 
     factory.registerAggregate(AccountAggregate, [
@@ -790,7 +738,7 @@ describe("Session", () => {
 
   it("should register aggregate with snapshot store via registerAggregate", () => {
     const store = new PgEventStore<TestEvent>();
-    const snapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<AccountState>();
     const factory = new SessionFactory(pool, store);
 
     expect(() => {
@@ -815,7 +763,7 @@ describe("Session", () => {
 
   it("should use snapshot store when registered via registerAggregate", async () => {
     const store = new PgEventStore<TestEvent>();
-    const snapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<AccountState>();
     const factory = new SessionFactory(pool, store);
 
     // Register with snapshot store via registerAggregate
@@ -902,8 +850,8 @@ describe("Session", () => {
 
   it("should register multiple aggregates with different snapshot stores", async () => {
     const store = new PgEventStore<TestEvent>();
-    const accountSnapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
-    const transactionSnapshotStore = new PgSnapshotStore<TransactionState>("eventfabric.snapshots", 1);
+    const accountSnapshotStore = new PgSnapshotStore<AccountState>();
+    const transactionSnapshotStore = new PgSnapshotStore<TransactionState>();
     const factory = new SessionFactory(pool, store);
 
     // Register Account with snapshot store
@@ -1026,7 +974,7 @@ describe("Session", () => {
 
   it("creates snapshots automatically based on snapshot policy", async () => {
     const store = new PgEventStore<TestEvent>();
-    const snapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<AccountState>();
     const factory = new SessionFactory(pool, store);
 
     factory.registerAggregate(AccountAggregate, [
@@ -1074,7 +1022,7 @@ describe("Session", () => {
 
   it("loadAggregateAsync replays full history (ignores snapshot)", async () => {
     const store = new PgEventStore<TestEvent>();
-    const snapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<AccountState>();
     const factory = new SessionFactory(pool, store);
 
     // snapshot every event so snapshots exist, but loadAggregateAsync should still replay all
@@ -1111,7 +1059,7 @@ describe("Session", () => {
 
   it("loadSnapshotAsync returns latest snapshot without replay", async () => {
     const store = new PgEventStore<TestEvent>();
-    const snapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
+    const snapshotStore = new PgSnapshotStore<AccountState>();
     const factory = new SessionFactory(pool, store);
 
     factory.registerAggregate(AccountAggregate, [
