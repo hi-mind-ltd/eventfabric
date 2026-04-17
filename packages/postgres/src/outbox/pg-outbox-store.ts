@@ -38,7 +38,8 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
       `WITH cte AS (
          SELECT id
          FROM ${this.outboxTable}
-         WHERE dead_lettered_at IS NULL
+         WHERE tenant_id = $4
+           AND dead_lettered_at IS NULL
            AND locked_at IS NULL
            AND ($3::text IS NULL OR topic = $3)
          ORDER BY id ASC
@@ -52,7 +53,7 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
        FROM cte
        WHERE o.id = cte.id
        RETURNING o.id, o.global_position, o.topic, o.attempts`,
-      [batchSize, workerId, topic ?? null]
+      [batchSize, workerId, topic ?? null, tx.tenantId]
     );
 
     return res.rows.map((r: unknown) => {
@@ -67,37 +68,36 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
   }
 
   async ack(tx: PgTx, id: OutboxRow["id"]): Promise<void> {
-    await tx.client.query(`DELETE FROM ${this.outboxTable} WHERE id = $1`, [id]);
+    await tx.client.query(`DELETE FROM ${this.outboxTable} WHERE tenant_id = $1 AND id = $2`, [tx.tenantId, id]);
   }
 
   async releaseWithError(tx: PgTx, id: OutboxRow["id"], error: string): Promise<void> {
     await tx.client.query(
       `UPDATE ${this.outboxTable}
-       SET locked_at = NULL, locked_by = NULL, last_error = $2
-       WHERE id = $1`,
-      [id, error]
+       SET locked_at = NULL, locked_by = NULL, last_error = $3
+       WHERE tenant_id = $1 AND id = $2`,
+      [tx.tenantId, id, error]
     );
   }
 
   async deadLetter(tx: PgTx, row: OutboxRow, reason: string): Promise<void> {
     // copy details then delete from outbox
     await tx.client.query(
-      `INSERT INTO ${this.dlqTable} (outbox_id, global_position, topic, attempts, last_error, dead_lettered_at)
-       SELECT id, global_position, topic, attempts, last_error, now()
+      `INSERT INTO ${this.dlqTable} (tenant_id, outbox_id, global_position, topic, attempts, last_error, dead_lettered_at)
+       SELECT tenant_id, id, global_position, topic, attempts, last_error, now()
        FROM ${this.outboxTable}
-       WHERE id = $1`,
-      [row.id]
+       WHERE tenant_id = $1 AND id = $2`,
+      [tx.tenantId, row.id]
     );
 
     await tx.client.query(
       `UPDATE ${this.outboxTable}
-       SET dead_lettered_at = now(), dead_letter_reason = $2
-       WHERE id = $1`,
-      [row.id, reason]
+       SET dead_lettered_at = now(), dead_letter_reason = $3
+       WHERE tenant_id = $1 AND id = $2`,
+      [tx.tenantId, row.id, reason]
     );
 
     // remove from active queue
-    await tx.client.query(`DELETE FROM ${this.outboxTable} WHERE id = $1`, [row.id]);
-    void reason;
+    await tx.client.query(`DELETE FROM ${this.outboxTable} WHERE tenant_id = $1 AND id = $2`, [tx.tenantId, row.id]);
   }
 }

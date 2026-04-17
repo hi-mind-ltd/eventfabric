@@ -8,16 +8,16 @@ export class PgProjectionCheckpointStore implements ProjectionCheckpointStore<Pg
     const res = await tx.client.query(
       `SELECT projection_name, last_global_position, updated_at
        FROM ${this.tableName}
-       WHERE projection_name = $1`,
-      [projectionName]
+       WHERE tenant_id = $1 AND projection_name = $2`,
+      [tx.tenantId, projectionName]
     );
 
     if (res.rowCount === 0) {
       await tx.client.query(
-        `INSERT INTO ${this.tableName} (projection_name, last_global_position)
-         VALUES ($1, 0)
-         ON CONFLICT (projection_name) DO NOTHING`,
-        [projectionName]
+        `INSERT INTO ${this.tableName} (tenant_id, projection_name, last_global_position)
+         VALUES ($1, $2, 0)
+         ON CONFLICT (tenant_id, projection_name) DO NOTHING`,
+        [tx.tenantId, projectionName]
       );
       return { projectionName, lastGlobalPosition: 0n, updatedAt: new Date().toISOString() };
     }
@@ -32,14 +32,14 @@ export class PgProjectionCheckpointStore implements ProjectionCheckpointStore<Pg
 
   async set(tx: PgTx, projectionName: string, lastGlobalPosition: bigint): Promise<void> {
     await tx.client.query(
-      `INSERT INTO ${this.tableName} (projection_name, last_global_position, updated_at)
-       VALUES ($1, $2, now())
-       ON CONFLICT (projection_name)
+      `INSERT INTO ${this.tableName} (tenant_id, projection_name, last_global_position, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (tenant_id, projection_name)
        DO UPDATE SET
          last_global_position = EXCLUDED.last_global_position,
          updated_at = now()
        WHERE ${this.tableName}.last_global_position <= EXCLUDED.last_global_position`,
-      [projectionName, lastGlobalPosition.toString()]
+      [tx.tenantId, projectionName, lastGlobalPosition.toString()]
     );
   }
 }

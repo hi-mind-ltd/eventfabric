@@ -2,13 +2,16 @@ import type { Pool } from "pg";
 import type { PgTx } from "./pg-transaction";
 
 export class PgUnitOfWork {
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    private readonly tenantId: string = "default"
+  ) {}
 
   async withTransaction<T>(fn: (tx: PgTx) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const res = await fn({ client });
+      const res = await fn({ client, tenantId: this.tenantId });
       await client.query("COMMIT");
       return res;
     } catch (e) {

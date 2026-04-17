@@ -9,9 +9,10 @@ export class PgDlqService implements DlqService {
   constructor(
     pool: Pool,
     private readonly outboxTable: string = "eventfabric.outbox",
-    private readonly dlqTable: string = "eventfabric.outbox_dead_letters"
+    private readonly dlqTable: string = "eventfabric.outbox_dead_letters",
+    tenantId: string = "default"
   ) {
-    this.uow = new PgUnitOfWork(pool);
+    this.uow = new PgUnitOfWork(pool, tenantId);
   }
 
   async list(options: ListDlqOptions = {}): Promise<{ items: DlqItem[]; total: number }> {
@@ -19,11 +20,11 @@ export class PgDlqService implements DlqService {
     const offset = options.offset ?? 0;
 
     return this.uow.withTransaction(async (tx) => {
-      const where = `($1::text IS NULL OR topic = $1)`;
+      const where = `tenant_id = $1 AND ($2::text IS NULL OR topic = $2)`;
 
       const totalRes = await tx.client.query(
         `SELECT COUNT(*)::int AS total FROM ${this.dlqTable} WHERE ${where}`,
-        [options.topic ?? null]
+        [tx.tenantId, options.topic ?? null]
       );
 
       const res = await tx.client.query(
@@ -31,8 +32,8 @@ export class PgDlqService implements DlqService {
          FROM ${this.dlqTable}
          WHERE ${where}
          ORDER BY dead_lettered_at DESC
-         LIMIT $2 OFFSET $3`,
-        [options.topic ?? null, limit, offset]
+         LIMIT $3 OFFSET $4`,
+        [tx.tenantId, options.topic ?? null, limit, offset]
       );
 
       return {
@@ -55,8 +56,8 @@ export class PgDlqService implements DlqService {
       const res = await tx.client.query(
         `SELECT id, outbox_id, global_position, topic, attempts, last_error, dead_lettered_at
          FROM ${this.dlqTable}
-         WHERE id = $1`,
-        [dlqId]
+         WHERE tenant_id = $1 AND id = $2`,
+        [tx.tenantId, dlqId]
       );
       if (res.rowCount === 0) return null;
       const r: any = res.rows[0];
@@ -82,9 +83,9 @@ export class PgDlqService implements DlqService {
     const dlqRes = await tx.client.query(
       `SELECT id, global_position, topic
        FROM ${this.dlqTable}
-       WHERE id = $1
+       WHERE tenant_id = $1 AND id = $2
        FOR UPDATE`,
-      [dlqId]
+      [tx.tenantId, dlqId]
     );
 
     if (dlqRes.rowCount === 0) return { requeued: false, reason: "DLQ item not found" };
@@ -94,21 +95,21 @@ export class PgDlqService implements DlqService {
     const topic = row.topic ?? null;
 
     await tx.client.query(
-      `INSERT INTO ${this.outboxTable} (global_position, topic, locked_at, locked_by, attempts, last_error)
-       VALUES ($1, $2, NULL, NULL, 0, NULL)
+      `INSERT INTO ${this.outboxTable} (tenant_id, global_position, topic, locked_at, locked_by, attempts, last_error)
+       VALUES ($1, $2, $3, NULL, NULL, 0, NULL)
        ON CONFLICT (global_position) DO NOTHING`,
-      [globalPosition.toString(), topic]
+      [tx.tenantId, globalPosition.toString(), topic]
     );
 
-    await tx.client.query(`DELETE FROM ${this.dlqTable} WHERE id = $1`, [dlqId]);
+    await tx.client.query(`DELETE FROM ${this.dlqTable} WHERE tenant_id = $1 AND id = $2`, [tx.tenantId, dlqId]);
     return { requeued: true };
   }
 
   async requeueByGlobalPosition(globalPosition: bigint): Promise<{ requeued: boolean; reason?: string }> {
     return this.uow.withTransaction(async (tx) => {
       const res = await tx.client.query(
-        `SELECT id FROM ${this.dlqTable} WHERE global_position = $1 FOR UPDATE`,
-        [globalPosition.toString()]
+        `SELECT id FROM ${this.dlqTable} WHERE tenant_id = $1 AND global_position = $2 FOR UPDATE`,
+        [tx.tenantId, globalPosition.toString()]
       );
       if (res.rowCount === 0) return { requeued: false, reason: "DLQ item not found" };
       return this.requeueInternal(tx, Number(res.rows[0].id));
@@ -120,10 +121,10 @@ export class PgDlqService implements DlqService {
       const res = await tx.client.query(
         `SELECT id
          FROM ${this.dlqTable}
-         WHERE global_position BETWEEN $1 AND $2
+         WHERE tenant_id = $1 AND global_position BETWEEN $2 AND $3
          ORDER BY global_position ASC
          FOR UPDATE`,
-        [from.toString(), to.toString()]
+        [tx.tenantId, from.toString(), to.toString()]
       );
 
       let count = 0;
@@ -137,9 +138,9 @@ export class PgDlqService implements DlqService {
 
   async purge(options?: { topic?: string | null; olderThan?: Date }): Promise<{ purged: number }> {
     return this.uow.withTransaction(async (tx) => {
-      const conditions: string[] = [];
-      const params: any[] = [];
-      let paramIndex = 1;
+      const conditions: string[] = [`tenant_id = $1`];
+      const params: any[] = [tx.tenantId];
+      let paramIndex = 2;
 
       if (options?.topic !== undefined) {
         conditions.push(`($${paramIndex}::text IS NULL OR topic = $${paramIndex})`);
@@ -153,7 +154,7 @@ export class PgDlqService implements DlqService {
         paramIndex++;
       }
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      const whereClause = `WHERE ${conditions.join(" AND ")}`;
 
       const res = await tx.client.query(
         `DELETE FROM ${this.dlqTable} ${whereClause}`,

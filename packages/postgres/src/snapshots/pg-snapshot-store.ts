@@ -12,19 +12,32 @@ export type Snapshot<S> = {
 export type SnapshotUpcaster<S> = (input: unknown) => S;
 export type SnapshotUpcasters<S> = { [schemaVersion: number]: SnapshotUpcaster<S> };
 
+export type PgSnapshotStoreOptions<S> = {
+  /** Schema-qualified snapshots table name. Default: "eventfabric.snapshots" */
+  tableName?: string;
+  /** Current snapshot schema version. Default: 1 */
+  currentSchemaVersion?: number;
+  /** Upcasters for migrating old snapshot versions to current. */
+  upcasters?: SnapshotUpcasters<S>;
+};
+
 export class PgSnapshotStore<SCurrent> {
-  constructor(
-    private readonly tableName: string = "eventfabric.snapshots",
-    private readonly currentSchemaVersion: number = 1,
-    private readonly upcasters: SnapshotUpcasters<SCurrent> = {}
-  ) {}
+  private readonly tableName: string;
+  private readonly currentSchemaVersion: number;
+  private readonly upcasters: SnapshotUpcasters<SCurrent>;
+
+  constructor(opts?: PgSnapshotStoreOptions<SCurrent>) {
+    this.tableName = opts?.tableName ?? "eventfabric.snapshots";
+    this.currentSchemaVersion = opts?.currentSchemaVersion ?? 1;
+    this.upcasters = opts?.upcasters ?? {};
+  }
 
   async load(tx: PgTx, aggregateName: string, aggregateId: string): Promise<Snapshot<SCurrent> | null> {
     const res = await tx.client.query(
       `SELECT aggregate_name, aggregate_id, aggregate_version, created_at, snapshot_schema_version, state
        FROM ${this.tableName}
-       WHERE aggregate_name = $1 AND aggregate_id = $2`,
-      [aggregateName, aggregateId]
+       WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
+      [tx.tenantId, aggregateName, aggregateId]
     );
     if (res.rowCount === 0) return null;
     const r: any = res.rows[0];
@@ -43,9 +56,9 @@ export class PgSnapshotStore<SCurrent> {
   async save(tx: PgTx, snapshot: Snapshot<SCurrent>): Promise<void> {
     await tx.client.query(
       `INSERT INTO ${this.tableName}
-        (aggregate_name, aggregate_id, aggregate_version, created_at, snapshot_schema_version, state)
-       VALUES ($1,$2,$3,$4::timestamptz,$5,$6::jsonb)
-       ON CONFLICT (aggregate_name, aggregate_id)
+        (tenant_id, aggregate_name, aggregate_id, aggregate_version, created_at, snapshot_schema_version, state)
+       VALUES ($1,$2,$3,$4,$5::timestamptz,$6,$7::jsonb)
+       ON CONFLICT (tenant_id, aggregate_name, aggregate_id)
        DO UPDATE SET
          aggregate_version = EXCLUDED.aggregate_version,
          created_at = EXCLUDED.created_at,
@@ -53,6 +66,7 @@ export class PgSnapshotStore<SCurrent> {
          state = EXCLUDED.state
        WHERE ${this.tableName}.aggregate_version <= EXCLUDED.aggregate_version`,
       [
+        tx.tenantId,
         snapshot.aggregateName,
         snapshot.aggregateId,
         snapshot.aggregateVersion,

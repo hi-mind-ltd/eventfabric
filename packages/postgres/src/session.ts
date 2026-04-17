@@ -5,6 +5,13 @@ import type { PgTx } from "./unitofwork/pg-transaction";
 import { PgEventStore } from "./pg-event-store";
 import { PgUnitOfWork } from "./unitofwork/pg-unit-of-work";
 import type { Pool } from "pg";
+import type { TenantResolver } from "./tenancy/tenant-resolver";
+import { ConjoinedTenantResolver } from "./tenancy/tenant-resolver";
+
+/** Type guard: Pool has `connect()`, TenantResolver has `getPool()`. */
+function isPool(x: Pool | TenantResolver): x is Pool {
+  return typeof (x as Pool).connect === "function";
+}
 
 /**
  * Type-safe mapping from event types to aggregate classes.
@@ -56,23 +63,34 @@ class SessionConfig<E extends AnyEvent> {
 /**
  * Factory for creating Session instances with shared configuration.
  * Configure once, create sessions per request.
- * 
+ *
+ * Accepts either a raw `Pool` (single-tenant / conjoined) or a `TenantResolver`
+ * (per-database multi-tenancy).
+ *
  * @example
+ * // Single-tenant or conjoined multi-tenancy (one pool)
  * const factory = new SessionFactory(pool, store);
- * factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited", ...], "account");
- * 
- * // In each request handler:
- * const session = factory.createSession();
- * const account = await session.loadAggregateAsync<AccountAggregate>("acc-1");
+ * const session = factory.createSession();           // tenant = "default"
+ * const session = factory.createSession("acme");     // conjoined tenant
+ *
+ * // Per-database multi-tenancy
+ * const resolver = new PerDatabaseTenantResolver({ acme: acmePool, contoso: contosoPool });
+ * const factory = new SessionFactory(resolver, store);
+ * const session = factory.createSession("acme");     // uses acmePool
  */
 export class SessionFactory<E extends AnyEvent> {
   private readonly config: SessionConfig<E>;
+  private readonly resolver: TenantResolver;
 
   constructor(
-    private readonly pool: Pool,
+    poolOrResolver: Pool | TenantResolver,
     private readonly store: PgEventStore<E>
   ) {
     this.config = new SessionConfig<E>();
+    // If a raw Pool is passed, wrap it in a ConjoinedTenantResolver
+    this.resolver = isPool(poolOrResolver)
+      ? new ConjoinedTenantResolver(poolOrResolver)
+      : poolOrResolver;
   }
 
   /**
@@ -147,9 +165,12 @@ export class SessionFactory<E extends AnyEvent> {
   /**
    * Create a new Session instance with shared configuration but isolated state.
    * Each session tracks its own loaded aggregates and pending operations.
+   *
+   * @param tenantId - Tenant ID for conjoined multi-tenancy. Defaults to "default" for single-tenant.
    */
-  createSession(): Session<E> {
-    return new Session(this.pool, this.store, this.config);
+  createSession(tenantId: string = "default"): Session<E> {
+    const pool = this.resolver.getPool(tenantId);
+    return new Session(pool, this.store, this.config, tenantId);
   }
 }
 
@@ -177,7 +198,8 @@ export class Session<E extends AnyEvent> {
   constructor(
     private readonly pool: Pool,
     private readonly store: PgEventStore<E>,
-    private readonly config: SessionConfig<E>
+    private readonly config: SessionConfig<E>,
+    private readonly tenantId: string = "default"
   ) {}
 
   /**
@@ -252,7 +274,7 @@ export class Session<E extends AnyEvent> {
     aggregateId: string,
     AggregateClass?: { aggregateName: string } & (new (...args: any[]) => any)
   ): Promise<EventEnvelope<E>[]> {
-    const uow = new PgUnitOfWork(this.pool);
+    const uow = new PgUnitOfWork(this.pool, this.tenantId);
     return uow.withTransaction(async (tx: PgTx) => {
       if (AggregateClass) {
         return this.store.loadStream(tx, aggregateId, AggregateClass);
@@ -302,13 +324,13 @@ export class Session<E extends AnyEvent> {
     const existing = this.loadedAggregates.get(aggregateId);
     if (existing) return existing as TAgg;
 
-    const uow = new PgUnitOfWork(this.pool);
+    const uow = new PgUnitOfWork(this.pool, this.tenantId);
     const agg = await uow.withTransaction(async (tx: PgTx) => {
       // Try to load events to infer aggregate class
       // We'll query for any events for this aggregate ID
       const result = await tx.client.query(
-        `SELECT aggregate_name FROM ${this.store.streamVersionsTableName} WHERE aggregate_id = $1 LIMIT 1`,
-        [aggregateId]
+        `SELECT aggregate_name FROM ${this.store.streamVersionsTableName} WHERE tenant_id = $1 AND aggregate_id = $2 LIMIT 1`,
+        [this.tenantId, aggregateId]
       );
 
       let aggregateName: string | null = null;
@@ -364,12 +386,12 @@ export class Session<E extends AnyEvent> {
   async loadSnapshotAsync<TAgg extends AggregateRoot<any, E>>(
     aggregateId: string
   ): Promise<TAgg> {
-    const uow = new PgUnitOfWork(this.pool);
+    const uow = new PgUnitOfWork(this.pool, this.tenantId);
     const agg = await uow.withTransaction(async (tx: PgTx) => {
       // Infer aggregate name
       const result = await tx.client.query(
-        `SELECT aggregate_name FROM ${this.store.streamVersionsTableName} WHERE aggregate_id = $1 LIMIT 1`,
-        [aggregateId]
+        `SELECT aggregate_name FROM ${this.store.streamVersionsTableName} WHERE tenant_id = $1 AND aggregate_id = $2 LIMIT 1`,
+        [this.tenantId, aggregateId]
       );
 
       let aggregateName: string | null = null;
@@ -532,7 +554,7 @@ export class Session<E extends AnyEvent> {
       return; // Nothing to save
     }
 
-    const uow = new PgUnitOfWork(this.pool);
+    const uow = new PgUnitOfWork(this.pool, this.tenantId);
     await uow.withTransaction(async (tx: PgTx) => {
       const allAppendedEvents: EventEnvelope<E>[] = [];
       const aggregateVersions: Map<string, number> = new Map();
@@ -563,8 +585,8 @@ export class Session<E extends AnyEvent> {
             const cur = await tx.client.query(
               `SELECT COALESCE(current_version, 0) AS v
                FROM ${this.store.streamVersionsTableName}
-               WHERE aggregate_name = $1 AND aggregate_id = $2`,
-              [op.aggregateName, op.aggregateId]
+               WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
+              [this.tenantId, op.aggregateName, op.aggregateId]
             );
             expectedVersion = Number(cur.rows[0]?.v ?? 0);
           }
