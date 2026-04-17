@@ -54,9 +54,9 @@ beforeAll(async () => {
   store = new PgEventStore<BankingEvent>();
   sessionFactory = new SessionFactory<BankingEvent>(pool, store);
 
-  const accountSnapshotStore = new PgSnapshotStore<AccountState>("eventfabric.snapshots", 1);
-  const transactionSnapshotStore = new PgSnapshotStore<TransactionState>("eventfabric.snapshots", 1);
-  const customerSnapshotStore = new PgSnapshotStore<CustomerState>("eventfabric.snapshots", 1);
+  const accountSnapshotStore = new PgSnapshotStore<AccountState>();
+  const transactionSnapshotStore = new PgSnapshotStore<TransactionState>();
+  const customerSnapshotStore = new PgSnapshotStore<CustomerState>();
 
   sessionFactory.registerAggregate(AccountAggregate, [
     "AccountOpened", "AccountDeposited", "AccountWithdrawn",
@@ -814,14 +814,10 @@ describe("account event upcaster", () => {
 
   it("V1 events are upcast when loaded through a store with the upcaster configured", async () => {
     // Create a store WITH the upcaster (like the real app does)
-    const upcasterStore = new PgEventStore<BankingEvent>(
-      "eventfabric.events",
-      "eventfabric.outbox",
-      accountEventUpcaster
-    );
+    const upcasterStore = new PgEventStore<BankingEvent>({ upcaster: accountEventUpcaster });
 
     // Register the aggregate so loadStream works
-    const uowTx: PgTx = { client: await pool.connect() } as any;
+    const uowTx: PgTx = { client: await pool.connect(), tenantId: "default" } as any;
     try {
       await uowTx.client.query("BEGIN");
 
@@ -850,7 +846,7 @@ describe("account event upcaster", () => {
     }
 
     // Load through the upcaster store — V1 should come back as V2
-    const uow2: PgTx = { client: await pool.connect() } as any;
+    const uow2: PgTx = { client: await pool.connect(), tenantId: "default" } as any;
     try {
       const events = await upcasterStore.loadStream(uow2, "acc-historical", AccountAggregate);
       expect(events).toHaveLength(1);
@@ -866,14 +862,10 @@ describe("account event upcaster", () => {
   });
 
   it("V1 events are hydrated correctly into AccountAggregate via upcaster", async () => {
-    const upcasterStore = new PgEventStore<BankingEvent>(
-      "eventfabric.events",
-      "eventfabric.outbox",
-      accountEventUpcaster
-    );
+    const upcasterStore = new PgEventStore<BankingEvent>({ upcaster: accountEventUpcaster });
 
     // Insert a V1 event
-    const uowTx: PgTx = { client: await pool.connect() } as any;
+    const uowTx: PgTx = { client: await pool.connect(), tenantId: "default" } as any;
     try {
       await uowTx.client.query("BEGIN");
       await uowTx.client.query(`
@@ -900,7 +892,7 @@ describe("account event upcaster", () => {
     }
 
     // Load stream and hydrate aggregate
-    const uow2: PgTx = { client: await pool.connect() } as any;
+    const uow2: PgTx = { client: await pool.connect(), tenantId: "default" } as any;
     try {
       const events = await upcasterStore.loadStream(uow2, "acc-v1-hydrate", AccountAggregate);
       const account = new AccountAggregate("acc-v1-hydrate");
@@ -928,6 +920,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-1",
+      tenantId: "default",
       aggregateId: "tx-email-1",
       aggregateName: "Transaction",
       aggregateVersion: 1,
@@ -965,6 +958,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-2",
+      tenantId: "default",
       aggregateId: "tx-email-2",
       aggregateName: "Transaction",
       aggregateVersion: 1,
@@ -996,6 +990,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-3",
+      tenantId: "default",
       aggregateId: "acc-dep-email",
       aggregateName: "Account",
       aggregateVersion: 2,
@@ -1025,6 +1020,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-4",
+      tenantId: "default",
       aggregateId: "acc-wd-email",
       aggregateName: "Account",
       aggregateVersion: 3,
@@ -1053,6 +1049,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-5",
+      tenantId: "default",
       aggregateId: "acc-open-email",
       aggregateName: "Account",
       aggregateVersion: 1,
@@ -1083,6 +1080,7 @@ describe("email notification projection", () => {
 
     const env = {
       eventId: "evt-6",
+      tenantId: "default",
       aggregateId: "cust-reg",
       aggregateName: "Customer",
       aggregateVersion: 1,
@@ -1121,6 +1119,7 @@ describe("deposit audit projection (forEventType)", () => {
     // It logs to console — we verify it doesn't throw and only fires for the right type.
     const depositEnv = {
       eventId: "evt-audit-1",
+      tenantId: "default",
       aggregateId: "acc-audit",
       aggregateName: "Account",
       aggregateVersion: 2,
@@ -1145,6 +1144,7 @@ describe("deposit audit projection (forEventType)", () => {
   it("skips non-AccountDeposited events without error", async () => {
     const otherEnv = {
       eventId: "evt-audit-2",
+      tenantId: "default",
       aggregateId: "acc-audit-2",
       aggregateName: "Account",
       aggregateVersion: 1,
@@ -1170,6 +1170,7 @@ describe("deposit audit projection (forEventType)", () => {
   it("processes deposits without transactionId", async () => {
     const env = {
       eventId: "evt-audit-3",
+      tenantId: "default",
       aggregateId: "acc-audit-3",
       aggregateName: "Account",
       aggregateVersion: 2,

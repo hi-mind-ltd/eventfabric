@@ -20,6 +20,7 @@ export class RowShapeError extends Error {
  *  or unknown — parsing happens in `mapRow` after validation. */
 type PgEventRow = {
   event_id: string;
+  tenant_id: string;
   aggregate_name: string;
   aggregate_id: string;
   aggregate_version: number | string;
@@ -74,20 +75,35 @@ export type LoadGlobalParams = {
   includeDismissed?: boolean;
 };
 
+export type PgEventStoreOptions<E extends AnyEvent> = {
+  /** Schema-qualified events table name. Default: "eventfabric.events" */
+  eventsTable?: string;
+  /** Schema-qualified outbox table name. Default: "eventfabric.outbox" */
+  outboxTable?: string;
+  /** Schema-qualified stream_versions table name. Default: "eventfabric.stream_versions" */
+  streamVersionsTable?: string;
+  /**
+   * Optional transform applied to every loaded event payload after shape
+   * validation. Use this to migrate historical events to the current schema
+   * when you ship a new event version, so replay keeps working without
+   * rewriting the event log. Fast-path pass-through for current-shape events
+   * is the caller's responsibility — the upcaster runs on every load.
+   */
+  upcaster?: EventUpcaster<E>;
+};
+
 export class PgEventStore<E extends AnyEvent> {
-  constructor(
-    private readonly eventsTable: string = "eventfabric.events",
-    private readonly outboxTable: string = "eventfabric.outbox",
-    /**
-     * Optional transform applied to every loaded event payload after shape
-     * validation. Use this to migrate historical events to the current schema
-     * when you ship a new event version, so replay keeps working without
-     * rewriting the event log. Fast-path pass-through for current-shape events
-     * is the caller's responsibility — the upcaster runs on every load.
-     */
-    private readonly upcaster?: EventUpcaster<E>,
-    private readonly streamVersionsTable: string = "eventfabric.stream_versions"
-  ) {}
+  private readonly eventsTable: string;
+  private readonly outboxTable: string;
+  private readonly upcaster?: EventUpcaster<E>;
+  private readonly streamVersionsTable: string;
+
+  constructor(opts?: PgEventStoreOptions<E>) {
+    this.eventsTable = opts?.eventsTable ?? "eventfabric.events";
+    this.outboxTable = opts?.outboxTable ?? "eventfabric.outbox";
+    this.streamVersionsTable = opts?.streamVersionsTable ?? "eventfabric.stream_versions";
+    this.upcaster = opts?.upcaster;
+  }
 
   /** The schema-qualified table name for events (e.g. "eventfabric.events"). */
   get tableName(): string {
@@ -122,13 +138,15 @@ export class PgEventStore<E extends AnyEvent> {
     // A single UPDATE ... WHERE current_version = expected is atomic — no
     // TOCTOU race, no need for a UNIQUE constraint on the events table.
     // Pattern: Marten DB (mt_streams), SQLStreamStore (Streams), EventStoreDB.
+    const tenantId = tx.tenantId;
+
     if (expectedAggregateVersion === 0) {
       // New stream — INSERT into stream_versions. PK violation = stream already exists.
       try {
         await tx.client.query(
-          `INSERT INTO ${this.streamVersionsTable} (aggregate_name, aggregate_id, current_version, created_at, updated_at)
-           VALUES ($1, $2, $3, now(), now())`,
-          [aggregateName, aggregateId, eventCount]
+          `INSERT INTO ${this.streamVersionsTable} (tenant_id, aggregate_name, aggregate_id, current_version, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, now(), now())`,
+          [tenantId, aggregateName, aggregateId, eventCount]
         );
       } catch (err: any) {
         if (err?.code === "23505") {
@@ -142,16 +160,16 @@ export class PgEventStore<E extends AnyEvent> {
       // Existing stream — atomic version bump. 0 rows updated = someone else moved the version.
       const result = await tx.client.query(
         `UPDATE ${this.streamVersionsTable}
-         SET current_version = $3, updated_at = now()
-         WHERE aggregate_name = $1 AND aggregate_id = $2 AND current_version = $4`,
-        [aggregateName, aggregateId, newVersion, expectedAggregateVersion]
+         SET current_version = $4, updated_at = now()
+         WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3 AND current_version = $5`,
+        [tenantId, aggregateName, aggregateId, newVersion, expectedAggregateVersion]
       );
       if (result.rowCount === 0) {
         // Fetch actual version for a helpful error message
         const actual = await tx.client.query(
           `SELECT current_version FROM ${this.streamVersionsTable}
-           WHERE aggregate_name = $1 AND aggregate_id = $2`,
-          [aggregateName, aggregateId]
+           WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
+          [tenantId, aggregateName, aggregateId]
         );
         const actualVersion = actual.rows[0]?.current_version ?? "(stream not found)";
         throw new ConcurrencyError(
@@ -164,10 +182,11 @@ export class PgEventStore<E extends AnyEvent> {
     const base = expectedAggregateVersion;
     const values: any[] = [];
     const rowsSql = params.events.map((evt, i) => {
-      const idx = i * 9;
+      const idx = i * 10;
       const eventId = randomUUID();
       values.push(
         eventId,
+        tenantId,
         aggregateName,
         aggregateId,
         base + i + 1,
@@ -177,14 +196,14 @@ export class PgEventStore<E extends AnyEvent> {
         params.meta?.correlationId ?? null,
         params.meta?.causationId ?? null
       );
-      return `($${idx+1}::uuid,$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7}::jsonb,now(),$${idx+8},$${idx+9})`;
+      return `($${idx+1}::uuid,$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7},$${idx+8}::jsonb,now(),$${idx+9},$${idx+10})`;
     }).join(",");
 
     const ins = await tx.client.query(
       `INSERT INTO ${this.eventsTable}
-        (event_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at, correlation_id, causation_id)
+        (event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at, correlation_id, causation_id)
        VALUES ${rowsSql}
-       RETURNING global_position, event_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+       RETURNING global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
                  dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id`,
       values
     );
@@ -194,13 +213,14 @@ export class PgEventStore<E extends AnyEvent> {
     if (params.enqueueOutbox) {
       const topic = params.outboxTopic ?? null;
       const gps = appended.map((env) => env.globalPosition.toString());
-      const topicParamIndex = gps.length + 1;
-      const valuesSql2 = gps.map((_, i) => `($${i+1}, $${topicParamIndex})`).join(",");
+      const tenantParamIndex = gps.length + 1;
+      const topicParamIndex = gps.length + 2;
+      const valuesSql2 = gps.map((_, i) => `($${i+1}, $${tenantParamIndex}, $${topicParamIndex})`).join(",");
       await tx.client.query(
-        `INSERT INTO ${this.outboxTable} (global_position, topic)
+        `INSERT INTO ${this.outboxTable} (global_position, tenant_id, topic)
          VALUES ${valuesSql2}
          ON CONFLICT (global_position) DO NOTHING`,
-        [...gps, topic]
+        [...gps, tenantId, topic]
       );
     }
 
@@ -290,12 +310,12 @@ export class PgEventStore<E extends AnyEvent> {
 
     const from = fromVersion ?? 1;
     const res = await tx.client.query(
-      `SELECT global_position, event_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+      `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
               dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
        FROM ${this.eventsTable}
-       WHERE aggregate_name = $1 AND aggregate_id = $2 AND aggregate_version >= $3
+       WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3 AND aggregate_version >= $4
        ORDER BY aggregate_version ASC`,
-      [aggregateName, aggregateId, from]
+      [tx.tenantId, aggregateName, aggregateId, from]
     );
 
     const envs = res.rows.map((r) => this.mapRow(r));
@@ -304,7 +324,7 @@ export class PgEventStore<E extends AnyEvent> {
 
   async loadGlobal(tx: PgTx, p: LoadGlobalParams): Promise<EventEnvelope<E>[]> {
     const res = await tx.client.query(
-      `SELECT global_position, event_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+      `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
               dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
        FROM ${this.eventsTable}
        WHERE global_position > $1
@@ -321,7 +341,7 @@ export class PgEventStore<E extends AnyEvent> {
     const params = positions.map(p => p.toString());
     const placeholders = params.map((_, i) => `$${i+1}`).join(",");
     const res = await tx.client.query(
-      `SELECT global_position, event_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+      `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
               dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
        FROM ${this.eventsTable}
        WHERE global_position IN (${placeholders})
@@ -335,11 +355,11 @@ export class PgEventStore<E extends AnyEvent> {
     const at = info?.at ?? new Date().toISOString();
     await tx.client.query(
       `UPDATE ${this.eventsTable}
-       SET dismissed_at = $2::timestamptz,
-           dismissed_reason = $3,
-           dismissed_by = $4
-       WHERE event_id = $1::uuid`,
-      [eventId, at, info?.reason ?? null, info?.by ?? null]
+       SET dismissed_at = $3::timestamptz,
+           dismissed_reason = $4,
+           dismissed_by = $5
+       WHERE tenant_id = $1 AND event_id = $2::uuid`,
+      [tx.tenantId, eventId, at, info?.reason ?? null, info?.by ?? null]
     );
   }
 
@@ -352,6 +372,7 @@ export class PgEventStore<E extends AnyEvent> {
       : (r.payload as E);
     return {
       eventId: r.event_id,
+      tenantId: r.tenant_id ?? "default",
       aggregateName: r.aggregate_name,
       aggregateId: r.aggregate_id,
       aggregateVersion: Number(r.aggregate_version),

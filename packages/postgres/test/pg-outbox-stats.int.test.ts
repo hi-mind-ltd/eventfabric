@@ -2,32 +2,15 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
 import { PgOutboxStatsService } from "../src/outbox/pg-outbox-stats";
+import { migrate } from "../src/pg-migrator";
 
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
-  await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-    CREATE TABLE IF NOT EXISTS eventfabric.outbox (
-      id BIGSERIAL PRIMARY KEY,
-      global_position BIGINT NOT NULL UNIQUE,
-      topic TEXT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      locked_at TIMESTAMPTZ NULL,
-      locked_by TEXT NULL,
-      attempts INT NOT NULL DEFAULT 0,
-      last_error TEXT NULL,
-      dead_lettered_at TIMESTAMPTZ NULL,
-      dead_letter_reason TEXT NULL
-    );
-  `);
-}
-
 beforeAll(async () => {
   container = await new PostgreSqlContainer("postgres:16-alpine").start();
   pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
+  await migrate(pool);
 }, 60000);
 
 afterAll(async () => {

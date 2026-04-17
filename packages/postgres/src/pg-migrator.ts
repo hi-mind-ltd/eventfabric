@@ -17,6 +17,7 @@ const CORE_MIGRATIONS = [
   "004_snapshots",
   "005_stream_versions",
   "006_performance",
+  "008_tenant_id",
 ];
 
 const PARTITIONING_MIGRATION = "007_partitioning";

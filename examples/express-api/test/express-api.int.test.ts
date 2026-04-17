@@ -26,7 +26,7 @@ beforeAll(async () => {
   store = new PgEventStore<UserEvent>();
   sessionFactory = new SessionFactory<UserEvent>(pool, store);
 
-  const snapshotStore = new PgSnapshotStore<UserState>("eventfabric.snapshots", 1);
+  const snapshotStore = new PgSnapshotStore<UserState>();
   sessionFactory.registerAggregate(UserAggregate, [
     "UserRegistered",
     "UserEmailChanged"

@@ -6,54 +6,17 @@ import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore } from "../src/pg-event-store";
 import { PgProjectionCheckpointStore } from "../src/projections/pg-projection-checkpoint-store";
 import { createCatchUpProjector } from "../src/projections/pg-catch-up-projector";
+import { migrate } from "../src/pg-migrator";
 
 type E = { type: "A"; version: 1; n: number };
 
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
-  await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-    CREATE TABLE IF NOT EXISTS eventfabric.stream_versions (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      current_version INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-    CREATE TABLE IF NOT EXISTS eventfabric.events (
-      global_position BIGSERIAL PRIMARY KEY,
-      event_id UUID NOT NULL UNIQUE,
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      type TEXT NOT NULL,
-      version INT NOT NULL,
-      payload JSONB NOT NULL,
-      occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      dismissed_at TIMESTAMPTZ NULL,
-      dismissed_reason TEXT NULL,
-      dismissed_by TEXT NULL,
-      correlation_id TEXT NULL,
-      causation_id TEXT NULL,
-      UNIQUE (aggregate_name, aggregate_id, aggregate_version)
-    );
-    CREATE INDEX IF NOT EXISTS events_global_idx ON eventfabric.events (global_position);
-
-    CREATE TABLE IF NOT EXISTS eventfabric.projection_checkpoints (
-      projection_name TEXT PRIMARY KEY,
-      last_global_position BIGINT NOT NULL DEFAULT 0,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-}
-
 beforeAll(async () => {
   container = await new PostgreSqlContainer("postgres:16-alpine").start();
   pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
+  await migrate(pool);
 }, 60000);
 
 afterAll(async () => {

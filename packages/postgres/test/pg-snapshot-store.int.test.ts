@@ -3,6 +3,7 @@ import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
 import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgSnapshotStore, type Snapshot } from "../src/snapshots/pg-snapshot-store";
+import { migrate } from "../src/pg-migrator";
 
 type StateV1 = { count: number };
 type StateV2 = { count: number; label: string };
@@ -10,25 +11,10 @@ type StateV2 = { count: number; label: string };
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
-  await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-    CREATE TABLE IF NOT EXISTS eventfabric.snapshots (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL,
-      snapshot_schema_version INT NOT NULL,
-      state JSONB NOT NULL,
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-  `);
-}
-
 beforeAll(async () => {
   container = await new PostgreSqlContainer("postgres:16-alpine").start();
   pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
+  await migrate(pool);
 }, 60000);
 
 afterAll(async () => {
@@ -209,7 +195,7 @@ describe("PgSnapshotStore", () => {
       }
     };
 
-    const store = new PgSnapshotStore<StateV2>("eventfabric.snapshots", 2, upcasters);
+    const store = new PgSnapshotStore<StateV2>({ currentSchemaVersion: 2, upcasters });
 
     // Save a snapshot with schema version 1
     await pool.query(`
@@ -228,7 +214,7 @@ describe("PgSnapshotStore", () => {
 
   it("does not upcast when schema version matches current", async () => {
     const uow = new PgUnitOfWork(pool);
-    const store = new PgSnapshotStore<StateV1>("eventfabric.snapshots", 1, {});
+    const store = new PgSnapshotStore<StateV1>();
 
     const snapshot = {
       aggregateName: "User",
@@ -253,7 +239,7 @@ describe("PgSnapshotStore", () => {
 
   it("throws error when upcaster is missing for schema version", async () => {
     const uow = new PgUnitOfWork(pool);
-    const store = new PgSnapshotStore<StateV2>("eventfabric.snapshots", 2, {}); // No upcasters
+    const store = new PgSnapshotStore<StateV2>({ currentSchemaVersion: 2 }); // No upcasters
 
     // Save a snapshot with schema version 1
     await pool.query(`
@@ -285,7 +271,7 @@ describe("PgSnapshotStore", () => {
       }
     };
 
-    const store = new PgSnapshotStore<StateV3>("eventfabric.snapshots", 3, upcasters);
+    const store = new PgSnapshotStore<StateV3>({ currentSchemaVersion: 3, upcasters });
 
     // Save a snapshot with schema version 1
     await pool.query(`

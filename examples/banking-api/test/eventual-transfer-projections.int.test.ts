@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
-import { PgEventStore, createCatchUpProjector } from "@eventfabric/postgres";
+import { PgEventStore, createCatchUpProjector, migrate } from "@eventfabric/postgres";
 import type { PgTx } from "@eventfabric/postgres";
 import { AccountAggregate } from "../src/domain/account.aggregate";
 import { TransactionAggregate } from "../src/domain/transaction.aggregate";
@@ -15,69 +15,10 @@ import {
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
-  await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-    CREATE TABLE IF NOT EXISTS eventfabric.stream_versions (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      current_version INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-    CREATE TABLE IF NOT EXISTS eventfabric.events (
-      global_position BIGSERIAL PRIMARY KEY,
-      event_id UUID NOT NULL UNIQUE,
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      type TEXT NOT NULL,
-      version INT NOT NULL,
-      payload JSONB NOT NULL,
-      occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      dismissed_at TIMESTAMPTZ NULL,
-      dismissed_reason TEXT NULL,
-      dismissed_by TEXT NULL,
-      correlation_id TEXT NULL,
-      causation_id TEXT NULL,
-      UNIQUE (aggregate_name, aggregate_id, aggregate_version)
-    );
-    CREATE INDEX IF NOT EXISTS events_global_idx ON eventfabric.events (global_position);
-
-    CREATE TABLE IF NOT EXISTS eventfabric.outbox (
-      id BIGSERIAL PRIMARY KEY,
-      global_position BIGINT NOT NULL UNIQUE,
-      topic TEXT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      locked_at TIMESTAMPTZ NULL,
-      locked_by TEXT NULL,
-      attempts INT NOT NULL DEFAULT 0,
-      last_error TEXT NULL,
-      dead_lettered_at TIMESTAMPTZ NULL,
-      dead_letter_reason TEXT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS eventfabric.outbox_dead_letters (
-      id BIGSERIAL PRIMARY KEY,
-      global_position BIGINT NOT NULL,
-      topic TEXT NULL,
-      error TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-
-    CREATE TABLE IF NOT EXISTS eventfabric.projection_checkpoints (
-      projection_name TEXT PRIMARY KEY,
-      last_global_position BIGINT NOT NULL DEFAULT 0,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-}
-
 beforeAll(async () => {
   container = await new PostgreSqlContainer("postgres:16-alpine").start();
   pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
+  await migrate(pool);
 }, 120000);
 
 afterAll(async () => {
@@ -104,7 +45,7 @@ describe("eventual transfer projections (integration)", () => {
 
   it("processes transfer start -> withdrawal -> deposit -> completion via catch-up", async () => {
     // Seed accounts and the initial TransactionStarted event
-    const uowTx: PgTx = { client: await pool.connect() } as any;
+    const uowTx: PgTx = { client: await pool.connect(), tenantId: "default" } as any;
     try {
       await uowTx.client.query("BEGIN");
       await eventStore.append(uowTx, {

@@ -82,8 +82,8 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
   async deadLetter(tx: PgTx, row: OutboxRow, reason: string): Promise<void> {
     // copy details then delete from outbox
     await tx.client.query(
-      `INSERT INTO ${this.dlqTable} (outbox_id, global_position, topic, attempts, last_error, dead_lettered_at)
-       SELECT id, global_position, topic, attempts, last_error, now()
+      `INSERT INTO ${this.dlqTable} (tenant_id, outbox_id, global_position, topic, attempts, last_error, dead_lettered_at)
+       SELECT tenant_id, id, global_position, topic, attempts, last_error, now()
        FROM ${this.outboxTable}
        WHERE id = $1`,
       [row.id]
@@ -98,6 +98,5 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
 
     // remove from active queue
     await tx.client.query(`DELETE FROM ${this.outboxTable} WHERE id = $1`, [row.id]);
-    void reason;
   }
 }

@@ -10,8 +10,8 @@ export type OutboxBacklogStats = {
 
 export class PgOutboxStatsService {
   private readonly uow: PgUnitOfWork;
-  constructor(pool: Pool, private readonly outboxTable: string = "eventfabric.outbox") {
-    this.uow = new PgUnitOfWork(pool);
+  constructor(pool: Pool, private readonly outboxTable: string = "eventfabric.outbox", tenantId: string = "default") {
+    this.uow = new PgUnitOfWork(pool, tenantId);
   }
 
   async getBacklogStats(): Promise<OutboxBacklogStats> {
@@ -19,7 +19,8 @@ export class PgOutboxStatsService {
       const main = await tx.client.query(
         `SELECT COUNT(*)::int AS total, MIN(created_at) AS oldest
          FROM ${this.outboxTable}
-         WHERE dead_lettered_at IS NULL`
+         WHERE tenant_id = $1 AND dead_lettered_at IS NULL`,
+        [tx.tenantId]
       );
       const totalPending = main.rows[0]?.total ?? 0;
       const oldestPendingAt = main.rows[0]?.oldest ? new Date(main.rows[0].oldest).toISOString() : null;
@@ -28,9 +29,10 @@ export class PgOutboxStatsService {
       const topics = await tx.client.query(
         `SELECT topic, COUNT(*)::int AS count
          FROM ${this.outboxTable}
-         WHERE dead_lettered_at IS NULL
+         WHERE tenant_id = $1 AND dead_lettered_at IS NULL
          GROUP BY topic
-         ORDER BY count DESC`
+         ORDER BY count DESC`,
+        [tx.tenantId]
       );
 
       return {

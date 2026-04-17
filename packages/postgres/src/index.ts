@@ -27,3 +27,7 @@ export type { PartitionInfo } from "./partitioning/pg-partition-manager";
 // Migrator
 export { migrate } from "./pg-migrator";
 export type { MigrateOptions, MigrateResult, MigrateObserver } from "./pg-migrator";
+
+// Tenancy
+export type { TenantResolver } from "./tenancy/tenant-resolver";
+export { ConjoinedTenantResolver, PerDatabaseTenantResolver } from "./tenancy/tenant-resolver";

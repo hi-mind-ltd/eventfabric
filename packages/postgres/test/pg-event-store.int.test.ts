@@ -3,6 +3,7 @@ import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
 import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore, ConcurrencyError, RowShapeError } from "../src/pg-event-store";
+import { migrate } from "../src/pg-migrator";
 import type { AnyEvent } from "@eventfabric/core";
 
 type E = { type: "A"; version: 1; n: number };
@@ -10,56 +11,10 @@ type E = { type: "A"; version: 1; n: number };
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
 
-async function migrate() {
-  // minimal set for this test
-  await pool.query(`
-    CREATE SCHEMA IF NOT EXISTS eventfabric;
-    CREATE TABLE IF NOT EXISTS eventfabric.stream_versions (
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      current_version INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (aggregate_name, aggregate_id)
-    );
-    CREATE TABLE IF NOT EXISTS eventfabric.events (
-      global_position BIGSERIAL PRIMARY KEY,
-      event_id UUID NOT NULL UNIQUE,
-      aggregate_name TEXT NOT NULL,
-      aggregate_id TEXT NOT NULL,
-      aggregate_version INT NOT NULL,
-      type TEXT NOT NULL,
-      version INT NOT NULL,
-      payload JSONB NOT NULL,
-      occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      dismissed_at TIMESTAMPTZ NULL,
-      dismissed_reason TEXT NULL,
-      dismissed_by TEXT NULL,
-      correlation_id TEXT NULL,
-      causation_id TEXT NULL,
-      UNIQUE (aggregate_name, aggregate_id, aggregate_version)
-    );
-    CREATE INDEX IF NOT EXISTS events_global_idx ON eventfabric.events (global_position);
-
-    CREATE TABLE IF NOT EXISTS eventfabric.outbox (
-      id BIGSERIAL PRIMARY KEY,
-      global_position BIGINT NOT NULL UNIQUE,
-      topic TEXT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      locked_at TIMESTAMPTZ NULL,
-      locked_by TEXT NULL,
-      attempts INT NOT NULL DEFAULT 0,
-      last_error TEXT NULL,
-      dead_lettered_at TIMESTAMPTZ NULL,
-      dead_letter_reason TEXT NULL
-    );
-  `);
-}
-
 beforeAll(async () => {
   container = await new PostgreSqlContainer("postgres:16-alpine").start();
   pool = new Pool({ connectionString: container.getConnectionUri() });
-  await migrate();
+  await migrate(pool);
 }, 120000);
 
 afterAll(async () => {
@@ -897,17 +852,15 @@ describe("PgEventStore", () => {
       );
 
       // Reader: same store class, now configured with a v1 → v2 upcaster
-      const reader = new PgEventStore<Evolved>(
-        "eventfabric.events",
-        "eventfabric.outbox",
-        (raw) => {
+      const reader = new PgEventStore<Evolved>({
+        upcaster: (raw) => {
           if (raw.type === "Widgeted" && raw.version === 1) {
             const v1 = raw as EventV1;
             return { type: "Widgeted", version: 2, label: v1.label, tenantId: "default" };
           }
           return raw as Evolved;
         }
-      );
+      });
 
       const events = await uow.withTransaction((tx) =>
         reader.loadStream(tx, { aggregateName: "Widget", aggregateId: "w1" })
@@ -922,16 +875,14 @@ describe("PgEventStore", () => {
 
     it("leaves current-shape events untouched", async () => {
       const upcasterCalls: AnyEvent[] = [];
-      const store = new PgEventStore<EventV2>(
-        "eventfabric.events",
-        "eventfabric.outbox",
-        (raw) => {
+      const store = new PgEventStore<EventV2>({
+        upcaster: (raw) => {
           upcasterCalls.push(raw);
           // Fast path: already current-shape
           if (raw.type === "Widgeted" && raw.version === 2) return raw as EventV2;
           throw new Error(`Unexpected historical event: ${JSON.stringify(raw)}`);
         }
-      );
+      });
 
       const uow = new PgUnitOfWork(pool);
       await uow.withTransaction((tx) =>

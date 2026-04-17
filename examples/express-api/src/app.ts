@@ -9,7 +9,7 @@ import { createOutboxOpsRouter } from "./ops/outbox-ops-router.example";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const store = new PgEventStore<UserEvent>();
-const snapshotStore = new PgSnapshotStore<UserState>("eventfabric.snapshots", 1);
+const snapshotStore = new PgSnapshotStore<UserState>();
 
 // Session factory - configured once, creates sessions per request
 const sessionFactory = new SessionFactory<UserEvent>(pool, store);

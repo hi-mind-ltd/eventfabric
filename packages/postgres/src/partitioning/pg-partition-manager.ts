@@ -71,6 +71,7 @@ export class PgPartitionManager {
         CREATE TABLE ${this.qualifiedTable} (
           global_position BIGINT NOT NULL DEFAULT nextval('${seqName}'::regclass),
           event_id UUID NOT NULL,
+          tenant_id TEXT NOT NULL DEFAULT 'default',
           aggregate_name TEXT NOT NULL,
           aggregate_id TEXT NOT NULL,
           aggregate_version INT NOT NULL,
@@ -101,14 +102,18 @@ export class PgPartitionManager {
           FOR VALUES FROM (${boundary}) TO (${boundary + partitionSize})
       `);
 
-      // Re-create indexes on the parent (automatically created on all partitions)
+      // Re-create indexes on the parent (automatically created on all partitions).
+      // Drop first because the old indexes follow the renamed partition table and
+      // IF NOT EXISTS would skip creation on the new parent.
+      await client.query(`DROP INDEX IF EXISTS ${this.schema}.events_global_idx`);
       await client.query(`
-        CREATE INDEX IF NOT EXISTS events_global_idx
+        CREATE INDEX events_global_idx
           ON ${this.qualifiedTable} (global_position)
       `);
+      await client.query(`DROP INDEX IF EXISTS ${this.schema}.events_stream_covering_idx`);
       await client.query(`
-        CREATE INDEX IF NOT EXISTS events_stream_covering_idx
-          ON ${this.qualifiedTable} (aggregate_name, aggregate_id, aggregate_version)
+        CREATE INDEX events_stream_covering_idx
+          ON ${this.qualifiedTable} (tenant_id, aggregate_name, aggregate_id, aggregate_version)
           INCLUDE (event_id, type, version, payload, occurred_at,
                    dismissed_at, dismissed_reason, dismissed_by,
                    correlation_id, causation_id)

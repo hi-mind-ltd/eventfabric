@@ -16,6 +16,7 @@ export type EventUpcaster<E extends AnyEvent> = (raw: AnyEvent) => E;
 
 export type EventEnvelope<E extends AnyEvent> = {
   eventId: string;
+  tenantId: string;
   aggregateName: string;
   aggregateId: string;
   aggregateVersion: number;
