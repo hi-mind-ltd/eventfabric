@@ -1,42 +1,49 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { AsyncProjectionRunner, type AsyncRunnerOptions } from "../src/projections/async-projection-runner";
-import type { AnyEvent, EventEnvelope, Transaction, UnitOfWork, EventStore } from "../src/types";
+import { AsyncProjectionRunner } from "../src/projections/async-projection-runner";
+import type { EventEnvelope, Transaction, UnitOfWork, EventStore } from "../src/types";
+import type { TenantScopedUnitOfWorkFactory } from "../src/projections/catch-up-projector";
 import type { OutboxStore, OutboxRow } from "../src/outbox/outbox-store";
-import type { ProjectionCheckpointStore } from "../src/projections/projection-checkpoint-store";
+import type { ProjectionCheckpointStore, ProjectionCheckpoint } from "../src/projections/projection-checkpoint-store";
 import type { AsyncProjection } from "../src/projections/async-projection";
 import { computeBackoffMs } from "../src/resilience/backoff";
 
 type E = { type: "TestEvent"; version: 1; value: string };
 
 // Mock implementations
-class MockTx implements Transaction {
-  // Empty - just for type checking
-}
+type MockTx = Transaction & { tenantId: string };
 
-class MockUow implements UnitOfWork<MockTx> {
+class MockUowFactory implements TenantScopedUnitOfWorkFactory<MockTx> {
   transactions: Array<{ fn: (tx: MockTx) => Promise<any> }> = [];
-  
-  async withTransaction<T>(fn: (tx: MockTx) => Promise<T>): Promise<T> {
-    this.transactions.push({ fn });
-    return fn(new MockTx());
+  forTenant(tenantId: string): UnitOfWork<MockTx> {
+    const self = this;
+    return {
+      async withTransaction<T>(fn: (tx: MockTx) => Promise<T>): Promise<T> {
+        self.transactions.push({ fn });
+        return fn({ tenantId });
+      }
+    };
+  }
+  narrow(tx: MockTx, tenantId: string): MockTx {
+    return { ...tx, tenantId };
   }
 }
 
 class MockEventStore implements EventStore<E, MockTx> {
   events = new Map<string, EventEnvelope<E>>();
-  
-  async loadByGlobalPositions(tx: MockTx, positions: bigint[]): Promise<EventEnvelope<E>[]> {
+
+  async loadByGlobalPositions(_tx: MockTx, positions: bigint[]): Promise<EventEnvelope<E>[]> {
     return positions
-      .map(p => this.events.get(p.toString()))
+      .map((p) => this.events.get(p.toString()))
       .filter((e): e is EventEnvelope<E> => e !== undefined);
   }
-  
+
   // Not used in tests, but required by interface
   async append(): Promise<{ appended: EventEnvelope<E>[]; nextAggregateVersion: number }> {
     return { appended: [], nextAggregateVersion: 0 };
   }
   async loadStream(): Promise<EventEnvelope<E>[]> { return []; }
   async loadGlobal(): Promise<EventEnvelope<E>[]> { return []; }
+  async discoverActiveTenants(): Promise<string[]> { return []; }
   async dismiss(): Promise<void> {}
 }
 
@@ -45,38 +52,45 @@ class MockOutboxStore implements OutboxStore<MockTx> {
   acked: Array<OutboxRow["id"]> = [];
   released: Array<{ id: OutboxRow["id"]; error: string }> = [];
   deadLettered: Array<{ row: OutboxRow; reason: string }> = [];
-  
-  async claimBatch(tx: MockTx, opts: { batchSize: number; workerId: string; topic?: string | null }): Promise<OutboxRow[]> {
+
+  async claimBatch(_tx: MockTx, _opts: { batchSize: number; workerId: string; topic?: string | null }): Promise<OutboxRow[]> {
     return this.claimed;
   }
-  
-  async ack(tx: MockTx, id: OutboxRow["id"]): Promise<void> {
+  async ack(_tx: MockTx, id: OutboxRow["id"]): Promise<void> {
     this.acked.push(id);
   }
-  
-  async releaseWithError(tx: MockTx, id: OutboxRow["id"], error: string): Promise<void> {
+  async releaseWithError(_tx: MockTx, id: OutboxRow["id"], error: string): Promise<void> {
     this.released.push({ id, error });
   }
-  
-  async deadLetter(tx: MockTx, row: OutboxRow, reason: string): Promise<void> {
+  async deadLetter(_tx: MockTx, row: OutboxRow, reason: string): Promise<void> {
     this.deadLettered.push({ row, reason });
   }
 }
 
 class MockCheckpointStore implements ProjectionCheckpointStore<MockTx> {
-  checkpoints = new Map<string, { projectionName: string; lastGlobalPosition: bigint; updatedAt: string }>();
-  
-  async get(tx: MockTx, projectionName: string) {
-    const cp = this.checkpoints.get(projectionName);
+  checkpoints = new Map<string, ProjectionCheckpoint>();
+
+  private key(projectionName: string, tenantId: string): string {
+    return `${projectionName}|${tenantId}`;
+  }
+
+  async get(_tx: MockTx, projectionName: string, tenantId: string): Promise<ProjectionCheckpoint> {
+    const cp = this.checkpoints.get(this.key(projectionName, tenantId));
     if (cp) return cp;
-    const newCp = { projectionName, lastGlobalPosition: 0n, updatedAt: new Date().toISOString() };
-    this.checkpoints.set(projectionName, newCp);
+    const newCp: ProjectionCheckpoint = {
+      projectionName,
+      tenantId,
+      lastGlobalPosition: 0n,
+      updatedAt: new Date().toISOString()
+    };
+    this.checkpoints.set(this.key(projectionName, tenantId), newCp);
     return newCp;
   }
-  
-  async set(tx: MockTx, projectionName: string, lastGlobalPosition: bigint): Promise<void> {
-    this.checkpoints.set(projectionName, {
+
+  async set(_tx: MockTx, projectionName: string, tenantId: string, lastGlobalPosition: bigint): Promise<void> {
+    this.checkpoints.set(this.key(projectionName, tenantId), {
       projectionName,
+      tenantId,
       lastGlobalPosition,
       updatedAt: new Date().toISOString()
     });
@@ -84,14 +98,14 @@ class MockCheckpointStore implements ProjectionCheckpointStore<MockTx> {
 }
 
 describe("AsyncProjectionRunner", () => {
-  let uow: MockUow;
+  let uow: MockUowFactory;
   let eventStore: MockEventStore;
   let outbox: MockOutboxStore;
   let checkpoints: MockCheckpointStore;
   let runner: AsyncProjectionRunner<E, MockTx>;
   
   beforeEach(() => {
-    uow = new MockUow();
+    uow = new MockUowFactory();
     eventStore = new MockEventStore();
     outbox = new MockOutboxStore();
     checkpoints = new MockCheckpointStore();
@@ -133,6 +147,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-1",
         globalPosition: 1n,
         payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 1,
@@ -142,6 +158,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-2",
         globalPosition: 2n,
         payload: { type: "TestEvent", version: 1, value: "event2" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 2,
@@ -153,7 +171,7 @@ describe("AsyncProjectionRunner", () => {
       
       expect(handled).toEqual(["event1", "event2"]);
       expect(outbox.acked).toEqual([1, 2]);
-      expect(checkpoints.checkpoints.get("test-proj")?.lastGlobalPosition).toBe(2n);
+      expect(checkpoints.checkpoints.get("test-proj" + "|default")?.lastGlobalPosition).toBe(2n);
     });
     
     it("filters events by topic", async () => {
@@ -176,6 +194,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-1",
         globalPosition: 1n,
         payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 1,
@@ -185,6 +205,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-2",
         globalPosition: 2n,
         payload: { type: "TestEvent", version: 1, value: "event2" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 2,
@@ -214,6 +236,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-1",
         globalPosition: 1n,
         payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 1,
@@ -244,6 +268,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-1",
         globalPosition: 1n,
         payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 1,
@@ -292,6 +318,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-1",
         globalPosition: 1n,
         payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 1,
@@ -317,13 +345,15 @@ describe("AsyncProjectionRunner", () => {
       runner = createRunner([projection], { transactionMode: "batch" });
       
       // Set checkpoint to 2, so event at position 1 should be skipped
-      await checkpoints.set(new MockTx(), "test-proj", 2n);
+      await checkpoints.set(({ tenantId: "default" }), "test-proj", "default", 2n);
       
       const row: OutboxRow = { id: 1, globalPosition: 1n, topic: "test", attempts: 0 };
       eventStore.events.set("1", {
         eventId: "evt-1",
         globalPosition: 1n,
         payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 1,
@@ -355,6 +385,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-1",
         globalPosition: 1n,
         payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 1,
@@ -383,6 +415,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-1",
         globalPosition: 1n,
         payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 1,
@@ -490,6 +524,8 @@ describe("AsyncProjectionRunner", () => {
         eventId: "evt-1",
         globalPosition: 1n,
         payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: 1,

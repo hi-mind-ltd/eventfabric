@@ -73,6 +73,13 @@ export type LoadGlobalParams = {
   fromGlobalPositionExclusive: bigint;
   limit: number;
   includeDismissed?: boolean;
+  /**
+   * Optional tenant filter. When set, only events from this tenant are
+   * returned. When omitted, events are returned across all tenants — caller
+   * must handle the cross-tenant case responsibly (e.g. for ops tooling).
+   * The catch-up projector always sets this.
+   */
+  tenantId?: string;
 };
 
 export type PgEventStoreOptions<E extends AnyEvent> = {
@@ -323,17 +330,57 @@ export class PgEventStore<E extends AnyEvent> {
   }
 
   async loadGlobal(tx: PgTx, p: LoadGlobalParams): Promise<EventEnvelope<E>[]> {
-    const res = await tx.client.query(
-      `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
-              dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
-       FROM ${this.eventsTable}
-       WHERE global_position > $1
-       ORDER BY global_position ASC
-       LIMIT $2`,
-      [p.fromGlobalPositionExclusive.toString(), p.limit]
-    );
+    // Tenant filter lives in the SQL (not post-filtered in JS) so the
+    // catch-up projector can read a batch of one tenant's events without
+    // pulling other tenants' rows over the wire. Index
+    // `events_stream_covering_idx` leads with tenant_id.
+    const res = p.tenantId === undefined
+      ? await tx.client.query(
+          `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+                  dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
+           FROM ${this.eventsTable}
+           WHERE global_position > $1
+           ORDER BY global_position ASC
+           LIMIT $2`,
+          [p.fromGlobalPositionExclusive.toString(), p.limit]
+        )
+      : await tx.client.query(
+          `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+                  dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
+           FROM ${this.eventsTable}
+           WHERE tenant_id = $1 AND global_position > $2
+           ORDER BY global_position ASC
+           LIMIT $3`,
+          [p.tenantId, p.fromGlobalPositionExclusive.toString(), p.limit]
+        );
     const envs = res.rows.map((r) => this.mapRow(r));
     return p.includeDismissed ? envs : envs.filter(e => !e.dismissed);
+  }
+
+  /**
+   * Return the distinct tenant ids with events at `global_position` greater
+   * than the given bound. Used by the catch-up projector to discover which
+   * tenants have pending work to fan out each round.
+   *
+   * Re-queried every round (no caching) so tenants onboarded at runtime are
+   * picked up without extra coordination. The scan is bounded by the
+   * tenant_id leading index on `events`, and in practice the result set is
+   * small (active tenant count, not row count).
+   */
+  async discoverActiveTenants(
+    tx: PgTx,
+    params: { fromGlobalPositionExclusive: bigint; limit?: number }
+  ): Promise<string[]> {
+    const limit = params.limit ?? 10_000;
+    const res = await tx.client.query(
+      `SELECT DISTINCT tenant_id
+       FROM ${this.eventsTable}
+       WHERE global_position > $1
+       ORDER BY tenant_id ASC
+       LIMIT $2`,
+      [params.fromGlobalPositionExclusive.toString(), limit]
+    );
+    return res.rows.map((r: any) => r.tenant_id as string);
   }
 
   async loadByGlobalPositions(tx: PgTx, positions: bigint[]): Promise<EventEnvelope<E>[]> {

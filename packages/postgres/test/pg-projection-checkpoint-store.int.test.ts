@@ -30,7 +30,7 @@ describe("PgProjectionCheckpointStore", () => {
     const store = new PgProjectionCheckpointStore();
 
     const checkpoint = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "new-projection");
+      return store.get(tx, "new-projection", "default");
     });
 
     expect(checkpoint.projectionName).toBe("new-projection");
@@ -57,7 +57,7 @@ describe("PgProjectionCheckpointStore", () => {
     `);
 
     const checkpoint = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "existing-projection");
+      return store.get(tx, "existing-projection", "default");
     });
 
     expect(checkpoint.projectionName).toBe("existing-projection");
@@ -70,11 +70,11 @@ describe("PgProjectionCheckpointStore", () => {
     const store = new PgProjectionCheckpointStore();
 
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "test-projection", 500n);
+      await store.set(tx, "test-projection", "default", 500n);
     });
 
     const checkpoint = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "test-projection");
+      return store.get(tx, "test-projection", "default");
     });
 
     expect(checkpoint.lastGlobalPosition).toBe(500n);
@@ -86,16 +86,16 @@ describe("PgProjectionCheckpointStore", () => {
 
     // Set initial position
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "update-test", 100n);
+      await store.set(tx, "update-test", "default", 100n);
     });
 
     // Update to higher position
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "update-test", 200n);
+      await store.set(tx, "update-test", "default", 200n);
     });
 
     const checkpoint = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "update-test");
+      return store.get(tx, "update-test", "default");
     });
 
     expect(checkpoint.lastGlobalPosition).toBe(200n);
@@ -107,22 +107,22 @@ describe("PgProjectionCheckpointStore", () => {
 
     // Set initial position
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "equal-test", 100n);
+      await store.set(tx, "equal-test", "default", 100n);
     });
 
     // Update to same position (should update updated_at)
     const beforeUpdate = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "equal-test");
+      return store.get(tx, "equal-test", "default");
     });
 
     await new Promise(resolve => setTimeout(resolve, 10)); // Small delay
 
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "equal-test", 100n);
+      await store.set(tx, "equal-test", "default", 100n);
     });
 
     const afterUpdate = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "equal-test");
+      return store.get(tx, "equal-test", "default");
     });
 
     expect(afterUpdate.lastGlobalPosition).toBe(100n);
@@ -138,16 +138,16 @@ describe("PgProjectionCheckpointStore", () => {
 
     // Set initial position
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "downgrade-test", 200n);
+      await store.set(tx, "downgrade-test", "default", 200n);
     });
 
     // Try to set lower position
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "downgrade-test", 100n);
+      await store.set(tx, "downgrade-test", "default", 100n);
     });
 
     const checkpoint = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "downgrade-test");
+      return store.get(tx, "downgrade-test", "default");
     });
 
     // Should keep the higher position
@@ -159,19 +159,19 @@ describe("PgProjectionCheckpointStore", () => {
     const store = new PgProjectionCheckpointStore();
 
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "projection-1", 100n);
-      await store.set(tx, "projection-2", 200n);
-      await store.set(tx, "projection-3", 300n);
+      await store.set(tx, "projection-1", "default", 100n);
+      await store.set(tx, "projection-2", "default", 200n);
+      await store.set(tx, "projection-3", "default", 300n);
     });
 
     const cp1 = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "projection-1");
+      return store.get(tx, "projection-1", "default");
     });
     const cp2 = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "projection-2");
+      return store.get(tx, "projection-2", "default");
     });
     const cp3 = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "projection-3");
+      return store.get(tx, "projection-3", "default");
     });
 
     expect(cp1.lastGlobalPosition).toBe(100n);
@@ -186,11 +186,11 @@ describe("PgProjectionCheckpointStore", () => {
     const largePosition = BigInt("9223372036854775807"); // Max bigint
 
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "large-position-test", largePosition);
+      await store.set(tx, "large-position-test", "default", largePosition);
     });
 
     const checkpoint = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "large-position-test");
+      return store.get(tx, "large-position-test", "default");
     });
 
     expect(checkpoint.lastGlobalPosition).toBe(largePosition);
@@ -202,9 +202,9 @@ describe("PgProjectionCheckpointStore", () => {
 
     // Multiple concurrent gets should all create the same checkpoint
     const results = await Promise.all([
-      uow.withTransaction(async (tx) => store.get(tx, "concurrent-test")),
-      uow.withTransaction(async (tx) => store.get(tx, "concurrent-test")),
-      uow.withTransaction(async (tx) => store.get(tx, "concurrent-test"))
+      uow.withTransaction(async (tx) => store.get(tx, "concurrent-test", "default")),
+      uow.withTransaction(async (tx) => store.get(tx, "concurrent-test", "default")),
+      uow.withTransaction(async (tx) => store.get(tx, "concurrent-test", "default"))
     ]);
 
     // All should return the same checkpoint
@@ -227,22 +227,22 @@ describe("PgProjectionCheckpointStore", () => {
 
     // Create initial checkpoint
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "timestamp-test", 100n);
+      await store.set(tx, "timestamp-test", "default", 100n);
     });
 
     const before = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "timestamp-test");
+      return store.get(tx, "timestamp-test", "default");
     });
 
     await new Promise(resolve => setTimeout(resolve, 100)); // Wait a bit
 
     // Update checkpoint
     await uow.withTransaction(async (tx) => {
-      await store.set(tx, "timestamp-test", 200n);
+      await store.set(tx, "timestamp-test", "default", 200n);
     });
 
     const after = await uow.withTransaction(async (tx) => {
-      return store.get(tx, "timestamp-test");
+      return store.get(tx, "timestamp-test", "default");
     });
 
     expect(new Date(after.updatedAt).getTime()).toBeGreaterThan(

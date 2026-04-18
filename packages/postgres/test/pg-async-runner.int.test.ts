@@ -750,10 +750,10 @@ describe("PgAsyncProjectionRunner", () => {
 
       // Check that both projections have checkpoints
       const cp1 = await uow.withTransaction(async (tx) => {
-        return checkpoints.get(tx, "checkpoint-proj-1");
+        return checkpoints.get(tx, "checkpoint-proj-1", "default");
       });
       const cp2 = await uow.withTransaction(async (tx) => {
-        return checkpoints.get(tx, "checkpoint-proj-2");
+        return checkpoints.get(tx, "checkpoint-proj-2", "default");
       });
 
       expect(cp1.lastGlobalPosition).toBe(globalPos2);
@@ -809,7 +809,7 @@ describe("PgAsyncProjectionRunner", () => {
       await new Promise(resolve => setTimeout(resolve, 500));
 
       const cp = await uow.withTransaction(async (tx) => {
-        return checkpoints.get(tx, "checkpoint-update");
+        return checkpoints.get(tx, "checkpoint-update", "default");
       });
 
       expect(cp.lastGlobalPosition).toBe(globalPos);
@@ -847,7 +847,7 @@ describe("PgAsyncProjectionRunner", () => {
 
       // Set checkpoint to second event (simulating previous processing)
       await uow.withTransaction(async (tx) => {
-        await checkpoints.set(tx, "skip-projection", globalPos2!);
+        await checkpoints.set(tx, "skip-projection", "default", globalPos2!);
       });
 
       const handled: string[] = [];

@@ -71,6 +71,13 @@ export interface EventStore<E extends AnyEvent, TTx extends Transaction = Transa
       fromGlobalPositionExclusive: bigint;
       limit: number;
       includeDismissed?: boolean;
+      /**
+       * Optional tenant filter. When set, only events with this tenant_id are
+       * returned. When omitted, events are returned across all tenants — used
+       * by cross-tenant tooling (ops dashboards, migrations). The catch-up
+       * projector always sets this so each projection round is single-tenant.
+       */
+      tenantId?: string;
     }
   ): Promise<EventEnvelope<E>[]>;
 
@@ -78,6 +85,20 @@ export interface EventStore<E extends AnyEvent, TTx extends Transaction = Transa
     tx: TTx,
     positions: bigint[]
   ): Promise<EventEnvelope<E>[]>;
+
+  /**
+   * Returns the set of tenant ids that have events at `global_position` >
+   * `fromGlobalPositionExclusive`. Used by the catch-up projector to discover
+   * which tenants have work pending this round, so it can fan out a single
+   * round into one transaction per active tenant.
+   *
+   * A fresh query is done every round (no caching) so tenants onboarded at
+   * runtime are picked up with no extra coordination.
+   */
+  discoverActiveTenants(
+    tx: TTx,
+    params: { fromGlobalPositionExclusive: bigint; limit?: number }
+  ): Promise<string[]>;
 
   dismiss(tx: TTx, eventId: string, info?: { reason?: string; by?: string; at?: string }): Promise<void>;
 }

@@ -329,7 +329,7 @@ describe("multi-tenancy: catch-up projection (cross-tenant)", () => {
     expect(tenantAOnly).toEqual(["acc-filt-a"]);
   });
 
-  it("single checkpoint tracks progress across all tenants", async () => {
+  it("checkpoints are per-tenant so one tenant's progress cannot shadow another's", async () => {
     const factory = createFactory();
 
     const sA = factory.createSession("tenant-a");
@@ -341,20 +341,25 @@ describe("multi-tenancy: catch-up projection (cross-tenant)", () => {
     await sB.saveChangesAsync();
 
     const projection: CatchUpProjection<TestEvent, PgTx> = {
-      name: "global-checkpoint",
+      name: "per-tenant-checkpoint",
       async handle() {}
     };
 
     const projector = createCatchUpProjector(pool, store);
     await projector.catchUpAll([projection], { batchSize: 100 });
 
-    // One checkpoint row, not per-tenant
     const { rows } = await pool.query(
-      `SELECT * FROM eventfabric.projection_checkpoints WHERE projection_name = 'global-checkpoint'`
+      `SELECT tenant_id, last_global_position FROM eventfabric.projection_checkpoints
+       WHERE projection_name = 'per-tenant-checkpoint'
+       ORDER BY tenant_id`
     );
-    expect(rows).toHaveLength(1);
-    // Checkpoint should be past both events
-    expect(Number(rows[0].last_global_position)).toBeGreaterThanOrEqual(2);
+    // One row per active tenant
+    expect(rows).toHaveLength(2);
+    expect(rows[0].tenant_id).toBe("tenant-a");
+    expect(rows[1].tenant_id).toBe("tenant-b");
+    // Each tenant's checkpoint must be past its own events
+    expect(Number(rows[0].last_global_position)).toBeGreaterThanOrEqual(1);
+    expect(Number(rows[1].last_global_position)).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -585,10 +590,10 @@ describe("multi-tenancy: dismiss isolation", () => {
 // ============================================================================
 
 describe("multi-tenancy: global position ordering", () => {
-  it("catch-up projection sees events in global_position order across tenants", async () => {
+  it("catch-up projection processes each tenant's events in global_position order", async () => {
     const factory = createFactory();
 
-    // Interleave: A, B, A, B
+    // Interleave writes: A1, B1, A2, B2 in the events table
     const sA1 = factory.createSession("tenant-a");
     sA1.startStream("acc-ord-a1", { type: "AccountOpened", version: 1, accountId: "acc-ord-a1", owner: "A1", balance: 0 } as TestEvent);
     await sA1.saveChangesAsync();
@@ -616,13 +621,15 @@ describe("multi-tenancy: global position ordering", () => {
     const projector = createCatchUpProjector(pool, store);
     await projector.catchUpAll([projection], { batchSize: 100 });
 
-    // Must be in global_position order: A1, B1, A2, B2
-    expect(order).toEqual([
-      { tenant: "tenant-a", id: "acc-ord-a1" },
-      { tenant: "tenant-b", id: "acc-ord-b1" },
-      { tenant: "tenant-a", id: "acc-ord-a2" },
-      { tenant: "tenant-b", id: "acc-ord-b2" },
-    ]);
+    // Contract: within a tenant, events are delivered in global_position order.
+    // Across tenants, rounds are fanned out independently (no cross-tenant
+    // global ordering guarantee) so one tenant's slow handler can't block
+    // another tenant's progress.
+    const tenantAOrder = order.filter((o) => o.tenant === "tenant-a").map((o) => o.id);
+    const tenantBOrder = order.filter((o) => o.tenant === "tenant-b").map((o) => o.id);
+    expect(tenantAOrder).toEqual(["acc-ord-a1", "acc-ord-a2"]);
+    expect(tenantBOrder).toEqual(["acc-ord-b1", "acc-ord-b2"]);
+    expect(order).toHaveLength(4);
   });
 });
 
@@ -759,44 +766,54 @@ describe("multi-tenancy: projection side-effect scenarios", () => {
     expect(received[0]!.aggregateId).toBe("acc-sc1");
   });
 
-  it("scenario 2 (catch-up): failure on tenant-2 event does not re-process tenant-1 events", async () => {
+  it("scenario 2 (catch-up): failure on tenant-2 does not block tenant-1 or re-process its events", async () => {
     const factory = createFactory();
 
-    // Tenant-1 raises an event
+    // Both tenants raise events
     const s1 = factory.createSession("tenant-1");
     s1.startStream("acc-sc2-t1", { type: "AccountOpened", version: 1, accountId: "acc-sc2-t1", owner: "T1", balance: 100 } as TestEvent);
     await s1.saveChangesAsync();
 
-    // First run: process tenant-1's event successfully
+    const s2 = factory.createSession("tenant-2");
+    s2.startStream("acc-sc2-t2", { type: "AccountOpened", version: 1, accountId: "acc-sc2-t2", owner: "T2", balance: 200 } as TestEvent);
+    await s2.saveChangesAsync();
+
     let processCount = 0;
+    const processedByTenant: string[] = [];
     const projection: CatchUpProjection<TestEvent, PgTx> = {
       name: "scenario-2-proj",
       async handle(_tx, env) {
         processCount++;
+        processedByTenant.push(env.tenantId);
         if (env.tenantId === "tenant-2") {
           throw new Error("Simulated tenant-2 failure");
         }
       }
     };
 
+    // Run 1: both tenants attempted. tenant-1 succeeds and its checkpoint
+    // advances. tenant-2 throws — the projector isolates the error,
+    // reports it via the observer, and rolls back tenant-2's tx so its
+    // checkpoint stays at 0.
+    let reportedErrors: string[] = [];
+    const observer = {
+      onProjectorError: ({ error }: { error: Error }) => reportedErrors.push(error.message)
+    };
     const projector = createCatchUpProjector(pool, store);
-    await projector.catchUpAll([projection], { batchSize: 100 });
-    expect(processCount).toBe(1); // tenant-1 processed
+    await projector.catchUpAll([projection], { batchSize: 100, observer });
+    expect(processedByTenant).toContain("tenant-1");
+    expect(processedByTenant).toContain("tenant-2");
+    expect(reportedErrors).toContain("Simulated tenant-2 failure");
 
-    // Tenant-2 raises an event
-    const s2 = factory.createSession("tenant-2");
-    s2.startStream("acc-sc2-t2", { type: "AccountOpened", version: 1, accountId: "acc-sc2-t2", owner: "T2", balance: 200 } as TestEvent);
-    await s2.saveChangesAsync();
-
-    // Second run: tenant-2's event fails, but tenant-1's checkpoint is already advanced
+    // Run 2: tenant-1's checkpoint is already past its event, so it's not
+    // re-processed. tenant-2's checkpoint is still 0, so its event is
+    // re-attempted.
     processCount = 0;
-    await expect(
-      projector.catchUpAll([projection], { batchSize: 100 })
-    ).rejects.toThrow("Simulated tenant-2 failure");
-
-    // tenant-1's event was NOT re-processed (checkpoint already past it)
-    // only tenant-2's event was attempted
-    expect(processCount).toBe(1); // only tenant-2 attempted, then failed
+    processedByTenant.length = 0;
+    reportedErrors = [];
+    await projector.catchUpAll([projection], { batchSize: 100, observer });
+    expect(processedByTenant).toEqual(["tenant-2"]);
+    expect(reportedErrors).toContain("Simulated tenant-2 failure");
   });
 
   it("scenario 2 (async/perRow): failure on tenant-2 does not affect tenant-1", async () => {

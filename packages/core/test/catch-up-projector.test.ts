@@ -1,55 +1,86 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { CatchUpProjector, type CatchUpOptions } from "../src/projections/catch-up-projector";
-import type { AnyEvent, EventEnvelope, Transaction, UnitOfWork, EventStore } from "../src/types";
-import type { ProjectionCheckpointStore } from "../src/projections/projection-checkpoint-store";
+import { CatchUpProjector, type TenantScopedUnitOfWorkFactory } from "../src/projections/catch-up-projector";
+import type { EventEnvelope, Transaction, UnitOfWork, EventStore } from "../src/types";
+import type { ProjectionCheckpointStore, ProjectionCheckpoint } from "../src/projections/projection-checkpoint-store";
 import type { CatchUpProjection } from "../src/projections/catch-up-projection";
 
 type E = { type: "TestEvent"; version: 1; value: string };
 
 // Mock implementations
-class MockTx implements Transaction {
-  // Empty - just for type checking
-}
+type MockTx = Transaction & { tenantId: string };
 
-class MockUow implements UnitOfWork<MockTx> {
-  async withTransaction<T>(fn: (tx: MockTx) => Promise<T>): Promise<T> {
-    return fn(new MockTx());
+class MockUowFactory implements TenantScopedUnitOfWorkFactory<MockTx> {
+  forTenant(tenantId: string): UnitOfWork<MockTx> {
+    return {
+      async withTransaction<T>(fn: (tx: MockTx) => Promise<T>): Promise<T> {
+        return fn({ tenantId });
+      }
+    };
+  }
+  narrow(tx: MockTx, tenantId: string): MockTx {
+    return { ...tx, tenantId };
   }
 }
 
 class MockEventStore implements EventStore<E, MockTx> {
   events: EventEnvelope<E>[] = [];
-  loadGlobalCalls: Array<{ fromGlobalPositionExclusive: bigint; limit: number; includeDismissed?: boolean }> = [];
-  
+  loadGlobalCalls: Array<{ fromGlobalPositionExclusive: bigint; limit: number; includeDismissed?: boolean; tenantId?: string }> = [];
+
   async loadGlobal(
     tx: MockTx,
-    params: { fromGlobalPositionExclusive: bigint; limit: number; includeDismissed?: boolean }
+    params: { fromGlobalPositionExclusive: bigint; limit: number; includeDismissed?: boolean; tenantId?: string }
   ): Promise<EventEnvelope<E>[]> {
     this.loadGlobalCalls.push(params);
-    return this.events.filter(e => e.globalPosition > params.fromGlobalPositionExclusive).slice(0, params.limit);
+    return this.events
+      .filter((e) => e.globalPosition > params.fromGlobalPositionExclusive)
+      .filter((e) => params.tenantId === undefined || e.tenantId === params.tenantId)
+      .slice(0, params.limit);
   }
-  
+
+  async discoverActiveTenants(
+    _tx: MockTx,
+    params: { fromGlobalPositionExclusive: bigint; limit?: number }
+  ): Promise<string[]> {
+    const tenants = new Set<string>();
+    for (const e of this.events) {
+      if (e.globalPosition > params.fromGlobalPositionExclusive) tenants.add(e.tenantId);
+    }
+    return [...tenants].sort();
+  }
+
   // Not used in tests, but required by interface
-  async append(): Promise<void> {}
+  async append(): Promise<{ appended: EventEnvelope<E>[]; nextAggregateVersion: number }> {
+    return { appended: [], nextAggregateVersion: 0 };
+  }
   async loadStream(): Promise<EventEnvelope<E>[]> { return []; }
   async loadByGlobalPositions(): Promise<EventEnvelope<E>[]> { return []; }
   async dismiss(): Promise<void> {}
 }
 
 class MockCheckpointStore implements ProjectionCheckpointStore<MockTx> {
-  checkpoints = new Map<string, { lastGlobalPosition: bigint; updatedAt: string }>();
-  
-  async get(tx: MockTx, projectionName: string) {
-    const cp = this.checkpoints.get(projectionName);
+  checkpoints = new Map<string, ProjectionCheckpoint>();
+
+  private key(projectionName: string, tenantId: string): string {
+    return `${projectionName}|${tenantId}`;
+  }
+
+  async get(_tx: MockTx, projectionName: string, tenantId: string): Promise<ProjectionCheckpoint> {
+    const cp = this.checkpoints.get(this.key(projectionName, tenantId));
     if (cp) return cp;
-    const newCp = { projectionName, lastGlobalPosition: 0n, updatedAt: new Date().toISOString() };
-    this.checkpoints.set(projectionName, newCp);
+    const newCp: ProjectionCheckpoint = {
+      projectionName,
+      tenantId,
+      lastGlobalPosition: 0n,
+      updatedAt: new Date().toISOString()
+    };
+    this.checkpoints.set(this.key(projectionName, tenantId), newCp);
     return newCp;
   }
-  
-  async set(tx: MockTx, projectionName: string, lastGlobalPosition: bigint): Promise<void> {
-    this.checkpoints.set(projectionName, {
+
+  async set(_tx: MockTx, projectionName: string, tenantId: string, lastGlobalPosition: bigint): Promise<void> {
+    this.checkpoints.set(this.key(projectionName, tenantId), {
       projectionName,
+      tenantId,
       lastGlobalPosition,
       updatedAt: new Date().toISOString()
     });
@@ -57,13 +88,13 @@ class MockCheckpointStore implements ProjectionCheckpointStore<MockTx> {
 }
 
 describe("CatchUpProjector", () => {
-  let uow: MockUow;
+  let uow: MockUowFactory;
   let eventStore: MockEventStore;
   let checkpoints: MockCheckpointStore;
   let projector: CatchUpProjector<E, MockTx>;
   
   beforeEach(() => {
-    uow = new MockUow();
+    uow = new MockUowFactory();
     eventStore = new MockEventStore();
     checkpoints = new MockCheckpointStore();
     projector = new CatchUpProjector(uow, eventStore, checkpoints);
@@ -84,6 +115,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 1n,
           payload: { type: "TestEvent", version: 1, value: "event1" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 1,
@@ -93,6 +126,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 2n,
           payload: { type: "TestEvent", version: 1, value: "event2" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 2,
@@ -106,7 +141,7 @@ describe("CatchUpProjector", () => {
       expect(handled).toHaveLength(2);
       expect(handled[0]!.payload.value).toBe("event1");
       expect(handled[1]!.payload.value).toBe("event2");
-      expect(checkpoints.checkpoints.get("test-proj")?.lastGlobalPosition).toBe(2n);
+      expect(checkpoints.checkpoints.get("test-proj" + "|default")?.lastGlobalPosition).toBe(2n);
     });
     
     it("starts from checkpoint position", async () => {
@@ -119,12 +154,14 @@ describe("CatchUpProjector", () => {
       };
       
       // Set checkpoint to 1
-      await checkpoints.set(new MockTx(), "test-proj", 1n);
+      await checkpoints.set(({ tenantId: "default" }), "test-proj", "default", 1n);
       
       eventStore.events = [
         {
           globalPosition: 1n,
           payload: { type: "TestEvent", version: 1, value: "event1" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 1,
@@ -134,6 +171,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 2n,
           payload: { type: "TestEvent", version: 1, value: "event2" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 2,
@@ -146,7 +185,7 @@ describe("CatchUpProjector", () => {
       
       expect(handled).toHaveLength(1);
       expect(handled[0]!.payload.value).toBe("event2"); // Only event after checkpoint
-      expect(checkpoints.checkpoints.get("test-proj")?.lastGlobalPosition).toBe(2n);
+      expect(checkpoints.checkpoints.get("test-proj" + "|default")?.lastGlobalPosition).toBe(2n);
     });
     
     it("processes events in batches", async () => {
@@ -162,6 +201,8 @@ describe("CatchUpProjector", () => {
       eventStore.events = Array.from({ length: 1000 }, (_, i) => ({
         globalPosition: BigInt(i + 1),
         payload: { type: "TestEvent", version: 1, value: `event${i + 1}` },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: i + 1,
@@ -188,6 +229,8 @@ describe("CatchUpProjector", () => {
       eventStore.events = Array.from({ length: 1000 }, (_, i) => ({
         globalPosition: BigInt(i + 1),
         payload: { type: "TestEvent", version: 1, value: `event${i + 1}` },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: i + 1,
@@ -214,6 +257,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 1n,
           payload: { type: "TestEvent", version: 1, value: "event1" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 1,
@@ -223,6 +268,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 2n,
           payload: { type: "TestEvent", version: 1, value: "event2" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 2,
@@ -232,6 +279,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 3n,
           payload: { type: "TestEvent", version: 1, value: "event3" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 3,
@@ -260,6 +309,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 1n,
           payload: { type: "TestEvent", version: 1, value: "event1" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 1,
@@ -269,6 +320,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 2n,
           payload: { type: "TestEvent", version: 1, value: "event2" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 2,
@@ -297,6 +350,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 1n,
           payload: { type: "TestEvent", version: 1, value: "event1" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 1,
@@ -320,6 +375,8 @@ describe("CatchUpProjector", () => {
       eventStore.events = Array.from({ length: 1000 }, (_, i) => ({
         globalPosition: BigInt(i + 1),
         payload: { type: "TestEvent", version: 1, value: `event${i + 1}` },
+        tenantId: "default",
+
         aggregateName: "A",
         aggregateId: "1",
         aggregateVersion: i + 1,
@@ -357,6 +414,8 @@ describe("CatchUpProjector", () => {
         {
           globalPosition: 1n,
           payload: { type: "TestEvent", version: 1, value: "event1" },
+          tenantId: "default",
+
           aggregateName: "A",
           aggregateId: "1",
           aggregateVersion: 1,
@@ -369,8 +428,8 @@ describe("CatchUpProjector", () => {
       
       expect(handled1).toHaveLength(1);
       expect(handled2).toHaveLength(1);
-      expect(checkpoints.checkpoints.get("proj1")?.lastGlobalPosition).toBe(1n);
-      expect(checkpoints.checkpoints.get("proj2")?.lastGlobalPosition).toBe(1n);
+      expect(checkpoints.checkpoints.get("proj1" + "|default")?.lastGlobalPosition).toBe(1n);
+      expect(checkpoints.checkpoints.get("proj2" + "|default")?.lastGlobalPosition).toBe(1n);
     });
   });
 });
