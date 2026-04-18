@@ -1,6 +1,6 @@
 {
   "name": "@eventfabric/opentelemetry",
-  "description": "OpenTelemetry observability adapters for EventFabric projection runners \u2014 traces + metrics for async (outbox) and catch-up projections.",
+  "description": "OpenTelemetry observability adapters for EventFabric projection runners — traces + metrics for async (outbox) and catch-up projections.",
   "keywords": [
     "event",
     "events",
@@ -27,7 +27,7 @@
     "url": "https://github.com/hi-mind-ltd/eventfabric",
     "directory": "packages/opentelemetry"
   },
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
