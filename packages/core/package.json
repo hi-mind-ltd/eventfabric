@@ -1,5 +1,27 @@
 {
   "name": "@eventfabric/core",
+  "description": "Event sourcing core for TypeScript: aggregates, event store + outbox interfaces, inline / catch-up / async projections, snapshots, multi-tenancy, upcasters. Backend-agnostic — pair with @eventfabric/postgres.",
+  "keywords": [
+    "event",
+    "events",
+    "event-driven",
+    "event-sourcing",
+    "eventsourcing",
+    "cqrs",
+    "ddd",
+    "domain-driven-design",
+    "aggregate",
+    "event-store",
+    "eventstore",
+    "projection",
+    "outbox",
+    "outbox-pattern",
+    "snapshot",
+    "upcaster",
+    "multi-tenancy",
+    "multi-tenant",
+    "typescript"
+  ],
   "license": "MIT",
   "author": "Hi-Mind Limited",
   "repository": {
