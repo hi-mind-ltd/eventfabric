@@ -351,17 +351,31 @@ export class Session<E extends AnyEvent> {
         );
       }
 
-      // Get snapshot store from registry if available
+      // Snapshot fast-path: if a snapshot store is registered for this aggregate
+      // and a snapshot exists, hydrate state from it and replay only the events
+      // written after the snapshot's version. Snapshots are optional — if none
+      // is registered or none has been written yet, fall back to full replay.
       const snapshotStore = this.config.snapshotStoreRegistry.get(aggregateName);
+      const snapshot = snapshotStore
+        ? await snapshotStore.load(tx, aggregateName, aggregateId)
+        : null;
 
-      // Load full history for live aggregate state
-      const history = await this.store.loadStream(tx, aggregateId, AggregateClass);
+      let aggregate: TAgg;
+      let history;
+      if (snapshot) {
+        aggregate = new AggregateClass(aggregateId, snapshot.state) as TAgg;
+        aggregate.version = snapshot.aggregateVersion;
+        history = await this.store.loadStream(tx, {
+          aggregateName,
+          aggregateId,
+          fromVersion: snapshot.aggregateVersion + 1
+        });
+      } else {
+        aggregate = new AggregateClass(aggregateId) as TAgg;
+        aggregate.version = 0;
+        history = await this.store.loadStream(tx, aggregateId, AggregateClass);
+      }
 
-      // Reconstruct aggregate
-      const aggregate = new AggregateClass(aggregateId) as TAgg;
-      aggregate.version = 0;
-
-      // Apply all events in order to ensure live state
       aggregate.loadFromHistory(
         history.map((h) => ({
           payload: h.payload,
@@ -369,7 +383,6 @@ export class Session<E extends AnyEvent> {
         }))
       );
 
-      // After live replay, also stash snapshot store and policy info on session so that saveChangesAsync can still use snapshots/policies for future calls
       return aggregate;
     });
 
