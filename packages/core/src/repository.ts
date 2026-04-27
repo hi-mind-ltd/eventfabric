@@ -1,9 +1,9 @@
 import type { AnyEvent, EventStore, EventEnvelope, Transaction, UnitOfWork } from "./types";
 import type { AggregateRoot } from "./aggregates/aggregate-root";
 import type { InlineProjector } from "./projections/inline-projector";
-import { SnapshotStore } from "./snapshots/snapshot-store";
-import { SnapshotPolicy } from "./snapshots/snapshot-policy";
-import { AsyncProcessorConfig } from "./projections/async-processor-config";
+import type { SnapshotStore } from "./snapshots/snapshot-store";
+import type { SnapshotPolicy } from "./snapshots/snapshot-policy";
+import type { AsyncProcessorConfig } from "./projections/async-processor-config";
 
 export class Repository<
   TAgg extends AggregateRoot<S, E>,

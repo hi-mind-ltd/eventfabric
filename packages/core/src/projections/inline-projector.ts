@@ -1,4 +1,4 @@
-import { InlineProjection } from "./inline-projection";
+import type { InlineProjection } from "./inline-projection";
 import type { AnyEvent, EventEnvelope, Transaction } from "../types";
 
 export class InlineProjector<E extends AnyEvent, TTx extends Transaction = Transaction> {
