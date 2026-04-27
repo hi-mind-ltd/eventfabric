@@ -1,5 +1,6 @@
 export * from './types';
 export * from './aggregates/aggregate-root';
+export * from './projections/inline-projection';
 export * from './projections/inline-projector';
 export * from './repository';
 export * from './events/event-helpers';
