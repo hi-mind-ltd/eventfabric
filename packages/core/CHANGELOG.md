@@ -1,5 +1,13 @@
 # @eventfabric/core
 
+## 0.1.10
+
+### Patch Changes
+
+- e03f235: **Fix:** export `InlineProjection`, `Snapshot`, `SnapshotPolicy`, `SnapshotStore`, and `AsyncProcessorConfig` from `@eventfabric/core`.
+
+  Previous patch attempted to re-export `InlineProjection` from the barrel, but the bundled `dist/index.d.ts` still omitted it. Root cause: with `treeshake: true` in tsup, `rollup-plugin-dts` inlines an interface as a private `declare` (and drops the public re-export) when its source file is reached via a value-style `import { Foo }` rather than `import type { Foo }`. Switched the offending imports in `inline-projector.ts`, `repository.ts`, and `snapshot-store.ts` to `import type`. Also added the snapshot module to the package barrel — `Snapshot`, `SnapshotPolicy`, and `SnapshotStore` were never re-exported, leaving consumers unable to type a custom `Repository` options object — and exposed `AsyncProcessorConfig` for the same reason.
+
 ## 0.1.9
 
 ### Patch Changes
