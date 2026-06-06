@@ -34,6 +34,25 @@ export interface UnitOfWork<TTx extends Transaction = Transaction> {
   withTransaction<T>(fn: (tx: TTx) => Promise<T>): Promise<T>;
 }
 
+/**
+ * A UnitOfWork that can also produce per-tenant views of itself. Used by
+ * the mediator's CommandBus and the saga workers to narrow transactions
+ * to a specific tenant without forcing callers to pass tenantId at every
+ * `withTransaction` call.
+ *
+ * `forTenant(tenantId)` must return a UnitOfWork whose transactions are
+ * bound to that tenant (e.g. via Postgres GUCs, schema selection, or row-
+ * level filtering at the store layer). The returned UoW is independent —
+ * calling `forTenant` again on the original yields a fresh tenant view.
+ *
+ * Single-tenant deployments don't need this type — pass a plain
+ * `UnitOfWork` and the bus skips the narrowing entirely.
+ */
+export interface TenantAwareUnitOfWork<TTx extends Transaction = Transaction>
+  extends UnitOfWork<TTx> {
+  forTenant(tenantId: string): UnitOfWork<TTx>;
+}
+
 export interface EventStore<E extends AnyEvent, TTx extends Transaction = Transaction> {
   append(
     tx: TTx,

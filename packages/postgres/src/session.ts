@@ -536,7 +536,16 @@ export class Session<E extends AnyEvent> {
    * session.append(accountId, 1, accountDeposited);
    * await session.saveChangesAsync(); // Commits everything in one transaction
    */
-  async saveChangesAsync(): Promise<void> {
+  async saveChangesAsync(opts?: {
+    /**
+     * Causation/correlation metadata stamped on every event written by this
+     * call. When dispatching from a command handler, build this from the
+     * command context: `commandContextToEventMeta(ctx)`. The metadata is
+     * threaded into `store.append`, which persists it to the events table's
+     * `correlation_id` / `causation_id` columns.
+     */
+    meta?: { correlationId?: string; causationId?: string };
+  }): Promise<void> {
     // First, collect pending events from all tracked aggregates
     for (const [aggregateId, aggregate] of this.loadedAggregates.entries()) {
       const events = aggregate.pullPendingEvents();
@@ -545,7 +554,7 @@ export class Session<E extends AnyEvent> {
       // Infer aggregate class from first event
       const firstEvent = events[0]!;
       const AggregateClass = this.inferAggregateFromEvent(firstEvent);
-      
+
       if (!AggregateClass) {
         throw new Error(
           `Cannot infer aggregate class from event type "${firstEvent.type}". ` +
@@ -567,6 +576,7 @@ export class Session<E extends AnyEvent> {
       return; // Nothing to save
     }
 
+    const meta = opts?.meta;
     const uow = new PgUnitOfWork(this.pool, this.tenantId);
     await uow.withTransaction(async (tx: PgTx) => {
       const allAppendedEvents: EventEnvelope<E>[] = [];
@@ -582,6 +592,7 @@ export class Session<E extends AnyEvent> {
             aggregateId: op.aggregateId,
             expectedAggregateVersion: 0,
             events: op.events,
+            meta,
             enqueueOutbox: true,
             outboxTopic: this.config.outboxTopicRegistry.get(op.aggregateName) ?? null
           });
@@ -609,6 +620,7 @@ export class Session<E extends AnyEvent> {
             aggregateId: op.aggregateId,
             expectedAggregateVersion: expectedVersion,
             events: op.events,
+            meta,
             enqueueOutbox: true,
             outboxTopic: this.config.outboxTopicRegistry.get(op.aggregateName) ?? null
           });

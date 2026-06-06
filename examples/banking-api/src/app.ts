@@ -17,7 +17,7 @@ import { TransactionAggregate, type TransactionState } from "./domain/transactio
 import { CustomerAggregate, type CustomerState } from "./domain/customer.aggregate";
 import type { BankingEvent } from "./domain/events";
 import { AccountOpened, AccountDeposited } from "./domain/account.events";
-import { TransactionInitiated, TransactionStarted, TransactionCompleted } from "./domain/transaction.events";
+import { TransactionInitiated, TransactionStarted } from "./domain/transaction.events";
 import { CustomerRegistered } from "./domain/customer.events";
 import { accountEventUpcaster } from "./domain/account.upcasters";
 import { emailNotificationProjection } from "./projections/email-projection";
@@ -334,12 +334,18 @@ app.post("/accounts/:id/close", async (req, res) => {
   }
 });
 
-// ========== Transaction Endpoints ==========
-app.post("/transactions/:id/initiate", async (req, res) => {
+// ========== Transfer Endpoint (projection-driven eventual consistency) ==========
+//
+// This is the only way a transfer enters the system in this variant.
+// There is no atomic /transfers and no manual /transactions/:id/...
+// lifecycle endpoint — every transition through pending → started →
+// withdrawn → deposited → completed is driven by the catch-up transfer
+// projections reacting to the events emitted here.
+app.post("/transfers", async (req, res) => {
   const session = sessionFactory.createSession();
   try {
-    const id = req.params.id;
-    const { fromAccountId, toAccountId, amount, currency, description } = req.body;
+    const { transactionId, fromAccountId, toAccountId, amount, description } = req.body;
+
     if (amount <= 0) {
       res.status(400).json({ error: "Transaction amount must be positive" });
       return;
@@ -348,41 +354,32 @@ app.post("/transactions/:id/initiate", async (req, res) => {
       res.status(400).json({ error: "Cannot transfer to the same account" });
       return;
     }
-    session.startStream(id, TransactionInitiated({ transactionId: id, fromAccountId, toAccountId, amount, currency: currency || "USD", description }));
+
+    // Seed the transaction stream with Initiated + Started. The catch-up
+    // transfer projections do the rest:
+    //   1. WithdrawalProjection reads TransactionStarted → performs withdrawal → emits WithdrawalCompleted
+    //   2. DepositProjection reads WithdrawalCompleted → performs deposit → emits DepositCompleted
+    //   3. CompletionProjection reads DepositCompleted → completes transaction → emits TransactionCompleted
+    // On insufficient funds, the withdrawal projection emits
+    // TransactionFailed inline and the chain stops.
+    session.startStream(transactionId,
+      TransactionInitiated({ transactionId, fromAccountId, toAccountId, amount, currency: "USD", description }),
+      TransactionStarted({ transactionId, fromAccountId, toAccountId, amount, currency: "USD", description, startedAt: new Date().toISOString() })
+    );
     await session.saveChangesAsync();
-    res.json({ ok: true, transactionId: id, status: "pending" });
+
+    res.json({
+      ok: true,
+      transactionId,
+      message: "Transfer initiated. The catch-up transfer projections will drive the chain to completion.",
+      status: "started"
+    });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
   }
 });
 
-app.post("/transactions/:id/complete", async (req, res) => {
-  const session = sessionFactory.createSession();
-  try {
-    const id = req.params.id;
-    const transaction = await session.loadAggregateAsync<TransactionAggregate>(id);
-    transaction.complete();
-    await session.saveChangesAsync();
-    res.json({ ok: true, transactionId: id, status: transaction.status });
-  } catch (error: any) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.post("/transactions/:id/fail", async (req, res) => {
-  const session = sessionFactory.createSession();
-  try {
-    const id = req.params.id;
-    const { reason } = req.body;
-    const transaction = await session.loadAggregateAsync<TransactionAggregate>(id);
-    transaction.fail(reason || "Unknown error");
-    await session.saveChangesAsync();
-    res.json({ ok: true, transactionId: id, status: transaction.status });
-  } catch (error: any) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
+// Read-only — observe the terminal state of a projection-driven transaction.
 app.get("/transactions/:id", async (req, res) => {
   const session = sessionFactory.createSession();
   try {
@@ -395,77 +392,6 @@ app.get("/transactions/:id", async (req, res) => {
     });
   } catch (error: any) {
     res.status(404).json({ error: error.message });
-  }
-});
-
-// ========== Eventual Transfer Endpoint (eventual consistency pattern) ==========
-app.post("/transfers/eventual", async (req, res) => {
-  const session = sessionFactory.createSession();
-  try {
-    const { transactionId, fromAccountId, toAccountId, amount, description } = req.body;
-
-    if (amount <= 0) {
-      res.status(400).json({ error: "Transaction amount must be positive" });
-      return;
-    }
-    if (fromAccountId === toAccountId) {
-      res.status(400).json({ error: "Cannot transfer to the same account" });
-      return;
-    }
-
-    // Start a new transaction stream with both initiate and start events.
-    // The async projections will handle the rest:
-    // 1. WithdrawalProjection processes TransactionStarted → performs withdrawal → raises WithdrawalCompleted
-    // 2. DepositProjection processes WithdrawalCompleted → performs deposit → raises DepositCompleted
-    // 3. CompletionProjection processes DepositCompleted → completes transaction → raises TransactionCompleted
-    session.startStream(transactionId,
-      TransactionInitiated({ transactionId, fromAccountId, toAccountId, amount, currency: "USD", description }),
-      TransactionStarted({ transactionId, fromAccountId, toAccountId, amount, currency: "USD", description, startedAt: new Date().toISOString() })
-    );
-    await session.saveChangesAsync();
-
-    res.json({
-      ok: true,
-      transactionId,
-      message: "Transfer initiated. Processing will complete asynchronously.",
-      status: "started"
-    });
-  } catch (error: any) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-// ========== Transfer Endpoint (atomic - immediate consistency) ==========
-app.post("/transfers", async (req, res) => {
-  try {
-    const { transactionId, fromAccountId, toAccountId, amount, description } = req.body;
-
-    // Load existing accounts and create the transaction + transfer in one session
-    const session = sessionFactory.createSession();
-    const fromAccount = await session.loadAggregateAsync<AccountAggregate>(fromAccountId);
-    const toAccount = await session.loadAggregateAsync<AccountAggregate>(toAccountId);
-
-    // Validate transfer before creating the transaction stream
-    fromAccount.transferOut(toAccountId, amount, transactionId);
-    toAccount.transferIn(fromAccountId, amount, transactionId);
-
-    // Create the transaction stream as initiated + completed atomically
-    session.startStream(transactionId,
-      TransactionInitiated({ transactionId, fromAccountId, toAccountId, amount, currency: "USD", description }),
-      TransactionCompleted({ transactionId, fromAccountId, toAccountId, amount, completedAt: new Date().toISOString() })
-    );
-
-    // Save all aggregates atomically in a single transaction
-    await session.saveChangesAsync();
-
-    res.json({
-      ok: true,
-      transactionId,
-      fromAccount: { id: fromAccountId, balance: fromAccount.balance },
-      toAccount: { id: toAccountId, balance: toAccount.balance }
-    });
-  } catch (error: any) {
-    res.status(400).json({ error: error.message });
   }
 });
 

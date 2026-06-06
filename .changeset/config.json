@@ -3,7 +3,17 @@
   "commit": false,
   "fixed": [],
   "linked": [
-    ["@eventfabric/core", "@eventfabric/postgres", "@eventfabric/opentelemetry"]
+    [
+      "@eventfabric/core",
+      "@eventfabric/postgres",
+      "@eventfabric/opentelemetry",
+      "@eventfabric/mediator",
+      "@eventfabric/mediator-postgres",
+      "@eventfabric/mediator-opentelemetry",
+      "@eventfabric/sagas",
+      "@eventfabric/sagas-postgres",
+      "@eventfabric/sagas-opentelemetry"
+    ]
   ],
   "access": "public",
   "baseBranch": "main",

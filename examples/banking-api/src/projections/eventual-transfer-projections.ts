@@ -28,6 +28,9 @@ import { TransactionAggregate } from "../domain/transaction.aggregate";
  * Each handler dispatches on event.type and returns early for events
  * it doesn't care about. The checkpoint still advances — other events
  * in the same batch just pass through untouched.
+ *
+ * For the same workflow expressed as a `Saga` (with a withdraw-timeout
+ * timer + a command pipeline), see `examples/banking-api-saga/`.
  */
 
 /**

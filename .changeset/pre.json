@@ -1,0 +1,19 @@
+{
+  "mode": "pre",
+  "tag": "beta",
+  "initialVersions": {
+    "@eventfabric/mediator": "0.1.0",
+    "@eventfabric/mediator-postgres": "0.1.0",
+    "@eventfabric/mediator-opentelemetry": "0.1.0",
+    "@eventfabric/core": "0.1.10",
+    "@eventfabric/opentelemetry": "0.1.10",
+    "@eventfabric/postgres": "0.1.10",
+    "@eventfabric/sagas": "0.1.0",
+    "@eventfabric/sagas-opentelemetry": "0.1.0",
+    "@eventfabric/sagas-postgres": "0.1.0"
+  },
+  "changesets": [
+    "initial-beta-commands-sagas",
+    "migrator-extensions-and-session-meta"
+  ]
+}

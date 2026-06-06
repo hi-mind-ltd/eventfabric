@@ -1,9 +1,40 @@
 # Proposal 0001 — Command pipeline & idempotency
 
-**Status:** Draft
+**Status:** Implemented (`0.2.0-beta.0`)
 **Author:** Architecture
-**Target package:** `@eventfabric/core` (new module), `@eventfabric/postgres` (storage)
 **Depends on:** Existing `Session`, `Repository`, `EventStore`, outbox
+
+## Implementation notes
+
+This proposal shipped in `0.2.0-beta.0`. The package layout differs from
+the proposal's original "Target package" line, which referenced
+`@eventfabric/core (new module)` and `@eventfabric/postgres (storage)`.
+Final layout:
+
+| Original target | Final package |
+|---|---|
+| `@eventfabric/core (new module)` | [`@eventfabric/mediator`](../mediator.md) — abstractions + in-memory store |
+| `@eventfabric/postgres (storage)` | [`@eventfabric/mediator-postgres`](../mediator.md) — PG idempotency store + migration `010` |
+| (not in proposal) | [`@eventfabric/mediator-opentelemetry`](../mediator.md) — added during implementation; `createCommandBusObserver` middleware + `createCommandIdempotencyGauges` |
+
+The split was made for symmetry with the saga family and to keep the
+mediator package backend-agnostic. The mediator depends on
+`@eventfabric/core` only for foundation types (`Transaction`,
+`UnitOfWork`, `TenantScopedUnitOfWorkFactory`, `withConcurrencyRetry`).
+
+Multi-tenancy landed slightly later than this proposal envisioned: the
+bus auto-narrows its UoW from `cmd.metadata.tenantId` via the
+`TenantScopedUnitOfWorkFactory` contract (`PgUnitOfWork.forTenant`).
+See [`docs/mediator.md`](../mediator.md#multi-tenancy) for the model.
+
+A few proposal items deferred to a later beta:
+
+- **Hash-derived idempotency keys (§3.7 mode 2).** Not implemented;
+  caller-supplied keys only. Tracked as a follow-up.
+- **Default middleware bundle (§3.4).** Idempotency and a logging
+  middleware ship today (`createLoggingMiddleware`). Tracing lives in
+  `@eventfabric/mediator-opentelemetry`. Auth and validation remain
+  user-supplied; the proposal already noted the contract is open.
 
 ## 1. Problem
 

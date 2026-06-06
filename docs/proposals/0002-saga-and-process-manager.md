@@ -1,10 +1,44 @@
 # Proposal 0002 — Saga / process manager primitive
 
-**Status:** Draft
+**Status:** Implemented (`0.2.0-beta.0`)
 **Author:** Architecture
-**Target package:** `@eventfabric/core` (new module), `@eventfabric/postgres` (storage)
 **Depends on:** Proposal 0001 (Command pipeline & idempotency)
-**Related code:** [examples/banking-api/src/projections/eventual-transfer-projections.ts](examples/banking-api/src/projections/eventual-transfer-projections.ts) — current hand-rolled approach
+**Related code:** [`examples/banking-api-saga`](../../examples/banking-api-saga/) — runnable end-to-end implementation of the funds-transfer saga sketched in §4; [`examples/banking-api/src/projections/eventual-transfer-projections.ts`](../../examples/banking-api/src/projections/eventual-transfer-projections.ts) — original hand-rolled approach for comparison
+
+## Implementation notes
+
+This proposal shipped in `0.2.0-beta.0`. The package layout differs
+from the proposal's original "Target package" line. Final layout:
+
+| Original target | Final package |
+|---|---|
+| `@eventfabric/core (new module)` | [`@eventfabric/sagas`](../sagas.md) — abstractions + in-memory stores + runner/dispatcher/scheduler |
+| `@eventfabric/postgres (storage)` | [`@eventfabric/sagas-postgres`](../sagas.md) — PG stores + migrations `011-013` |
+| (not in proposal) | [`@eventfabric/sagas-opentelemetry`](../sagas.md) — added during implementation; saga observer + queue gauges |
+
+The split keeps the saga package backend-agnostic. Sagas depend on
+[`@eventfabric/mediator`](../mediator.md) for the `Command` envelope
+and `CommandBus` — the dispatcher routes saga-emitted commands through
+the bus, which gives them free idempotency dedup via the
+`saga:<name>:<instance>:<rowId>` rewrite (§3.4).
+
+Multi-tenancy landed cleanly: the dispatcher stamps the saga's
+`tenantId` onto each dispatched command's `metadata.tenantId` and the
+bus auto-narrows from that. The scheduler narrows its UoW per item via
+`uow.forTenant(item.tenantId)`. See [`docs/sagas.md`](../sagas.md#multi-tenancy).
+
+Schema evolution (§3.9) is supported via `SagaStateUpcaster<TState>` on
+the `Saga` interface. The runner calls the upcaster when a loaded
+instance's `schemaVersion` is less than the saga's current `version`;
+the upgraded state persists on the next CAS update. See
+[`docs/sagas.md`](../sagas.md#schema-evolution).
+
+A few items deferred to a later beta:
+
+- **Saga state audit log (§3.2 opt-in).** Not implemented — none of the
+  initial pilot deployments need it. Tracked as a follow-up.
+- **Event-sourced sagas (§3.2, "Reserved for a future proposal 0002b").**
+  Still reserved. The snapshot model is the default and only mode today.
 
 ## 1. Problem
 

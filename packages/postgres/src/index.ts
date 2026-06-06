@@ -1,4 +1,5 @@
 export type { PgTx } from "./unitofwork/pg-transaction";
+export { PgUnitOfWork } from "./unitofwork/pg-unit-of-work";
 
 export { PgEventStore, ConcurrencyError, RowShapeError } from "./pg-event-store";
 export { PgSnapshotStore } from "./snapshots/pg-snapshot-store";
@@ -26,7 +27,7 @@ export type { PartitionInfo } from "./partitioning/pg-partition-manager";
 
 // Migrator
 export { migrate } from "./pg-migrator";
-export type { MigrateOptions, MigrateResult, MigrateObserver } from "./pg-migrator";
+export type { MigrateOptions, MigrateResult, MigrateObserver, MigrationSet } from "./pg-migrator";
 
 // Tenancy
 export type { TenantResolver } from "./tenancy/tenant-resolver";
