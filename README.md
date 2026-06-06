@@ -270,7 +270,7 @@ sequenceDiagram
         DB-->>Mid: status='completed', result=...
         Mid-->>Bus: stored result  (handler NOT invoked)
     end
-    Note over Bus,DB: Commit (or rollback on failure;<br/>idempotency slot vanishes with the tx).
+    Note over Bus,DB: Commit (or rollback on failure —<br/>idempotency slot vanishes with the tx).
     Bus-->>API: result
     API-->>User: 200 OK
 ```
@@ -327,7 +327,7 @@ sequenceDiagram
         Runner->>Saga: handle(tx, WithdrawalCompleted)
         rect rgb(232, 244, 233)
         Note over Saga,DB: Same transactional pattern
-        Saga->>DB: UPDATE saga_instances  (CAS state_version; step="withdrawn")
+        Saga->>DB: UPDATE saga_instances  (CAS state_version, step="withdrawn")
         Saga->>DB: INSERT saga_pending_commands  (DepositToAccount)
         Saga->>DB: UPDATE saga_scheduled_messages  SET status='cancelled'  (withdraw-timeout)
         end
