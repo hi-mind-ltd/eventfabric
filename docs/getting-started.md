@@ -251,4 +251,6 @@ curl http://localhost:3001/accounts/acc-1
 | [Event Store](./event-store.md)              | `PgEventStore`, append, load, concurrency, upcasting                |
 | [Sessions](./sessions.md)                    | `SessionFactory`, unit of work, identity map, batching               |
 | [Snapshots](./snapshots.md)                  | `PgSnapshotStore`, policies, upcasting, when to snapshot             |
+| [Mediator (Commands)](./mediator.md)         | `Command`, `CommandBus`, idempotency, middleware, causation, OTel    |
+| [Sagas](./sagas.md)                          | `Saga<S, E>`, runner, command dispatcher, timer scheduler, OTel      |
 | [Schema Reference](./schema-reference.md)    | Every table, column, index, and migration explained                  |

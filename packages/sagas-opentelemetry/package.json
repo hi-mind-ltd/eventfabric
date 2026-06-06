@@ -1,0 +1,59 @@
+{
+  "name": "@eventfabric/sagas-opentelemetry",
+  "description": "OpenTelemetry adapter for @eventfabric/sagas: traces + counters + histograms per saga reaction / command dispatch / timer fire, plus observable gauges for queue lag and overdue timers.",
+  "keywords": [
+    "saga",
+    "process-manager",
+    "opentelemetry",
+    "otel",
+    "observability",
+    "tracing",
+    "metrics",
+    "typescript",
+    "eventfabric"
+  ],
+  "license": "MIT",
+  "author": "Hi-Mind Limited",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hi-mind-ltd/eventfabric",
+    "directory": "packages/sagas-opentelemetry"
+  },
+  "version": "0.2.0-beta.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@eventfabric/sagas": "workspace:*",
+    "@opentelemetry/api": "^1.9.0"
+  },
+  "devDependencies": {
+    "@eventfabric/sagas": "workspace:*",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/context-async-hooks": "^1.26.0",
+    "@opentelemetry/sdk-metrics": "^1.26.0",
+    "@opentelemetry/sdk-trace-base": "^1.26.0",
+    "@types/node": "^20.19.27",
+    "vitest": "^2.1.8",
+    "typescript": "^5.6.3"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

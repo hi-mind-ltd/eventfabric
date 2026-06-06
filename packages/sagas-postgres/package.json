@@ -1,0 +1,74 @@
+{
+  "name": "@eventfabric/sagas-postgres",
+  "description": "Postgres-backed storage for @eventfabric/sagas: saga instance state, command queue, and timer scheduler tables. Pair with the abstract saga runtime.",
+  "keywords": [
+    "saga",
+    "process-manager",
+    "orchestration",
+    "postgres",
+    "postgresql",
+    "ddd",
+    "domain-driven-design",
+    "event-sourcing",
+    "cqrs",
+    "typescript",
+    "eventfabric"
+  ],
+  "license": "MIT",
+  "author": "Hi-Mind Limited",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hi-mind-ltd/eventfabric",
+    "directory": "packages/sagas-postgres"
+  },
+  "version": "0.2.0-beta.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@eventfabric/sagas": "workspace:*",
+    "@eventfabric/mediator": "workspace:*",
+    "@eventfabric/mediator-postgres": "workspace:*",
+    "@eventfabric/postgres": "workspace:*",
+    "pg": "^8.13.1"
+  },
+  "peerDependenciesMeta": {
+    "@eventfabric/mediator-postgres": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@eventfabric/mediator": "workspace:*",
+    "@eventfabric/mediator-postgres": "workspace:*",
+    "@eventfabric/core": "workspace:*",
+    "@eventfabric/postgres": "workspace:*",
+    "@eventfabric/sagas": "workspace:*",
+    "@testcontainers/postgresql": "^10.14.0",
+    "@types/node": "^20.19.27",
+    "@types/pg": "^8.11.10",
+    "pg": "^8.13.1",
+    "testcontainers": "^10.14.0",
+    "vitest": "^2.1.8",
+    "typescript": "^5.6.3"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

@@ -2,7 +2,9 @@
 
 All EventFabric tables live in the `eventfabric` PostgreSQL schema. This
 document provides a complete column-level reference for every table, index, and
-constraint created by the migration files in `packages/postgres/migrations/`.
+constraint shipped by the framework — including the **extension** migrations
+that the `@eventfabric/mediator-postgres` and `@eventfabric/sagas-postgres`
+packages contribute on top of the core tables.
 
 ## Schema creation
 
@@ -14,6 +16,8 @@ Run this before any migration. Migration `001_init.sql` includes this statement.
 
 ## Migration file listing
 
+### Core (shipped by `@eventfabric/postgres`)
+
 | File                            | Creates / Modifies                                             |
 | ------------------------------- | -------------------------------------------------------------- |
 | `001_init.sql`                  | `eventfabric` schema, `eventfabric.events` table, 2 indexes   |
@@ -23,23 +27,51 @@ Run this before any migration. Migration `001_init.sql` includes this statement.
 | `005_stream_versions.sql`       | `eventfabric.stream_versions` table (concurrency gatekeeper), backfills from existing events |
 | `006_performance.sql`           | Partial index on outbox, aggressive autovacuum on outbox, covering index on events |
 | `007_partitioning.sql`          | Drops UNIQUE constraints on events table (required for partitioning) |
+| `008_tenant_id.sql`             | Adds `tenant_id` column + composite indexes to event-store + outbox + snapshot tables for multi-tenancy |
+| `009_per_tenant_projection_checkpoints.sql` | Replaces `projection_checkpoints.last_global_position` with per-tenant checkpoint rows |
 
-All migrations are idempotent. Apply them in numeric order, or use `migrate(pool)`:
+### Mediator extension (shipped by `@eventfabric/mediator-postgres`)
 
-```bash
-psql "$DATABASE_URL" -f packages/postgres/migrations/001_init.sql
-psql "$DATABASE_URL" -f packages/postgres/migrations/002_projection_checkpoints.sql
-psql "$DATABASE_URL" -f packages/postgres/migrations/003_outbox_and_dlq.sql
-psql "$DATABASE_URL" -f packages/postgres/migrations/004_snapshots.sql
-psql "$DATABASE_URL" -f packages/postgres/migrations/005_stream_versions.sql
-psql "$DATABASE_URL" -f packages/postgres/migrations/006_performance.sql
-```
+| File                            | Creates / Modifies                                             |
+| ------------------------------- | -------------------------------------------------------------- |
+| `010_command_idempotency.sql`   | `eventfabric.command_idempotency` table (dedup slot per `(tenant_id, idempotency_key)`) + cleanup index |
 
-Or programmatically:
+### Sagas extension (shipped by `@eventfabric/sagas-postgres`)
+
+| File                            | Creates / Modifies                                             |
+| ------------------------------- | -------------------------------------------------------------- |
+| `011_saga_instances.sql`        | `eventfabric.saga_instances` table (per-instance state + optimistic CAS) + partial active-instance index |
+| `012_saga_pending_commands.sql` | `eventfabric.saga_pending_commands` outbox table + claim + watchdog indexes |
+| `013_saga_scheduled_messages.sql`| `eventfabric.saga_scheduled_messages` timer table + due + watchdog indexes |
+
+All migrations are idempotent. Apply them via `migrate(pool, { extensions })`:
 
 ```typescript
 import { migrate } from "@eventfabric/postgres";
+import { commandsMigrations } from "@eventfabric/mediator-postgres";
+import { sagasMigrations } from "@eventfabric/sagas-postgres";
+
+// Core tables only:
 await migrate(pool);
+
+// Core + mediator + sagas:
+await migrate(pool, { extensions: [commandsMigrations, sagasMigrations] });
+```
+
+Each `MigrationSet` carries the source package label, the absolute directory
+of `.sql` files, and the migration names. The migrator applies them after
+core, before partitioning, records each name in `eventfabric.schema_migrations`,
+and skips already-applied entries on re-run.
+
+For the lowest-level manual install (no Node), apply files in numeric order:
+
+```bash
+psql "$DATABASE_URL" -f packages/postgres/migrations/001_init.sql
+# ... 002 through 009 from packages/postgres/migrations/ ...
+psql "$DATABASE_URL" -f packages/mediator-postgres/migrations/010_command_idempotency.sql
+psql "$DATABASE_URL" -f packages/sagas-postgres/migrations/011_saga_instances.sql
+psql "$DATABASE_URL" -f packages/sagas-postgres/migrations/012_saga_pending_commands.sql
+psql "$DATABASE_URL" -f packages/sagas-postgres/migrations/013_saga_scheduled_messages.sql
 ```
 
 ---
@@ -257,6 +289,194 @@ overwrite older ones via the version-gated upsert in `PgSnapshotStore.save()`.
 
 ---
 
+---
+
+## Table: eventfabric.command_idempotency
+
+The mediator's dedup slot. One row per `(tenant_id, idempotency_key)`. The
+`CommandBus` inserts a row in `in_flight` state inside the same transaction
+as the command handler's effects; on success the row is updated to
+`completed` with the handler's stored result, on failure the row vanishes
+with the transaction rollback. Created by
+`packages/mediator-postgres/migrations/010_command_idempotency.sql`.
+
+### Columns
+
+| Column              | Type          | Nullable | Default     | Description                                                       |
+| ------------------- | ------------- | -------- | ----------- | ----------------------------------------------------------------- |
+| `tenant_id`         | `TEXT`        | NOT NULL | `'default'` | Tenant scope. Same `idempotency_key` in different tenants never collides. |
+| `idempotency_key`   | `TEXT`        | NOT NULL | --          | Caller-supplied key from `cmd.metadata.idempotencyKey`. Composite PK with `tenant_id`. |
+| `command_type`      | `TEXT`        | NOT NULL | --          | `cmd.type` — kept for triage / observability, not for routing.    |
+| `command_id`        | `TEXT`        | NOT NULL | --          | `cmd.metadata.commandId` of whichever attempt currently owns the slot. |
+| `status`            | `TEXT`        | NOT NULL | --          | `'in_flight'`, `'completed'`, or `'failed'`. Enforced by CHECK.   |
+| `result`            | `JSONB`       | NULL     | `NULL`      | Stored handler return value, set when `status` transitions to `'completed'`. Returned verbatim on subsequent claim-with-same-key. |
+| `error_message`     | `TEXT`        | NULL     | `NULL`      | Reason text written by the watchdog when flipping `'in_flight'` → `'failed'`. Surfaced for ops triage. |
+| `created_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`     | When the slot was claimed. Used by both `cleanup` (retention) and `resetStaleInFlight` (watchdog window). |
+| `completed_at`      | `TIMESTAMPTZ` | NULL     | `NULL`      | Set by `complete` and by the watchdog when flipping to `'failed'`. |
+
+### Constraints
+
+| Constraint                          | Type        | Description                                                     |
+| ----------------------------------- | ----------- | --------------------------------------------------------------- |
+| `command_idempotency_pkey`          | PRIMARY KEY | `(tenant_id, idempotency_key)`. Drives the atomic claim semantics — INSERT ON CONFLICT DO UPDATE WHERE status='failed'. |
+| `command_idempotency_status_check`  | CHECK       | `status IN ('in_flight','completed','failed')`.                |
+
+### Indexes
+
+| Index name                                 | Columns         | Purpose                                                              |
+| ------------------------------------------ | --------------- | -------------------------------------------------------------------- |
+| `command_idempotency_created_at_idx`       | `(created_at)`  | Sweeps the cleanup job (`DELETE WHERE created_at < $threshold`) and the in-flight watchdog (`UPDATE WHERE status='in_flight' AND created_at < $threshold`). |
+
+### Design notes
+
+- The bus's claim is `INSERT ... ON CONFLICT (tenant_id, idempotency_key) DO UPDATE SET status='in_flight' ... WHERE command_idempotency.status='failed' RETURNING ...`. One round-trip handles fresh claims and atomic recovery from watchdog-failed slots.
+- The slot lifetime is bound to the bus's transaction — when the handler throws, the rollback removes the `in_flight` row implicitly, so the next retry claims afresh without operator intervention.
+- See the [Mediator docs](./mediator.md#idempotency-in-detail) for the full claim-result decision table and the [Operational Runbook](./operational-runbook.md) for cleanup + watchdog cadences.
+
+---
+
+## Table: eventfabric.saga_instances
+
+Per-instance saga state. Each row is one running (or terminated) saga: its
+JSONB state, an optimistic-locking `state_version`, lifecycle status, and the
+highest `global_position` it has applied. State updates use a CAS on
+`state_version` to serialize concurrent advances of the same instance. Created
+by `packages/sagas-postgres/migrations/011_saga_instances.sql`.
+
+### Columns
+
+| Column              | Type          | Nullable | Default     | Description                                                       |
+| ------------------- | ------------- | -------- | ----------- | ----------------------------------------------------------------- |
+| `tenant_id`         | `TEXT`        | NOT NULL | `'default'` | Tenant scope. Same `(saga_name, instance_id)` in different tenants → independent instances. |
+| `saga_name`         | `TEXT`        | NOT NULL | --          | The saga's static `name` (e.g. `"FundsTransfer"`). Part of the composite PK. |
+| `instance_id`       | `TEXT`        | NOT NULL | --          | Per-saga instance identifier — usually the correlation id returned by `correlate(event)`. |
+| `state`             | `JSONB`       | NOT NULL | --          | The saga's current `state` snapshot. Overwritten on every transition. |
+| `state_version`     | `INTEGER`     | NOT NULL | --          | Optimistic-concurrency token. Every `update` CAS asserts `WHERE state_version = $expected` and bumps by 1. |
+| `status`            | `TEXT`        | NOT NULL | --          | `'active'`, `'completed'` (reaction returned `end:true`), or `'failed'` (operator-flipped after dead-letter). |
+| `schema_version`    | `INTEGER`     | NOT NULL | `1`         | Saga state schema version. The runner upcasts on load when this is below the saga's current `version` (via the saga's `upcaster`), and persists the upgraded value on the next CAS update. See [Sagas › Schema evolution](./sagas.md#schema-evolution). |
+| `last_event_pos`    | `BIGINT`      | NULL     | `NULL`      | Highest `globalPosition` the runner has applied to this instance. Events with `globalPosition <= last_event_pos` are skipped (idempotent replay). |
+| `created_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`     | When the instance was first inserted by the runner. Drives the `instance_age_seconds` metric at completion. |
+| `updated_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`     | When the last transition committed. |
+
+### Constraints
+
+| Constraint                          | Type        | Description                                                     |
+| ----------------------------------- | ----------- | --------------------------------------------------------------- |
+| `saga_instances_pkey`               | PRIMARY KEY | `(tenant_id, saga_name, instance_id)`. PK violation on INSERT catches parallel workers trying to seed the same instance. |
+| `saga_instances_status_check`       | CHECK       | `status IN ('active','completed','failed')`.                  |
+
+### Indexes
+
+| Index name                          | Columns                       | Purpose                                                          |
+| ----------------------------------- | ----------------------------- | ---------------------------------------------------------------- |
+| `saga_instances_active_idx` (partial) | `(saga_name, tenant_id)` WHERE `status = 'active'` | Powers the ops query "show me all running instances of `FundsTransfer` for tenant `acme`" — used by `PgSagaStateStore.listActive()` and dashboards. The partial predicate keeps the index small as completed instances accumulate. |
+
+### Design notes
+
+- Snapshot-only state model. Each row holds the **current** saga state, not a history of transitions. Re-deriving state from events on every tick would dominate runtime cost. Marten and NServiceBus both use the snapshot model for the same reason.
+- Two parallel runners trying to advance the same instance race on `UPDATE ... WHERE state_version = $expected`; the loser receives `rowCount = 0`, the runner returns `concurrent`, and the runner releases the message back to the outbox for retry.
+- `last_event_pos` makes replay idempotent. The async-projection runner can deliver the same event twice (after a crash) without producing double effects.
+- `schema_version` is bumped lazily on the next CAS update after the saga's `upcaster` runs. Long-quiescent instances stay at their old version until they receive their next event. See [Sagas › Schema evolution](./sagas.md#schema-evolution).
+- Retention: `PgSagaStateStore.cleanupTerminal({ olderThan, statuses? })` deletes terminal rows. See the [Operational Runbook](./operational-runbook.md#retention) for cadence.
+- See [Sagas](./sagas.md) for the full programming model and [Operational Runbook](./operational-runbook.md) for the manual-recovery flow on `status='failed'`.
+
+---
+
+## Table: eventfabric.saga_pending_commands
+
+The outbox for commands emitted by sagas. The saga runner inserts rows here
+in the **same transaction** that advances saga state — atomic by construction.
+The `SagaCommandDispatcher` worker drains pending rows in batches via
+`FOR UPDATE SKIP LOCKED`, dispatches each one through the `CommandBus`, and
+deletes the row on success. After `maxAttempts`, rows are flipped to
+`status='failed'` for ops triage. Created by
+`packages/sagas-postgres/migrations/012_saga_pending_commands.sql`.
+
+### Columns
+
+| Column              | Type          | Nullable | Default     | Description                                                       |
+| ------------------- | ------------- | -------- | ----------- | ----------------------------------------------------------------- |
+| `id`                | `BIGSERIAL`   | NOT NULL | auto-inc    | **PRIMARY KEY.** Used as the dispatch idempotency key suffix: `saga:<name>:<instance>:<id>` — so a re-dispatch after a watchdog release dedups against the bus's completed slot. |
+| `tenant_id`         | `TEXT`        | NOT NULL | --          | Tenant scope. The dispatcher stamps this onto `cmd.metadata.tenantId` so the bus auto-narrows. |
+| `saga_name`         | `TEXT`        | NOT NULL | --          | Source saga's static `name`. Used to construct the dispatch idempotency key and surface in OTel labels. |
+| `instance_id`       | `TEXT`        | NOT NULL | --          | Source instance id. Used in the dispatch idempotency key. |
+| `command`           | `JSONB`       | NOT NULL | --          | The full `Command` envelope the saga returned in its reaction. The dispatcher rewrites `metadata.idempotencyKey` (and `metadata.tenantId` if unset) before sending through the bus. |
+| `status`            | `TEXT`        | NOT NULL | `'pending'` | `'pending'` (claimable), `'claimed'` (dispatched, awaiting ack), or `'failed'` (max retries exhausted). |
+| `attempts`          | `INTEGER`     | NOT NULL | `0`         | Bumped on every `claimBatch`. The dispatcher compares against `maxAttempts` before deciding to fail vs release. |
+| `last_error`        | `TEXT`        | NULL     | `NULL`      | Error message from the last failed dispatch. Set by `releaseWithError`, `markFailed`, and the watchdog. |
+| `enqueued_at`       | `TIMESTAMPTZ` | NOT NULL | `now()`     | When the saga emitted the command. Drives the `pending_commands_lag_seconds` gauge. |
+| `claimed_at`        | `TIMESTAMPTZ` | NULL     | `NULL`      | Set when status flips to `'claimed'`. Used by the watchdog to detect dispatcher crashes. Reset to `NULL` on release. |
+
+### Constraints
+
+| Constraint                          | Type        | Description                                                     |
+| ----------------------------------- | ----------- | --------------------------------------------------------------- |
+| `saga_pending_commands_pkey`        | PRIMARY KEY | `(id)`. Drives `ack`/`releaseWithError`/`markFailed` lookups.   |
+| `saga_pending_commands_status_check` | CHECK      | `status IN ('pending','claimed','failed')`.                    |
+
+### Indexes
+
+| Index name                                  | Columns                | Purpose                                                          |
+| ------------------------------------------- | ---------------------- | ---------------------------------------------------------------- |
+| `saga_pending_commands_pending_idx` (partial) | `(id)` WHERE `status='pending'` | Hot path for the dispatcher's `SELECT ... FOR UPDATE SKIP LOCKED ORDER BY id ASC LIMIT $batch`. The partial predicate keeps the index tiny — only the pending rows are visible. |
+| `saga_pending_commands_claimed_idx` (partial) | `(claimed_at)` WHERE `status='claimed'` | Powers `resetStaleClaimed({ olderThan })` and the ops query "show me dispatchers that crashed mid-send." |
+
+### Design notes
+
+- No audit table for dispatched commands. The **events** produced by the command's handler are the durable record; the row is `DELETE`d on `ack`. Keeping a permanent history would double-write on the hot path.
+- `attempts` is bumped at `claimBatch` time (atomically with the status flip to `'claimed'`), so a dispatcher crash mid-send still counts the attempt — the watchdog releases the row with attempts preserved, and the next claim sees the same count.
+- Retention: `PgSagaCommandQueue.cleanupFailed({ olderThan })` deletes `failed` rows. Successful dispatches are already ack-deleted. See the [Operational Runbook](./operational-runbook.md#retention).
+- See the [Sagas](./sagas.md#sagacommanddispatcher) docs for the dispatch flow and [Operational Runbook](./operational-runbook.md) for the watchdog cadence + triage of `status='failed'` rows.
+
+---
+
+## Table: eventfabric.saga_scheduled_messages
+
+The timer queue. Each row is a future `TimerMessage` a saga scheduled. The
+runner inserts rows in the same transaction as the saga's state advance. The
+`SagaTimerScheduler` worker polls due rows (`fire_at <= NOW()`), claims them
+via `FOR UPDATE SKIP LOCKED`, delivers them to the saga's `reactToTimer`, and
+marks them `fired`. Cancelled rows are retained for ops visibility. Created by
+`packages/sagas-postgres/migrations/013_saga_scheduled_messages.sql`.
+
+### Columns
+
+| Column              | Type          | Nullable | Default     | Description                                                       |
+| ------------------- | ------------- | -------- | ----------- | ----------------------------------------------------------------- |
+| `tenant_id`         | `TEXT`        | NOT NULL | `'default'` | Tenant scope. The scheduler narrows its UoW to this value via `forTenant` before the per-item transaction. |
+| `saga_name`         | `TEXT`        | NOT NULL | --          | Owning saga's static `name`. Composite-PK partner. |
+| `instance_id`       | `TEXT`        | NOT NULL | --          | Owning instance id. Composite-PK partner. |
+| `id`                | `TEXT`        | NOT NULL | --          | Author-supplied stable timer id (e.g. `"withdraw-timeout"`). Composite-PK partner. The saga uses the same id to cancel before the timer fires. |
+| `fire_at`           | `TIMESTAMPTZ` | NOT NULL | --          | Absolute time at which the timer should fire. The scheduler picks up rows with `fire_at <= NOW()`. |
+| `message`           | `JSONB`       | NOT NULL | --          | The `TimerMessage` payload that gets delivered back to the saga as `reactToTimer(state, message, ctx)`. |
+| `status`            | `TEXT`        | NOT NULL | `'pending'` | `'pending'`, `'claimed'`, `'fired'`, or `'cancelled'`. |
+| `scheduled_at`      | `TIMESTAMPTZ` | NOT NULL | `now()`     | When the saga scheduled the timer. Reset on re-schedule (same id → ON CONFLICT updates `scheduled_at`). |
+| `claimed_at`        | `TIMESTAMPTZ` | NULL     | `NULL`      | Set when status flips to `'claimed'`. Watchdog uses this to detect scheduler crashes. Reset to `NULL` on release. |
+
+### Constraints
+
+| Constraint                          | Type        | Description                                                     |
+| ----------------------------------- | ----------- | --------------------------------------------------------------- |
+| `saga_scheduled_messages_pkey`      | PRIMARY KEY | `(tenant_id, saga_name, instance_id, id)`. The composite PK lets the saga's `cancel: ["withdraw-timeout"]` directly hit one row. Re-scheduling the same id uses ON CONFLICT to replace the prior pending row. |
+| `saga_scheduled_messages_status_check` | CHECK    | `status IN ('pending','claimed','fired','cancelled')`.        |
+
+### Indexes
+
+| Index name                                | Columns                        | Purpose                                                          |
+| ----------------------------------------- | ------------------------------ | ---------------------------------------------------------------- |
+| `saga_scheduled_due_idx` (partial)        | `(fire_at)` WHERE `status='pending'` | Hot path for the scheduler's `SELECT ... WHERE status='pending' AND fire_at <= $now FOR UPDATE SKIP LOCKED ORDER BY fire_at ASC`. The partial predicate excludes fired + cancelled rows from the index entirely. |
+| `saga_scheduled_claimed_idx` (partial)    | `(claimed_at)` WHERE `status='claimed'` | Powers `resetStaleClaimed({ olderThan })` and the ops alert metric for crashed scheduler workers. |
+
+### Design notes
+
+- Sub-second timers are out of scope. The default poll interval is 1 second; `fire_at <= NOW()` semantics mean the scheduler fires at-or-after the requested time, never before.
+- Cancelled rows are kept (`status='cancelled'`) for ops visibility — useful when investigating "the timer never fired" reports.
+- `ON CONFLICT (tenant_id, saga_name, instance_id, id) DO UPDATE SET ... status='pending', claimed_at=NULL` is how saga authors update a previously-scheduled timer's `fireAt` or payload — re-`schedule` with the same `id` and the runner replaces the pending row.
+- Retention: `PgSagaTimerStore.cleanupTerminal({ olderThan, statuses? })` deletes `fired` + `cancelled` rows (filter to `["fired"]` to keep cancelled timers around longer for "why didn't this fire?" triage). See the [Operational Runbook](./operational-runbook.md#retention).
+- See [Sagas](./sagas.md#sagatimerscheduler) for the delivery flow and [Operational Runbook](./operational-runbook.md) for the `scheduled_messages_overdue_count` alert (the metric that says "your scheduler is down or starved").
+
+---
+
 ## Entity-relationship summary
 
 ```
@@ -290,12 +510,60 @@ eventfabric.outbox_dead_letters  │
 eventfabric.projection_checkpoints
   projection_name
   last_global_position               (stores a global_position value)
+
+──────────────  mediator extension  ──────────────
+
+eventfabric.command_idempotency
+  tenant_id        ┐
+  idempotency_key  ┘                 (composite PK)
+  command_type
+  command_id                         (cmd.metadata.commandId, informational)
+  status                             ('in_flight' | 'completed' | 'failed')
+  result                             (JSONB, returned on completed retries)
+  created_at                         (drives cleanup + watchdog windows)
+
+────────────────  sagas extension  ────────────────
+
+eventfabric.saga_instances
+  tenant_id     ┐
+  saga_name    ─┤
+  instance_id  ─┘                    (composite PK)
+  state                              (JSONB snapshot)
+  state_version                      (CAS token)
+  status                             ('active' | 'completed' | 'failed')
+  last_event_pos ────────────────┐
+                                 │   (stores a global_position value
+                                 │    for idempotent event replay)
+eventfabric.saga_pending_commands│
+  id                             │
+  tenant_id  ─────┐              │   (the bus auto-narrows from this when
+  saga_name  ─────┤              │    the dispatcher rewrites the cmd)
+  instance_id ────┘              │
+  command                        │   (JSONB Command envelope)
+  status                         │   ('pending' | 'claimed' | 'failed')
+  attempts                       │
+  enqueued_at + claimed_at       │   (drive queue lag + watchdog metrics)
+                                 │
+eventfabric.saga_scheduled_messages
+  tenant_id    ┐                 │
+  saga_name   ─┤                 │
+  instance_id ─┤                 │   (composite PK matches owning instance)
+  id          ─┘                 │
+  fire_at                        │   (drives overdue-timer alert)
+  message                        │   (JSONB TimerMessage)
+  status                         │   ('pending' | 'claimed' | 'fired' | 'cancelled')
+                                 │
+                                 │   (events emitted by command handlers
+                                 │    feed back into the saga via the
+                                 │    outbox runner → sagaAsAsyncProjection)
+                                 ▼
+                      eventfabric.events  ←  the source of truth
 ```
 
-Note: the foreign key relationships between `outbox.global_position` and
-`events.global_position` are enforced **by application logic**, not by SQL
-`REFERENCES` constraints. This is intentional -- it avoids lock contention on
-the events table during outbox operations.
+Notes:
+- The foreign key relationships between `outbox.global_position` and `events.global_position` are enforced **by application logic**, not by SQL `REFERENCES` constraints. This is intentional — it avoids lock contention on the events table during outbox operations.
+- The mediator and saga tables likewise have no SQL foreign keys to `events` (or to each other). The dispatcher → bus → handler → events flow is enforced by transactions, not constraints.
+- The saga's `last_event_pos` makes replay idempotent: events with `globalPosition <= last_event_pos` are silently skipped, so re-delivery from the outbox is a no-op.
 
 ## Related documentation
 
@@ -306,3 +574,6 @@ the events table during outbox operations.
 - [Snapshots](./snapshots.md) — `PgSnapshotStore` API for `eventfabric.snapshots`
 - [Core Concepts](./core-concepts.md) — Transactional outbox pattern
 - [Sessions](./sessions.md) — How the session integrates with these tables
+- [Mediator](./mediator.md) — `CommandBus`, idempotency, and the `command_idempotency` table
+- [Sagas](./sagas.md) — `Saga<S, E>`, runner, dispatcher, scheduler, and the three saga tables
+- [Operational Runbook](./operational-runbook.md) — Cleanup + watchdog cadences for all four extension tables
