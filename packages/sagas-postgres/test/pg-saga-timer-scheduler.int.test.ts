@@ -438,7 +438,6 @@ describe("PgSagaTimerStore + SagaTimerScheduler (integration)", () => {
   it("orphaned timer (no handler) defaults to status='failed' so ops can triage rather than silently discarding", async () => {
     await seedInstance("i-orphan");
 
-    const stateStore = new PgSagaStateStore<CounterState>();
     const timerStore = new PgSagaTimerStore();
     const uow = new PgUnitOfWork(pool);
 
