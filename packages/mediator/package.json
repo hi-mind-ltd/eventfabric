@@ -38,11 +38,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "peerDependencies": {
-    "@eventfabric/core": "workspace:*"
-  },
   "devDependencies": {
-    "@eventfabric/core": "workspace:*",
     "@types/node": "^20.19.27",
     "vitest": "^2.1.8",
     "typescript": "^5.6.3"
@@ -51,5 +47,8 @@
     "build": "tsup",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@eventfabric/core": "workspace:*"
   }
 }

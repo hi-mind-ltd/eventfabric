@@ -41,10 +41,6 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@eventfabric/sagas": "workspace:*",
-    "@eventfabric/mediator": "workspace:*",
-    "@eventfabric/mediator-postgres": "workspace:*",
-    "@eventfabric/postgres": "workspace:*",
     "pg": "^8.13.1"
   },
   "peerDependenciesMeta": {
@@ -53,11 +49,6 @@
     }
   },
   "devDependencies": {
-    "@eventfabric/mediator": "workspace:*",
-    "@eventfabric/mediator-postgres": "workspace:*",
-    "@eventfabric/core": "workspace:*",
-    "@eventfabric/postgres": "workspace:*",
-    "@eventfabric/sagas": "workspace:*",
     "@testcontainers/postgresql": "^10.14.0",
     "@types/node": "^20.19.27",
     "@types/pg": "^8.11.10",
@@ -70,5 +61,11 @@
     "build": "tsup",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@eventfabric/sagas": "workspace:*",
+    "@eventfabric/mediator": "workspace:*",
+    "@eventfabric/mediator-postgres": "workspace:*",
+    "@eventfabric/postgres": "workspace:*"
   }
 }

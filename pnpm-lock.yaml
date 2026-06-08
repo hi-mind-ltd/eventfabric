@@ -224,10 +224,11 @@ importers:
         version: 2.1.9(@types/node@20.19.27)
 
   packages/mediator:
-    devDependencies:
+    dependencies:
       '@eventfabric/core':
         specifier: workspace:*
         version: link:../core
+    devDependencies:
       '@types/node':
         specifier: ^20.19.27
         version: 20.19.27
@@ -239,10 +240,11 @@ importers:
         version: 2.1.9(@types/node@20.19.27)
 
   packages/mediator-opentelemetry:
-    devDependencies:
+    dependencies:
       '@eventfabric/mediator':
         specifier: workspace:*
         version: link:../mediator
+    devDependencies:
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.1
@@ -266,16 +268,14 @@ importers:
         version: 2.1.9(@types/node@20.19.27)
 
   packages/mediator-postgres:
-    devDependencies:
-      '@eventfabric/core':
-        specifier: workspace:*
-        version: link:../core
+    dependencies:
       '@eventfabric/mediator':
         specifier: workspace:*
         version: link:../mediator
       '@eventfabric/postgres':
         specifier: workspace:*
         version: link:../postgres
+    devDependencies:
       '@testcontainers/postgresql':
         specifier: ^10.14.0
         version: 10.28.0
@@ -299,10 +299,11 @@ importers:
         version: 2.1.9(@types/node@20.19.27)
 
   packages/opentelemetry:
-    devDependencies:
+    dependencies:
       '@eventfabric/core':
         specifier: workspace:*
         version: link:../core
+    devDependencies:
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.1
@@ -351,13 +352,14 @@ importers:
         version: 2.1.9(@types/node@20.19.27)
 
   packages/sagas:
-    devDependencies:
+    dependencies:
       '@eventfabric/core':
         specifier: workspace:*
         version: link:../core
       '@eventfabric/mediator':
         specifier: workspace:*
         version: link:../mediator
+    devDependencies:
       '@types/node':
         specifier: ^20.19.27
         version: 20.19.27
@@ -369,10 +371,11 @@ importers:
         version: 2.1.9(@types/node@20.19.27)
 
   packages/sagas-opentelemetry:
-    devDependencies:
+    dependencies:
       '@eventfabric/sagas':
         specifier: workspace:*
         version: link:../sagas
+    devDependencies:
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.1
@@ -396,10 +399,7 @@ importers:
         version: 2.1.9(@types/node@20.19.27)
 
   packages/sagas-postgres:
-    devDependencies:
-      '@eventfabric/core':
-        specifier: workspace:*
-        version: link:../core
+    dependencies:
       '@eventfabric/mediator':
         specifier: workspace:*
         version: link:../mediator
@@ -412,6 +412,7 @@ importers:
       '@eventfabric/sagas':
         specifier: workspace:*
         version: link:../sagas
+    devDependencies:
       '@testcontainers/postgresql':
         specifier: ^10.14.0
         version: 10.28.0
