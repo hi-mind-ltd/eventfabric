@@ -29,6 +29,7 @@ Run this before any migration. Migration `001_init.sql` includes this statement.
 | `007_partitioning.sql`          | Drops UNIQUE constraints on events table (required for partitioning) |
 | `008_tenant_id.sql`             | Adds `tenant_id` column + composite indexes to event-store + outbox + snapshot tables for multi-tenancy |
 | `009_per_tenant_projection_checkpoints.sql` | Replaces `projection_checkpoints.last_global_position` with per-tenant checkpoint rows |
+| `015_event_hash_chain.sql`      | Tamper-evidence (opt-in per aggregate): adds `events.event_hash`, `stream_versions.head_hash`, and the `event_chain_anchors` + `event_chain_anchor_members` tables. Dormant unless a `hashChain.secret` is configured. See [Tamper Evidence](./tamper-evidence.md). |
 
 ### Mediator extension (shipped by `@eventfabric/mediator-postgres`)
 
@@ -98,6 +99,7 @@ The append-only event log. Every domain event ever recorded lives here.
 | `dismissed_by`      | `TEXT`        | NULL     | `NULL`    | Optional identifier of the actor who dismissed the event. |
 | `correlation_id`    | `TEXT`        | NULL     | `NULL`    | Optional tracing correlation ID. Passed via `meta.correlationId` at append time. |
 | `causation_id`      | `TEXT`        | NULL     | `NULL`    | Optional tracing causation ID. Passed via `meta.causationId` at append time. |
+| `event_hash`        | `BYTEA`       | NULL     | `NULL`    | Tamper-evidence chain hash (015). `HMAC(secret, prevHash ‖ canonical(event))` for events of chaining-enabled aggregates; `NULL` otherwise. See [Tamper Evidence](./tamper-evidence.md). |
 
 ### Constraints
 
@@ -136,6 +138,7 @@ on this table before inserting events. Created by `005_stream_versions.sql`.
 | `current_version`   | `INT`         | NOT NULL | `0`      | The latest committed `aggregate_version` for this stream. Updated atomically on every append. |
 | `created_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`  | Timestamp when the stream was first created.                     |
 | `updated_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`  | Timestamp of the last append to this stream.                     |
+| `head_hash`         | `BYTEA`       | NULL     | `NULL`   | Tamper-evidence chain head (015): the `event_hash` of this stream's latest chained event, cached so the write path needn't read the events table to extend the chain. `NULL` for unchained streams. |
 
 ### Constraints
 
@@ -154,6 +157,66 @@ explanation.
 This pattern is used by Marten DB (`mt_streams`), SQLStreamStore (`Streams`),
 and EventStoreDB (internal stream metadata). Keeping it separate from the events
 table enables [Partitioning](./partitioning.md) of the events table.
+
+---
+
+## Table: eventfabric.event_chain_anchors
+
+Per-tenant tamper-evidence anchor chain (opt-in feature, migration 015). Each
+row is one async "seal" of the tenant's chained stream heads, chained by an
+HMAC so the sealed records are themselves tamper-evident. Written by
+`PgChainAnchorSealer.seal()`; verified by `verifyAnchors()`. See
+[Tamper Evidence](./tamper-evidence.md).
+
+### Columns
+
+| Column              | Type          | Nullable | Default  | Description                                                       |
+| ------------------- | ------------- | -------- | -------- | ----------------------------------------------------------------- |
+| `tenant_id`         | `TEXT`        | NOT NULL | --       | Tenant this anchor belongs to. Part of the composite primary key. |
+| `anchor_seq`        | `BIGINT`      | NOT NULL | --       | Monotonic per-tenant anchor sequence (1, 2, 3…). Part of the composite primary key. |
+| `prev_anchor_hash`  | `BYTEA`       | NOT NULL | --       | The previous anchor's `anchor_hash` (or the tenant anchor genesis for seq 1). |
+| `anchor_hash`       | `BYTEA`       | NOT NULL | --       | `HMAC(secret, prev_anchor_hash ‖ canonical(sealed members))`.    |
+| `member_count`      | `INT`         | NOT NULL | --       | Number of stream heads sealed in this anchor's delta.            |
+| `created_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`  | When the anchor was sealed.                                      |
+
+### Constraints
+
+| Constraint                  | Type        | Description                                                     |
+| --------------------------- | ----------- | --------------------------------------------------------------- |
+| `event_chain_anchors_pkey`  | PRIMARY KEY | `(tenant_id, anchor_seq)`. Backstops concurrent sealers and serves "latest anchor for tenant" via a backward index scan. |
+
+---
+
+## Table: eventfabric.event_chain_anchor_members
+
+One row per stream sealed by an anchor (the anchor's delta — streams whose head
+advanced since the previous anchor). The latest row per `(tenant_id,
+aggregate_name, aggregate_id)` is that stream's last sealed `(version, head)`,
+which `verifyAnchors()` checks is still present and unchanged in the live log.
+Migration 015.
+
+### Columns
+
+| Column              | Type     | Nullable | Default | Description                                                       |
+| ------------------- | -------- | -------- | ------- | ----------------------------------------------------------------- |
+| `tenant_id`         | `TEXT`   | NOT NULL | --      | Tenant. Part of the composite primary key.                        |
+| `anchor_seq`        | `BIGINT` | NOT NULL | --      | The anchor this member belongs to. Part of the composite primary key. |
+| `aggregate_name`    | `TEXT`   | NOT NULL | --      | Stream's aggregate name. Part of the composite primary key.       |
+| `aggregate_id`      | `TEXT`   | NOT NULL | --      | Stream's aggregate id. Part of the composite primary key.         |
+| `sealed_version`    | `INT`    | NOT NULL | --      | The stream's `current_version` at seal time.                      |
+| `sealed_head_hash`  | `BYTEA`  | NOT NULL | --      | The stream's `head_hash` at seal time (= the `event_hash` at `sealed_version`). |
+
+### Constraints
+
+| Constraint                          | Type        | Description                                                     |
+| ----------------------------------- | ----------- | --------------------------------------------------------------- |
+| `event_chain_anchor_members_pkey`   | PRIMARY KEY | `(tenant_id, anchor_seq, aggregate_name, aggregate_id)`.        |
+
+### Indexes
+
+| Index name                                  | Columns                                                  | Purpose                                  |
+| ------------------------------------------- | -------------------------------------------------------- | ---------------------------------------- |
+| `event_chain_anchor_members_stream_idx`     | `(tenant_id, aggregate_name, aggregate_id, anchor_seq DESC)` | "Latest sealed state for a stream" lookup during verification and delta computation. |
 
 ---
 

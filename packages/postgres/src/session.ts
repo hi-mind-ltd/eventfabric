@@ -112,13 +112,19 @@ export class SessionFactory<E extends AnyEvent> {
     EAgg extends E,
     const TTypes extends readonly EAgg["type"][]
   >(
-    AggregateClass: { aggregateName: string } & (new (...args: any[]) => AggregateRoot<any, EAgg>),
+    AggregateClass: { aggregateName: string; tamperEvident?: boolean } & (new (...args: any[]) => AggregateRoot<any, EAgg>),
     eventTypes: ExhaustiveEventTypes<EAgg, TTypes>,
     outboxTopic: string,
     opts?: {
       snapshotStore?: { load(tx: PgTx, aggregateName: string, aggregateId: string): Promise<{ state: any; aggregateVersion: number } | null>; save(tx: PgTx, snapshot: any): Promise<void> };
       snapshotPolicy?: SnapshotPolicy;
       snapshotSchemaVersion?: number;
+      /**
+       * Override the aggregate's `static tamperEvident`. Use this only when the
+       * same aggregate must be chained in one deployment but not another; the
+       * intrinsic property normally lives on the class.
+       */
+      tamperEvident?: boolean;
     }
   ): void {
     if (!AggregateClass || !AggregateClass.aggregateName) {
@@ -135,6 +141,14 @@ export class SessionFactory<E extends AnyEvent> {
 
     // Register outbox topic
     this.config.outboxTopicRegistry.set(AggregateClass.aggregateName, outboxTopic);
+
+    // Tamper-evidence: intrinsic `static tamperEvident` on the class is the
+    // source of truth; the opts flag is an explicit per-deployment override.
+    // Either way it forwards into the store's hash-chain enabled set.
+    const tamperEvident = opts?.tamperEvident ?? AggregateClass.tamperEvident ?? false;
+    if (tamperEvident) {
+      this.store.enableHashChainFor(AggregateClass.aggregateName);
+    }
 
     // Register snapshot store if provided
     if (opts?.snapshotStore) {

@@ -5,6 +5,21 @@ export type HandlerMap<E extends AnyEvent, S> = {
 };
 
 export abstract class AggregateRoot<S, E extends AnyEvent> {
+  /**
+   * Opt this aggregate's streams into tamper-evident hash chaining. A backend
+   * that implements {@link TamperEvidentEventStore} (e.g. `@eventfabric/postgres`)
+   * treats every stream of this aggregate as hash-chained when this is `true`.
+   * Declared as an intrinsic property of the aggregate; the storage adapter
+   * reads it at registration time. Defaults to `false`.
+   *
+   * @example
+   * class AuditLog extends AggregateRoot<AuditState, AuditEvent> {
+   *   static aggregateName = "audit";
+   *   static tamperEvident = true;
+   * }
+   */
+  static tamperEvident = false;
+
   public version = 0;
   public state: S;
   private pending: E[] = [];

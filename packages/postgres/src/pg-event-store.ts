@@ -1,5 +1,12 @@
 import { randomUUID } from "crypto";
-import type { AnyEvent, EventEnvelope, EventUpcaster } from "@eventfabric/core";
+import type {
+  AnyEvent,
+  EventEnvelope,
+  EventUpcaster,
+  ChainVerificationResult,
+  TamperEvidentEventStore,
+} from "@eventfabric/core";
+import { computeEventHash, streamGenesis, hashesEqual, toSecret } from "@eventfabric/core";
 import type { PgTx } from "./unitofwork/pg-transaction";
 
 export class ConcurrencyError extends Error {
@@ -97,19 +104,107 @@ export type PgEventStoreOptions<E extends AnyEvent> = {
    * is the caller's responsibility — the upcaster runs on every load.
    */
   upcaster?: EventUpcaster<E>;
+  /**
+   * Enables tamper-evident hash chaining (requires migration 015). `secret` is
+   * the HMAC key — keep it in env/KMS, never in the database; without it an
+   * attacker who can write the DB could forge the chain. `enabledAggregates`
+   * lists the aggregate names to chain; you can also enable them later via
+   * {@link PgEventStore.enableHashChainFor} (which is what
+   * `SessionFactory.registerAggregate` calls for aggregates that declare
+   * `static tamperEvident = true`).
+   *
+   * When this option is absent the feature is fully dormant: `append` runs the
+   * original SQL with no reference to the hash columns, so stores that never
+   * opt in don't even need migration 015.
+   */
+  hashChain?: {
+    secret: string | Buffer;
+    enabledAggregates?: Iterable<string>;
+  };
 };
 
-export class PgEventStore<E extends AnyEvent> {
+export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore<E, PgTx> {
   private readonly eventsTable: string;
   private readonly outboxTable: string;
   private readonly upcaster?: EventUpcaster<E>;
   private readonly streamVersionsTable: string;
+  /** HMAC key for hash chaining, or undefined when the feature is off. */
+  private readonly hashSecret?: Buffer;
+  /** Aggregate names whose streams are hash-chained. Mutable so registration
+   *  (registerAggregate) can add to it after construction. */
+  private readonly hashEnabled: Set<string>;
 
   constructor(opts?: PgEventStoreOptions<E>) {
     this.eventsTable = opts?.eventsTable ?? "eventfabric.events";
     this.outboxTable = opts?.outboxTable ?? "eventfabric.outbox";
     this.streamVersionsTable = opts?.streamVersionsTable ?? "eventfabric.stream_versions";
     this.upcaster = opts?.upcaster;
+    this.hashSecret = opts?.hashChain ? toSecret(opts.hashChain.secret) : undefined;
+    this.hashEnabled = new Set(opts?.hashChain?.enabledAggregates ?? []);
+  }
+
+  /**
+   * Mark an aggregate's streams as tamper-evident (hash-chained). Requires the
+   * store to have been constructed with `hashChain.secret`. Called by
+   * `SessionFactory.registerAggregate` when an aggregate declares
+   * `static tamperEvident = true`.
+   */
+  enableHashChainFor(aggregateName: string): void {
+    if (this.hashSecret === undefined) {
+      throw new Error(
+        `Cannot enable tamper-evidence for "${aggregateName}": PgEventStore was constructed ` +
+        `without hashChain.secret. Pass { hashChain: { secret } } to the PgEventStore constructor.`
+      );
+    }
+    this.hashEnabled.add(aggregateName);
+  }
+
+  /** True when the chaining feature is configured at all (secret present). */
+  private get hashFeatureOn(): boolean {
+    return this.hashSecret !== undefined;
+  }
+
+  /** True when this specific aggregate's streams should be chained. */
+  private isChained(aggregateName: string): boolean {
+    return this.hashSecret !== undefined && this.hashEnabled.has(aggregateName);
+  }
+
+  /**
+   * Compute the chain hash for each event in a batch, in version order, linking
+   * the first to `prev` (the stream's current head or genesis). Returns the
+   * per-event hashes and the new head (the last event's hash).
+   */
+  private chainBatch(
+    prev: Buffer,
+    tenantId: string,
+    aggregateName: string,
+    aggregateId: string,
+    base: number,
+    eventIds: string[],
+    events: E[],
+    meta?: { correlationId?: string; causationId?: string }
+  ): { hashes: Buffer[]; head: Buffer } {
+    const secret = this.hashSecret!;
+    const hashes: Buffer[] = [];
+    let p = prev;
+    for (let i = 0; i < events.length; i++) {
+      const evt = events[i]!;
+      const h = computeEventHash(secret, p, {
+        tenantId,
+        aggregateName,
+        aggregateId,
+        aggregateVersion: base + i + 1,
+        eventId: eventIds[i]!,
+        type: evt.type,
+        version: evt.version,
+        payload: evt,
+        correlationId: meta?.correlationId ?? null,
+        causationId: meta?.causationId ?? null,
+      });
+      hashes.push(h);
+      p = h;
+    }
+    return { hashes, head: p };
   }
 
   /** The schema-qualified table name for events (e.g. "eventfabric.events"). */
@@ -146,15 +241,39 @@ export class PgEventStore<E extends AnyEvent> {
     // TOCTOU race, no need for a UNIQUE constraint on the events table.
     // Pattern: Marten DB (mt_streams), SQLStreamStore (Streams), EventStoreDB.
     const tenantId = tx.tenantId;
+    const base = expectedAggregateVersion;
+    const chained = this.isChained(aggregateName);
+
+    // Event ids are generated up front so chained hashes can incorporate them.
+    const eventIds = params.events.map(() => randomUUID());
+    // Per-event chain hashes — null for unchained aggregates. Filled in once we
+    // know the stream's previous head (genesis for a new stream, head_hash for
+    // an existing one).
+    let eventHashes: (Buffer | null)[] = params.events.map(() => null);
 
     if (expectedAggregateVersion === 0) {
       // New stream — INSERT into stream_versions. PK violation = stream already exists.
+      let head: Buffer | null = null;
+      if (chained) {
+        const genesis = streamGenesis(this.hashSecret!, tenantId, aggregateName, aggregateId);
+        const r = this.chainBatch(genesis, tenantId, aggregateName, aggregateId, base, eventIds, params.events, params.meta);
+        eventHashes = r.hashes;
+        head = r.head;
+      }
       try {
-        await tx.client.query(
-          `INSERT INTO ${this.streamVersionsTable} (tenant_id, aggregate_name, aggregate_id, current_version, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, now(), now())`,
-          [tenantId, aggregateName, aggregateId, eventCount]
-        );
+        if (this.hashFeatureOn) {
+          await tx.client.query(
+            `INSERT INTO ${this.streamVersionsTable} (tenant_id, aggregate_name, aggregate_id, current_version, head_hash, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, now(), now())`,
+            [tenantId, aggregateName, aggregateId, eventCount, head]
+          );
+        } else {
+          await tx.client.query(
+            `INSERT INTO ${this.streamVersionsTable} (tenant_id, aggregate_name, aggregate_id, current_version, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, now(), now())`,
+            [tenantId, aggregateName, aggregateId, eventCount]
+          );
+        }
       } catch (err: any) {
         if (err?.code === "23505") {
           throw new ConcurrencyError(
@@ -163,6 +282,35 @@ export class PgEventStore<E extends AnyEvent> {
         }
         throw err;
       }
+    } else if (chained) {
+      // Chained existing stream — lock the row to read the current head atomically,
+      // then bump version + head together. Same isolation outcome as the blind
+      // UPDATE below, with one extra round-trip to fetch the prev hash.
+      const locked = await tx.client.query(
+        `SELECT current_version, head_hash FROM ${this.streamVersionsTable}
+         WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3
+         FOR UPDATE`,
+        [tenantId, aggregateName, aggregateId]
+      );
+      const row = locked.rows[0];
+      const actualVersion = row ? Number(row.current_version) : undefined;
+      if (actualVersion !== expectedAggregateVersion) {
+        throw new ConcurrencyError(
+          `Expected version ${expectedAggregateVersion} but stream ${aggregateName}:${aggregateId} is at ${actualVersion ?? "(stream not found)"}`
+        );
+      }
+      // head_hash is NULL when the stream predates tamper-evidence being enabled;
+      // start the chain from genesis so events from here forward are protected.
+      const prev: Buffer =
+        (row.head_hash as Buffer | null) ?? streamGenesis(this.hashSecret!, tenantId, aggregateName, aggregateId);
+      const r = this.chainBatch(prev, tenantId, aggregateName, aggregateId, base, eventIds, params.events, params.meta);
+      eventHashes = r.hashes;
+      await tx.client.query(
+        `UPDATE ${this.streamVersionsTable}
+         SET current_version = $4, head_hash = $5, updated_at = now()
+         WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
+        [tenantId, aggregateName, aggregateId, newVersion, r.head]
+      );
     } else {
       // Existing stream — atomic version bump. 0 rows updated = someone else moved the version.
       const result = await tx.client.query(
@@ -186,13 +334,12 @@ export class PgEventStore<E extends AnyEvent> {
     }
 
     // Build and insert events
-    const base = expectedAggregateVersion;
     const values: any[] = [];
+    const perRow = this.hashFeatureOn ? 11 : 10;
     const rowsSql = params.events.map((evt, i) => {
-      const idx = i * 10;
-      const eventId = randomUUID();
+      const idx = i * perRow;
       values.push(
-        eventId,
+        eventIds[i],
         tenantId,
         aggregateName,
         aggregateId,
@@ -203,12 +350,20 @@ export class PgEventStore<E extends AnyEvent> {
         params.meta?.correlationId ?? null,
         params.meta?.causationId ?? null
       );
+      if (this.hashFeatureOn) {
+        values.push(eventHashes[i]);
+        return `($${idx+1}::uuid,$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7},$${idx+8}::jsonb,now(),$${idx+9},$${idx+10},$${idx+11})`;
+      }
       return `($${idx+1}::uuid,$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7},$${idx+8}::jsonb,now(),$${idx+9},$${idx+10})`;
     }).join(",");
 
+    const columns = this.hashFeatureOn
+      ? "(event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at, correlation_id, causation_id, event_hash)"
+      : "(event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at, correlation_id, causation_id)";
+
     const ins = await tx.client.query(
       `INSERT INTO ${this.eventsTable}
-        (event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at, correlation_id, causation_id)
+        ${columns}
        VALUES ${rowsSql}
        RETURNING global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
                  dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id`,
@@ -408,6 +563,120 @@ export class PgEventStore<E extends AnyEvent> {
        WHERE tenant_id = $1 AND event_id = $2::uuid`,
       [tx.tenantId, eventId, at, info?.reason ?? null, info?.by ?? null]
     );
+  }
+
+  /**
+   * Walk a single stream's hash chain and report whether it is intact. Reads
+   * the raw stored payload (NOT upcasted — the hash is over the stored bytes),
+   * including dismissed events (a soft-dismiss does not remove an event from
+   * the chain). Detects payload/metadata mutation, event removal (version gap
+   * or NULL hash inside the chain), and tail removal (head mismatch).
+   *
+   * Streams that began chaining mid-life (tamper-evidence enabled after some
+   * events already existed) are verified from their first protected event
+   * onward; earlier NULL-hash events are out of scope.
+   */
+  async verifyStream(
+    tx: PgTx,
+    params: { aggregateName: string; aggregateId: string }
+  ): Promise<ChainVerificationResult> {
+    if (this.hashSecret === undefined) {
+      throw new Error("verifyStream requires the store to be constructed with hashChain.secret");
+    }
+    const secret = this.hashSecret;
+    const tenantId = tx.tenantId;
+    const { aggregateName, aggregateId } = params;
+    const base: ChainVerificationResult = {
+      ok: true, tenantId, aggregateName, aggregateId, eventsChecked: 0, firstBrokenAt: null,
+    };
+
+    const res = await tx.client.query(
+      `SELECT aggregate_version, event_id, type, version, payload, correlation_id, causation_id, event_hash
+       FROM ${this.eventsTable}
+       WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3
+       ORDER BY aggregate_version ASC`,
+      [tenantId, aggregateName, aggregateId]
+    );
+    const rows = res.rows;
+
+    const headRes = await tx.client.query(
+      `SELECT head_hash FROM ${this.streamVersionsTable}
+       WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
+      [tenantId, aggregateName, aggregateId]
+    );
+    const storedHead: Buffer | null = headRes.rows[0]?.head_hash ?? null;
+
+    const chainStart = rows.findIndex((r: any) => r.event_hash !== null);
+    if (chainStart === -1) {
+      // No protected events. Consistent only if there is no stored head either.
+      if (storedHead) {
+        return { ...base, ok: false, firstBrokenAt: rows.length ? Number(rows[rows.length - 1].aggregate_version) : 0,
+          reason: "stream_versions.head_hash is set but the stream has no protected events" };
+      }
+      return base;
+    }
+
+    let prev = streamGenesis(secret, tenantId, aggregateName, aggregateId);
+    let checked = 0;
+    let expectedVersion = Number(rows[chainStart].aggregate_version);
+    for (let i = chainStart; i < rows.length; i++) {
+      const r: any = rows[i];
+      const version = Number(r.aggregate_version);
+      if (r.event_hash === null) {
+        return { ...base, ok: false, eventsChecked: checked, firstBrokenAt: version,
+          reason: "NULL event_hash inside the protected chain (event removed or never chained)" };
+      }
+      if (version !== expectedVersion) {
+        return { ...base, ok: false, eventsChecked: checked, firstBrokenAt: expectedVersion,
+          reason: `version gap: expected ${expectedVersion}, found ${version} (event removed)` };
+      }
+      const recomputed = computeEventHash(secret, prev, {
+        tenantId,
+        aggregateName,
+        aggregateId,
+        aggregateVersion: version,
+        eventId: r.event_id,
+        type: r.type,
+        version: Number(r.version),
+        payload: r.payload,
+        correlationId: r.correlation_id ?? null,
+        causationId: r.causation_id ?? null,
+      });
+      if (!hashesEqual(recomputed, r.event_hash as Buffer)) {
+        return { ...base, ok: false, eventsChecked: checked, firstBrokenAt: version,
+          reason: "event_hash mismatch (payload or metadata altered)" };
+      }
+      prev = recomputed;
+      checked++;
+      expectedVersion = version + 1;
+    }
+
+    if (!hashesEqual(prev, storedHead)) {
+      return { ...base, ok: false, eventsChecked: checked, firstBrokenAt: expectedVersion - 1,
+        reason: "head_hash mismatch (tail event(s) removed or head tampered)" };
+    }
+    return { ...base, eventsChecked: checked };
+  }
+
+  /**
+   * Verify every stream of the given aggregate for the transaction's tenant.
+   * Returns one result per stream; callers typically filter on `!r.ok`.
+   */
+  async verifyAggregate(
+    tx: PgTx,
+    params: { aggregateName: string }
+  ): Promise<ChainVerificationResult[]> {
+    const res = await tx.client.query(
+      `SELECT aggregate_id FROM ${this.streamVersionsTable}
+       WHERE tenant_id = $1 AND aggregate_name = $2
+       ORDER BY aggregate_id ASC`,
+      [tx.tenantId, params.aggregateName]
+    );
+    const out: ChainVerificationResult[] = [];
+    for (const row of res.rows) {
+      out.push(await this.verifyStream(tx, { aggregateName: params.aggregateName, aggregateId: row.aggregate_id }));
+    }
+    return out;
   }
 
   private mapRow(r: unknown): EventEnvelope<E> {

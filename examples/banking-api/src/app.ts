@@ -5,6 +5,9 @@ import {
   PgSnapshotStore,
   PgDlqService,
   PgOutboxStatsService,
+  PgUnitOfWork,
+  PgChainAnchorSealer,
+  PgChainAnchorRunner,
   createAsyncProjectionRunner,
   createCatchUpProjector,
   SessionFactory,
@@ -32,10 +35,20 @@ import { createOutboxOpsRouter } from "./ops/outbox-ops-router";
 import { createPartitionOpsRouter } from "./ops/partition-ops-router";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// Tamper-evidence: the account ledger is hash-chained (see /accounts/:id/verify
+// and the anchor below). The HMAC secret comes from the environment — never
+// commit it; without it, existing chains can't be verified. The dev fallback
+// is for local runs only.
+const CHAIN_SECRET = process.env.EF_CHAIN_SECRET ?? "dev-insecure-secret-change-me";
+
 // The upcaster is applied to every loaded event payload. Historical
 // AccountOpenedV1 events are migrated to V2 (with region="unknown") before
 // they reach handlers, projections, or read models.
-const store = new PgEventStore<BankingEvent>({ upcaster: accountEventUpcaster });
+const store = new PgEventStore<BankingEvent>({
+  upcaster: accountEventUpcaster,
+  hashChain: { secret: CHAIN_SECRET }
+});
 
 // Snapshots for each aggregate type (optional, for performance)
 const accountSnapshotStore = new PgSnapshotStore<AccountState>();
@@ -55,7 +68,7 @@ sessionFactory.registerAggregate(AccountAggregate, [
   "AccountTransferredOut",
   "AccountTransferredIn",
   "AccountClosed"
-], "account", { snapshotStore: accountSnapshotStore });
+], "account", { snapshotStore: accountSnapshotStore, tamperEvident: true });
 sessionFactory.registerAggregate(TransactionAggregate, [
   "TransactionInitiated",
   "TransactionStarted",
@@ -157,6 +170,20 @@ emailRunner.start(abortController.signal).catch((err) => {
     }
   }
 })();
+
+// ===== Tamper-evidence anchor =====
+// Per-stream chains (above) protect events within an account. The per-tenant
+// anchor adds cross-stream / whole-stream-deletion coverage: a background sealer
+// snapshots the chained stream heads into an HMAC-chained anchor, off the write
+// path. Verify it via GET /ops/chain/verify.
+const anchorSealer = new PgChainAnchorSealer({ secret: CHAIN_SECRET });
+const anchorRunner = new PgChainAnchorRunner(pool, anchorSealer, {
+  intervalMs: 30_000,
+  onError: (err, tenantId) => console.error("Anchor sealer error:", tenantId ?? "", err)
+});
+anchorRunner.start(abortController.signal).catch((err) => {
+  if (err?.name !== "AbortError") console.error("Anchor runner error:", err);
+});
 
 // Graceful shutdown
 process.on("SIGINT", () => {
@@ -320,6 +347,19 @@ app.get("/accounts/:id", async (req, res) => {
   }
 });
 
+// Tamper-evidence: walk this account's hash chain and report whether it is
+// intact. 200 = intact; 409 = a break was detected (with firstBrokenAt/reason).
+app.get("/accounts/:id/verify", async (req, res) => {
+  try {
+    const result = await new PgUnitOfWork(pool).withTransaction((tx) =>
+      store.verifyStream(tx, { aggregateName: AccountAggregate.aggregateName, aggregateId: req.params.id })
+    );
+    res.status(result.ok ? 200 : 409).json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/accounts/:id/close", async (req, res) => {
   const session = sessionFactory.createSession();
   try {
@@ -471,6 +511,25 @@ app.get("/accounts/with-customers", async (req, res) => {
 app.use("/ops/dlq", createDlqRouter(dlq));
 app.use("/ops/outbox", createOutboxOpsRouter(outboxStats));
 app.use("/ops/partitions", createPartitionOpsRouter(pool));
+
+// Tamper-evidence anchor ops: force a seal, or verify the whole anchor chain
+// (catches whole-stream deletion / rollback that per-account verify can't).
+app.post("/ops/chain/seal", async (_req, res) => {
+  try {
+    const result = await new PgUnitOfWork(pool).withTransaction((tx) => anchorSealer.seal(tx));
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+app.get("/ops/chain/verify", async (_req, res) => {
+  try {
+    const result = await new PgUnitOfWork(pool).withTransaction((tx) => anchorSealer.verifyAnchors(tx));
+    res.status(result.ok ? 200 : 409).json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 const PORT = process.env.PORT || 3001;
 

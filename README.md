@@ -381,6 +381,7 @@ event store or the outbox runner; it composes with them.
 - [Snapshots](docs/snapshots.md) — `PgSnapshotStore`, policies, snapshot upcasters
 - [Schema Evolution](docs/schema-evolution.md) — event upcasters, migrating event versions
 - [Concurrency](docs/concurrency.md) — optimistic concurrency, `ConcurrencyError`, retry helper
+- [Tamper Evidence](docs/tamper-evidence.md) — opt-in HMAC hash chaining, `verifyStream`, per-tenant anchor
 
 ### Projections
 
