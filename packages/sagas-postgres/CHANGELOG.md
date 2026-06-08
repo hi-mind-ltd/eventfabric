@@ -1,5 +1,15 @@
 # @eventfabric/sagas-postgres
 
+## 0.3.0
+
+### Patch Changes
+
+- Updated dependencies [073ced2]
+  - @eventfabric/postgres@0.3.0
+  - @eventfabric/mediator@0.3.0
+  - @eventfabric/mediator-postgres@0.3.0
+  - @eventfabric/sagas@0.3.0
+
 ## 0.2.0
 
 ### Minor Changes
