@@ -276,6 +276,9 @@ importers:
         specifier: workspace:*
         version: link:../postgres
     devDependencies:
+      '@eventfabric/core':
+        specifier: workspace:*
+        version: link:../core
       '@testcontainers/postgresql':
         specifier: ^10.14.0
         version: 10.28.0
@@ -413,6 +416,9 @@ importers:
         specifier: workspace:*
         version: link:../sagas
     devDependencies:
+      '@eventfabric/core':
+        specifier: workspace:*
+        version: link:../core
       '@testcontainers/postgresql':
         specifier: ^10.14.0
         version: 10.28.0

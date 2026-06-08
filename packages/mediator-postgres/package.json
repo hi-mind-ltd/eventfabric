@@ -44,6 +44,7 @@
     "pg": "^8.13.1"
   },
   "devDependencies": {
+    "@eventfabric/core": "workspace:*",
     "@testcontainers/postgresql": "^10.14.0",
     "@types/node": "^20.19.27",
     "@types/pg": "^8.11.10",
