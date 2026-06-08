@@ -14,6 +14,7 @@ A comprehensive banking application example demonstrating event sourcing pattern
 - **Unit of Work**: Transaction management across multiple aggregates
 - **Dead Letter Queue**: Failed message handling
 - **Outbox Pattern**: Reliable event delivery
+- **Tamper Evidence**: The account ledger is HMAC hash-chained — `GET /accounts/:id/verify` detects altered/removed events, and a background anchor (`/ops/chain/*`) catches whole-stream deletion. See [docs/tamper-evidence.md](../../docs/tamper-evidence.md)
 
 ## Setup
 
@@ -25,6 +26,9 @@ pnpm install
 2. Set up PostgreSQL database and set `DATABASE_URL`:
 ```bash
 export DATABASE_URL="postgresql://user:password@localhost:5432/banking_db"
+# HMAC secret for the tamper-evident account ledger (keep it out of source/VCS;
+# a dev fallback is used if unset). Required to verify chains across restarts.
+export EF_CHAIN_SECRET="$(openssl rand -hex 32)"
 ```
 
 3. Run migrations (if needed):
@@ -58,6 +62,7 @@ pnpm dev
 - `POST /accounts/:id/deposit` - Deposit money
 - `POST /accounts/:id/withdraw` - Withdraw money
 - `GET /accounts/:id` - Get account details
+- `GET /accounts/:id/verify` - Verify the account's tamper-evidence hash chain (200 = intact, 409 = broken with `firstBrokenAt`/`reason`)
 - `POST /accounts/:id/close` - Close an account
 
 ### Transactions
@@ -77,6 +82,8 @@ pnpm dev
 - `GET /ops/dlq` - View dead letter queue
 - `POST /ops/dlq/requeue/global/:pos` - Requeue a failed message
 - `GET /ops/outbox` - View outbox statistics
+- `POST /ops/chain/seal` - Force a tamper-evidence anchor seal (also runs every 30s in the background)
+- `GET /ops/chain/verify` - Verify the per-tenant anchor chain (catches whole-stream deletion / rollback)
 
 ## Example Usage
 

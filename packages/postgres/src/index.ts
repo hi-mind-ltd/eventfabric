@@ -2,6 +2,18 @@ export type { PgTx } from "./unitofwork/pg-transaction";
 export { PgUnitOfWork } from "./unitofwork/pg-unit-of-work";
 
 export { PgEventStore, ConcurrencyError, RowShapeError } from "./pg-event-store";
+export type { PgEventStoreOptions } from "./pg-event-store";
+// Re-exported from core for convenience (the tamper-evidence contract + result
+// type live in @eventfabric/core; PgEventStore implements TamperEvidentEventStore).
+export type { ChainVerificationResult, TamperEvidentEventStore } from "@eventfabric/core";
+export { PgChainAnchorSealer, PgChainAnchorRunner } from "./chain-anchor-sealer";
+export type {
+  PgChainAnchorSealerOptions,
+  SealResult,
+  AnchorVerificationResult,
+  AnchorFailureKind,
+  ChainAnchorRunnerOptions,
+} from "./chain-anchor-sealer";
 export { PgSnapshotStore } from "./snapshots/pg-snapshot-store";
 
 export { PgProjectionCheckpointStore } from "./projections/pg-projection-checkpoint-store";

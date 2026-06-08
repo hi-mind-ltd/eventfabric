@@ -19,6 +19,9 @@ const CORE_MIGRATIONS = [
   "006_performance",
   "008_tenant_id",
   "009_per_tenant_projection_checkpoints",
+  // 010-014 are owned by extension packages (@eventfabric/mediator-postgres,
+  // @eventfabric/sagas-postgres); the next free core name is 015.
+  "015_event_hash_chain",
 ];
 
 const PARTITIONING_MIGRATION = "007_partitioning";

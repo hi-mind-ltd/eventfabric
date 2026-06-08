@@ -35,6 +35,11 @@ export * from './projections/catch-up-observer';
 // Query builder interface (database-agnostic — adapters implement for their target)
 export * from './query/query-builder';
 
+// Tamper-evidence: backend-agnostic hash-chain primitives + the verification
+// contract an event-store adapter implements (Postgres adapter in @eventfabric/postgres).
+export * from './integrity/hash-chain';
+export * from './integrity/tamper-evident-store';
+
 // Resilience utilities
 export * from './resilience/backoff';
 export * from './resilience/with-concurrency-retry';

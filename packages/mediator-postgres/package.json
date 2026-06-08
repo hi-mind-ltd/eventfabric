@@ -41,14 +41,10 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@eventfabric/mediator": "workspace:*",
-    "@eventfabric/postgres": "workspace:*",
     "pg": "^8.13.1"
   },
   "devDependencies": {
-    "@eventfabric/mediator": "workspace:*",
     "@eventfabric/core": "workspace:*",
-    "@eventfabric/postgres": "workspace:*",
     "@testcontainers/postgresql": "^10.14.0",
     "@types/node": "^20.19.27",
     "@types/pg": "^8.11.10",
@@ -61,5 +57,9 @@
     "build": "tsup",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@eventfabric/mediator": "workspace:*",
+    "@eventfabric/postgres": "workspace:*"
   }
 }

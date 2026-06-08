@@ -39,11 +39,9 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@eventfabric/mediator": "workspace:*",
     "@opentelemetry/api": "^1.9.0"
   },
   "devDependencies": {
-    "@eventfabric/mediator": "workspace:*",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/context-async-hooks": "^1.26.0",
     "@opentelemetry/sdk-metrics": "^1.26.0",
@@ -56,5 +54,8 @@
     "build": "tsup",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@eventfabric/mediator": "workspace:*"
   }
 }

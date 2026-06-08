@@ -84,6 +84,9 @@ export class PgPartitionManager {
           dismissed_by TEXT NULL,
           correlation_id TEXT NULL,
           causation_id TEXT NULL,
+          -- Added by migration 015 (tamper-evident chaining). Must match the
+          -- existing table's columns or ATTACH PARTITION rejects the rename.
+          event_hash BYTEA NULL,
           PRIMARY KEY (global_position)
         ) PARTITION BY RANGE (global_position)
       `);

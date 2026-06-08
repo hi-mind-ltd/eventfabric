@@ -54,11 +54,9 @@
   "publishConfig": {
     "access": "public"
   },
-  "peerDependencies": {
-    "@eventfabric/core": "workspace:*"
-  },
   "dependencies": {
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "@eventfabric/core": "workspace:*"
   },
   "devDependencies": {
     "@testcontainers/postgresql": "^10.14.0",

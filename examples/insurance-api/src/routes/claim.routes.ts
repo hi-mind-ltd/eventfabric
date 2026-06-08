@@ -1,5 +1,7 @@
 import type { FastifyInstance } from "fastify";
-import type { SessionFactory } from "@eventfabric/postgres";
+import type { Pool } from "pg";
+import { PgUnitOfWork } from "@eventfabric/postgres";
+import type { PgEventStore, SessionFactory } from "@eventfabric/postgres";
 import type { InsuranceEvent } from "../domain/events";
 import { ClaimAggregate } from "../domain/claim.aggregate";
 import { PolicyAggregate } from "../domain/policy.aggregate";
@@ -7,9 +9,11 @@ import { ClaimSubmitted } from "../domain/claim.events";
 
 type Deps = {
   sessionFactory: SessionFactory<InsuranceEvent>;
+  store: PgEventStore<InsuranceEvent>;
+  pool: Pool;
 };
 
-export async function registerClaimRoutes(app: FastifyInstance, { sessionFactory }: Deps): Promise<void> {
+export async function registerClaimRoutes(app: FastifyInstance, { sessionFactory, store, pool }: Deps): Promise<void> {
   app.post<{
     Params: { id: string };
     Body: {
@@ -136,6 +140,22 @@ export async function registerClaimRoutes(app: FastifyInstance, { sessionFactory
         });
       } catch (err) {
         return reply.code(404).send({ error: (err as Error).message });
+      }
+    }
+  );
+
+  // Tamper-evidence: verify this claim's hash chain (tenant-scoped).
+  // 200 = intact; 409 = a break was detected (firstBrokenAt / reason).
+  app.get<{ Params: { id: string } }>(
+    "/claims/:id/verify",
+    async (req, reply) => {
+      try {
+        const result = await new PgUnitOfWork(pool, req.tenantId).withTransaction((tx) =>
+          store.verifyStream(tx, { aggregateName: ClaimAggregate.aggregateName, aggregateId: req.params.id })
+        );
+        return reply.code(result.ok ? 200 : 409).send(result);
+      } catch (err) {
+        return reply.code(500).send({ error: (err as Error).message });
       }
     }
   );

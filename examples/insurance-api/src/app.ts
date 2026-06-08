@@ -10,6 +10,7 @@ import { buildInsuranceApp, runMigrations } from "./build-app";
  * Optional env:
  *   PORT                 – default 3002
  *   ALLOWED_TENANTS      – comma-separated list (e.g. "acme,contoso"). Omit to accept any tenant.
+ *   EF_CHAIN_SECRET      – HMAC secret for the tamper-evident claim ledger (dev fallback if unset).
  */
 async function start() {
   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -23,6 +24,7 @@ async function start() {
   const { app, startWorkers } = buildInsuranceApp({
     pool,
     allowedTenants,
+    chainSecret: process.env.EF_CHAIN_SECRET,
     logger: true
   });
 

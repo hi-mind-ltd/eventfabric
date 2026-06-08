@@ -18,6 +18,9 @@ export type ClaimState = {
 
 export class ClaimAggregate extends AggregateRoot<ClaimState, ClaimEvent> {
   static readonly aggregateName = "Claim" as const;
+  // Claims are fraud/audit-sensitive — make the claim ledger tamper-evident.
+  // The store registering this aggregate MUST be configured with a hashChain secret.
+  static readonly tamperEvident = true;
 
   protected handlers = {
     ClaimSubmitted: (s, e) => {

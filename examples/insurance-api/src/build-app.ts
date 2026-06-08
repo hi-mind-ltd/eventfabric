@@ -4,6 +4,9 @@ import { trace, metrics, type Tracer, type Meter } from "@opentelemetry/api";
 import {
   PgEventStore,
   PgSnapshotStore,
+  PgUnitOfWork,
+  PgChainAnchorSealer,
+  PgChainAnchorRunner,
   SessionFactory,
   ConjoinedTenantResolver,
   createAsyncProjectionRunner,
@@ -40,12 +43,17 @@ export type InsuranceAppOptions = {
   meter?: Meter;
   /** Fastify logger setting. Defaults to false (quiet, good for tests). */
   logger?: boolean;
+  /** HMAC secret for the tamper-evident claim ledger. Keep it out of source
+   *  (env/KMS); a dev fallback is used if unset. */
+  chainSecret?: string;
 };
 
 export type InsuranceApp = {
   app: FastifyInstance;
   sessionFactory: SessionFactory<InsuranceEvent>;
   store: PgEventStore<InsuranceEvent>;
+  /** Tamper-evidence anchor sealer (per-tenant), exposed for ops + tests. */
+  anchorSealer: PgChainAnchorSealer;
   tenantResolver: TenantResolver;
   /**
    * Start background projection workers (notifications outbox runner +
@@ -74,7 +82,14 @@ export function buildInsuranceApp(opts: InsuranceAppOptions): InsuranceApp {
   // `tx.tenantId`, and `createSession(tenantId)` threads the header-derived
   // tenant through to that level.
   const tenantResolver = new ConjoinedTenantResolver(pool);
-  const store = new PgEventStore<InsuranceEvent>({ upcaster: policyEventUpcaster });
+  // Tamper-evidence: ClaimAggregate declares `static tamperEvident = true`, so the
+  // store it's registered against must carry the HMAC secret.
+  const chainSecret = opts.chainSecret ?? "dev-insecure-secret-change-me";
+  const store = new PgEventStore<InsuranceEvent>({
+    upcaster: policyEventUpcaster,
+    hashChain: { secret: chainSecret }
+  });
+  const anchorSealer = new PgChainAnchorSealer({ secret: chainSecret });
 
   const sessionFactory = new SessionFactory<InsuranceEvent>(tenantResolver, store);
 
@@ -128,7 +143,18 @@ export function buildInsuranceApp(opts: InsuranceAppOptions): InsuranceApp {
   app.register(async (scope) => {
     await registerPolicyholderRoutes(scope, { sessionFactory });
     await registerPolicyRoutes(scope, { sessionFactory, pool });
-    await registerClaimRoutes(scope, { sessionFactory });
+    await registerClaimRoutes(scope, { sessionFactory, store, pool });
+
+    // Tamper-evidence anchor ops (per-tenant): force a seal, or verify the
+    // anchor chain (catches whole-stream deletion / rollback of claims).
+    scope.post("/ops/chain/seal", async (req, reply) => {
+      const result = await new PgUnitOfWork(pool, req.tenantId).withTransaction((tx) => anchorSealer.seal(tx));
+      return reply.send(result);
+    });
+    scope.get("/ops/chain/verify", async (req, reply) => {
+      const result = await new PgUnitOfWork(pool, req.tenantId).withTransaction((tx) => anchorSealer.verifyAnchors(tx));
+      return reply.code(result.ok ? 200 : 409).send(result);
+    });
   });
 
   // ---- Background workers --------------------------------------------------
@@ -185,13 +211,23 @@ export function buildInsuranceApp(opts: InsuranceAppOptions): InsuranceApp {
       }
     })();
 
+    // Tamper-evidence anchor sealer: snapshots chained claim heads per tenant
+    // into the anchor chain, off the write path. Discovers tenants itself.
+    const anchorRunner = new PgChainAnchorRunner(pool, anchorSealer, {
+      intervalMs: 30_000,
+      onError: (err, tenantId) => console.error("Anchor sealer error:", tenantId ?? "", err)
+    });
+    const anchorDone = anchorRunner.start(controller.signal).catch((err) => {
+      if (err?.name !== "AbortError") console.error("Anchor runner error:", err);
+    });
+
     return {
       controller,
-      done: Promise.all([runnerDone, catchUpDone]).then(() => undefined)
+      done: Promise.all([runnerDone, catchUpDone, anchorDone]).then(() => undefined)
     };
   }
 
-  return { app, sessionFactory, store, tenantResolver, startWorkers };
+  return { app, sessionFactory, store, anchorSealer, tenantResolver, startWorkers };
 }
 
 /**
