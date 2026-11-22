@@ -1,5 +1,11 @@
 # @eventfabric/mediator-opentelemetry
 
+## 0.4.0
+
+### Patch Changes
+
+- @eventfabric/mediator@0.4.0
+
 ## 0.3.0
 
 ### Patch Changes

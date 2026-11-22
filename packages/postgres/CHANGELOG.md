@@ -1,5 +1,64 @@
 # @eventfabric/postgres
 
+## 0.4.0
+
+### Minor Changes
+
+- 015b888: fix(async-runner): stop skipping outbox rows that sit at or below a projection checkpoint
+
+  The async runner used to skip any event at or below the projection's checkpoint and then ack (delete) its outbox row. Global positions are allocated when an event is inserted, not when its transaction commits, so the skip silently dropped:
+
+  - events whose transaction committed after a higher position was processed,
+  - rows requeued from the DLQ, and
+  - rows handled out of order by concurrent runner replicas.
+
+  The outbox row is now the only record of delivery, and it is deleted in the same transaction as the handlers that processed it. The runner no longer reads or writes `projection_checkpoints`. The `checkpoints` constructor argument of `AsyncProjectionRunner` is deprecated and ignored, and `createAsyncProjectionRunner` no longer passes one. Handlers must be idempotent: delivery is at least once.
+
+- 015b888: feat(catch-up): safe to run the same projection on several instances at once
+
+  `ProjectionCheckpointStore` has a new optional method, `claim(tx, projection, tenant)`. It locks the checkpoint for the rest of the transaction and returns `null` without waiting when another transaction holds it. The catch-up projector claims the checkpoint before reading each batch. Any number of instances (processes, nodes) can now run the same projection: each batch is processed by exactly one of them, and a busy (projection, tenant) pair is skipped until the next round. `PgProjectionCheckpointStore` implements it with `SELECT … FOR UPDATE SKIP LOCKED`. Custom checkpoint stores without `claim` keep the previous behaviour, where concurrent instances may process the same events twice.
+
+- 015b888: fix(catch-up): never skip events that commit after a higher position (high water mark)
+
+  Global positions are allocated at INSERT, not at COMMIT. The catch-up projector read `global_position > checkpoint` with no upper bound, so an event still in flight below a committed higher position was skipped for good once the checkpoint moved past it.
+
+  Reads are now bounded by a **high water mark**: the highest position at or below which every event is final.
+
+  - `@eventfabric/core`: new `HighWaterMark` interface. `CatchUpProjector` takes an optional fourth constructor argument. When it is set, tenant discovery and every batch read stop at the mark. New `CatchUpOptions.highWaterMarkWaitMs` (default 2000) is how long a call waits for in-flight transactions to settle. `EventStore.loadGlobal` and `discoverActiveTenants` accept an optional `toGlobalPositionInclusive`. Custom event stores must honour it to get the guarantee.
+  - `@eventfabric/postgres`: new `PgHighWaterMark`, based on transaction snapshots (`pg_current_snapshot`, so PostgreSQL 13+). A sampled position becomes safe once every transaction that was in flight at the time of the sample has finished. Gaps from rolled-back transactions are passed over naturally. `createCatchUpProjector` always wires one in. It accepts `{ highWaterMark: { skipLiveTransactionsAfterMs } }` as an escape hatch for long-running write transactions, which otherwise hold the mark back, the same as Marten's default. The deprecated `PgCatchUpProjector` takes an optional `pool` argument to enable it.
+
+- 015b888: fix(outbox): stop claimed outbox rows from staying locked forever
+
+  - `AsyncRunnerOptions.leaseMs` (default 5 minutes): a claimed row whose lock is older than the lease is treated as abandoned and can be claimed again, so rows held by a worker that crashed after claiming are recovered.
+  - `perRow` mode releases the claimed rows it never reached, whether the loop ended because of a handler failure or because the runner was stopped. These rows do not count towards `maxAttempts`.
+  - `batch` mode dead-letters rows whose event cannot be loaded, as `perRow` mode already did, instead of leaving them locked.
+
+  **Breaking for custom `OutboxStore` implementations:** the interface has a new required method, `release(tx, ids)`, which unlocks rows and undoes the `attempts` increment from the claim. `claimBatch` also accepts an optional `leaseMs`. `PgOutboxStore` implements both.
+
+- 015b888: feat: ProjectionDaemon, a Marten-style async daemon for projections
+
+  `ProjectionDaemon` (core) and `createProjectionDaemon(pool, eventStore, projections, opts)` (postgres) run projections continuously against the event log:
+
+  - **Checkpoints per (projection, tenant).** A projection added later back-fills from the start of the log, and `rebuild(name)` replays one from scratch. It calls the new optional `CatchUpProjection.reset(tx)` per tenant to clear the read model, resets the checkpoint (new optional `ProjectionCheckpointStore.reset`) and drops that projection's dead letters.
+  - **High water mark.** Reads never pass an event whose transaction is still in flight, so late commits are not skipped.
+  - **Several instances.** Each batch claims its checkpoint, so any number of instances can run the same projections and each event is handled once. Instances running different projections each see every event.
+  - **Failures.** A failing event is retried with backoff. Events before it in the batch are committed first, so one bad event only holds back what comes after it. After `maxAttempts` (default 10) the event goes to the new `eventfabric.projection_dead_letters` table (migration `016_projection_dead_letters`) and the checkpoint moves past it. `replayDeadLetter(id)` and `listDeadLetters()` manage dead letters. The observer gains `onEventDeadLettered`.
+
+  New exports: `ProjectionDaemon`, `ProjectionDaemonOptions`, `ProjectionDeadLetterStore`, `ProjectionDeadLetter` (core); `createProjectionDaemon`, `PgProjectionDeadLetterStore` (postgres).
+
+  Use the daemon for projections. Keep the outbox `AsyncProjectionRunner` for external delivery: each outbox row goes to whichever runner claims it, so runners with different handlers must split the outbox with `claimTopic`.
+
+### Patch Changes
+
+- Updated dependencies [015b888]
+- Updated dependencies [015b888]
+- Updated dependencies [015b888]
+- Updated dependencies [015b888]
+- Updated dependencies [015b888]
+- Updated dependencies [015b888]
+- Updated dependencies [015b888]
+  - @eventfabric/core@0.4.0
+
 ## 0.3.0
 
 ### Minor Changes
