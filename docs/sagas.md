@@ -298,6 +298,34 @@ when events arrive in position order, which the daemon guarantees.
 Dead-letter replays bypass it (`ProjectionHandleContext.replay`), and
 `lastEventPos` never moves backwards.
 
+#### Moving an existing saga from the outbox runner
+
+A projection the daemon has never seen starts at checkpoint 0 and reads
+the whole log. Existing instances skip what they have already applied,
+but an old flow whose instance row has since been deleted would be
+started again. Seed the checkpoint before the first daemon start, with
+the outbox runner stopped:
+
+```sql
+-- One checkpoint per tenant: just before the oldest event still waiting
+-- in the outbox (or the newest event, if the outbox is empty). Overlap
+-- with what the old runner already delivered is skipped by lastEventPos.
+INSERT INTO eventfabric.projection_checkpoints (projection_name, tenant_id, last_global_position)
+SELECT 'saga:FundsTransfer', e.tenant_id,
+       COALESCE((SELECT MIN(o.global_position) - 1
+                   FROM eventfabric.outbox o
+                  WHERE o.tenant_id = e.tenant_id),
+                MAX(e.global_position))
+FROM eventfabric.events e
+GROUP BY e.tenant_id
+ON CONFLICT (projection_name, tenant_id)
+DO UPDATE SET last_global_position = EXCLUDED.last_global_position;
+```
+
+Saga rows already in `outbox_dead_letters` are not picked up by the
+daemon. Requeue them before switching (and let the old runner drain
+them), or handle them by hand.
+
 ### `sagaAsAsyncProjection` (outbox runner) — limitations
 
 `sagaAsAsyncProjection(saga, stores)` runs a saga on the outbox

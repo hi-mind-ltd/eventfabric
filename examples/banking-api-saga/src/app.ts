@@ -7,13 +7,13 @@ import {
   PgOutboxStatsService,
   PgUnitOfWork,
   createAsyncProjectionRunner,
-  createCatchUpProjector,
+  createProjectionDaemon,
   SessionFactory,
   query,
   migrate
 } from "@eventfabric/postgres";
 import type { PgTx } from "@eventfabric/postgres";
-import { sleep, withConcurrencyRetry } from "@eventfabric/core";
+import { withConcurrencyRetry } from "@eventfabric/core";
 import { CommandBus, createLoggingMiddleware } from "@eventfabric/mediator";
 import { PgIdempotencyStore, commandsMigrations } from "@eventfabric/mediator-postgres";
 import {
@@ -23,7 +23,7 @@ import {
 import {
   SagaCommandDispatcher,
   SagaTimerScheduler,
-  sagaAsAsyncProjection,
+  sagaAsProjection,
   type Saga,
   type SagaTimerHandler,
 } from "@eventfabric/sagas";
@@ -50,6 +50,7 @@ import { depositAuditProjection } from "./projections/deposit-audit";
 import { fundsTransferSaga, type TransferState } from "./sagas/funds-transfer.saga";
 import { registerFundsTransferHandlers } from "./sagas/funds-transfer.handlers";
 import { createDlqRouter } from "./ops/dlq-router";
+import { createProjectionDlqRouter } from "./ops/projection-dlq-router";
 import { createOutboxOpsRouter } from "./ops/outbox-ops-router";
 import { createPartitionOpsRouter } from "./ops/partition-ops-router";
 
@@ -203,42 +204,53 @@ createSagaQueueGauges({
 
 // ===== Projection wiring =====
 //
-// Two async tiers, each picked for what it actually needs:
+// Two background tiers, each picked for what it actually needs:
 //
-//   1. Outbox-based async runner for:
-//      - email notifications (external delivery — at-least-once + DLQ
-//        is what outbox exists for),
-//      - the FundsTransfer saga, wrapped via sagaAsAsyncProjection so it
-//        joins the same runner without new infrastructure.
+//   1. Projection daemon (event log + checkpoint per projection/tenant +
+//      high water mark) for:
+//      - the FundsTransfer saga, via sagaAsProjection. The daemon delivers
+//        events in global_position order and never past an in-flight
+//        transaction, which the saga's lastEventPos duplicate check relies
+//        on. (On the outbox runner, a saga event committing after a later
+//        one for the same transfer could be dropped.)
+//      - deposit-audit (single-event-type read model).
+//      Failing events are retried, then dead-lettered (see
+//      /ops/projections/dead-letters). Safe to run on several replicas.
 //
-//   2. Catch-up projector for deposit-audit only (single-event-type
-//      read-model derivation — no external side effects, so catch-up is
-//      cheaper than outbox).
+//   2. Outbox runner for email notifications only: per-message external
+//      delivery with topic routing.
 
-const sagaProjection = sagaAsAsyncProjection(fundsTransferSaga, sagaStores, {
-  observer: sagaObserver,
-});
+const projectionDaemon = createProjectionDaemon(
+  pool,
+  store,
+  [
+    sagaAsProjection(fundsTransferSaga, sagaStores, { observer: sagaObserver }),
+    depositAuditProjection,
+  ],
+  {
+    batchSize: 100,
+    idleSleepMs: 500,
+    maxAttempts: 5,
+    backoff: { minMs: 100, maxMs: 5000, factor: 2, jitter: 0.1 },
+    observer: catchUpObserver,
+  }
+);
 
-// Outbox runner: email + saga react both flow through here.
+// Outbox runner: email only.
 const asyncRunner = createAsyncProjectionRunner(
   pool,
   store,
-  [emailNotificationProjection, sagaProjection],
+  [emailNotificationProjection],
   {
     workerId: "async-worker-1",
     batchSize: 10,
     idleSleepMs: 1000,
     maxAttempts: 5,
-    transactionMode: "batch",
+    transactionMode: "perRow", // email is an external side effect
     backoff: { minMs: 100, maxMs: 5000, factor: 2, jitter: 0.1 },
     observer: asyncObserver,
   }
 );
-
-// Catch-up projector: deposit-audit only. The transfer chain is now
-// driven by the saga + command pipeline above.
-const catchUpProjections = [depositAuditProjection];
-const catchUpProjector = createCatchUpProjector<BankingEvent>(pool, store);
 
 // Saga workers — long-lived loops that drain the command queue and fire
 // due timers. Both are safe to run with multiple replicas (FOR UPDATE
@@ -259,39 +271,25 @@ const sagaScheduler = new SagaTimerScheduler(uow, sagaTimerStore, sagaTimerHandl
   observer: sagaObserver,
 });
 
-// Start async projection runners
+// Background workers are started from start() below, after migrations:
+// on a fresh database their first query would otherwise fail and the saga
+// dispatcher / timer scheduler loops would exit.
 const abortController = new AbortController();
-asyncRunner.start(abortController.signal).catch((err) => {
-  console.error("Async projection runner error:", err);
-});
-
-// Saga dispatcher + timer scheduler — these own their own loops.
-sagaDispatcher.start().catch((err) => {
-  console.error("SagaCommandDispatcher error:", err);
-});
-sagaScheduler.start().catch((err) => {
-  console.error("SagaTimerScheduler error:", err);
-});
-
-// Catch-up polling loop. catchUpAll runs all registered projections
-// sequentially; each tracks its own checkpoint. Sleep idleMs between
-// rounds when nothing's left to process.
-(async () => {
-  const idleMs = 500;
-  while (!abortController.signal.aborted) {
-    try {
-      await catchUpProjector.catchUpAll(catchUpProjections, { batchSize: 100, observer: catchUpObserver });
-    } catch (err) {
-      console.error("Catch-up projector error:", err);
-    }
-    try {
-      await sleep(idleMs, abortController.signal);
-    } catch {
-      // AbortError on shutdown — fall through and exit the loop
-      break;
-    }
-  }
-})();
+function startBackgroundWorkers(): void {
+  asyncRunner.start(abortController.signal).catch((err) => {
+    console.error("Async projection runner error:", err);
+  });
+  projectionDaemon.start(abortController.signal).catch((err) => {
+    console.error("Projection daemon error:", err);
+  });
+  // Saga dispatcher + timer scheduler — these own their own loops.
+  sagaDispatcher.start().catch((err) => {
+    console.error("SagaCommandDispatcher error:", err);
+  });
+  sagaScheduler.start().catch((err) => {
+    console.error("SagaTimerScheduler error:", err);
+  });
+}
 
 // Graceful shutdown
 process.on("SIGINT", async () => {
@@ -618,6 +616,7 @@ app.get("/accounts/with-customers", async (req, res) => {
 
 // ========== Operations Endpoints ==========
 app.use("/ops/dlq", createDlqRouter(dlq));
+app.use("/ops/projections", createProjectionDlqRouter(projectionDaemon));
 app.use("/ops/outbox", createOutboxOpsRouter(outboxStats));
 app.use("/ops/partitions", createPartitionOpsRouter(pool));
 
@@ -634,6 +633,8 @@ async function start() {
   if (result.partitioned) {
     console.log("Events table is partitioned");
   }
+
+  startBackgroundWorkers();
 
   app.listen(PORT, () => {
     console.log(`Banking API (saga variant) listening on :${PORT}`);
