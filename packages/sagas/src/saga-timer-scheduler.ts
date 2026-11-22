@@ -287,6 +287,9 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
 
       const durationMs = Date.now() - startedAt;
       if (result === "stale") {
+        safeEmit(() =>
+          this.observer?.onTimerSkipped?.({ ...baseInfo, durationMs, reason: "not-claimed" })
+        );
         skipped++;
       } else if (result === "concurrent") {
         safeEmit(() =>

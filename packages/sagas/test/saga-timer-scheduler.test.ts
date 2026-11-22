@@ -245,6 +245,47 @@ describe("SagaTimerScheduler", () => {
     expect(orphaned).toEqual(["ghost"]);
   });
 
+  it("skips and reports (onTimerSkipped) a timer cancelled after it was claimed", async () => {
+    const { stateStore, timerStore, handlers } = buildHandlers();
+    await seedInstance(stateStore, "i-1");
+    await timerStore.schedule(tx, {
+      tenantId: "default",
+      sagaName: "Counter",
+      instanceId: "i-1",
+      id: "timeout",
+      fireAt: new Date(Date.now() - 1000),
+      message: { type: "$timer", id: "timeout", payload: null },
+    });
+
+    // The claim tx commits; then an event handler cancels the timer before delivery.
+    let opened = 0;
+    const uow: UnitOfWork<Transaction> = {
+      async withTransaction<T>(fn: (t: Transaction) => Promise<T>): Promise<T> {
+        const r = await fn(tx);
+        if (opened++ === 0) {
+          await timerStore.cancel(tx, { tenantId: "default", sagaName: "Counter", instanceId: "i-1", ids: ["timeout"] });
+        }
+        return r;
+      },
+    };
+    const skipped: Array<{ timerId: string; reason: string }> = [];
+    const fired: string[] = [];
+    const scheduler = new SagaTimerScheduler(uow, timerStore, handlers, {
+      observer: {
+        onTimerSkipped: (info) => skipped.push({ timerId: info.timerId, reason: info.reason }),
+        onTimerFired: (info) => fired.push(info.timerId),
+      },
+    });
+
+    const round = await scheduler.runOnce();
+
+    expect(round).toMatchObject({ claimed: 1, fired: 0, skipped: 1 });
+    expect(skipped).toEqual([{ timerId: "timeout", reason: "not-claimed" }]);
+    expect(fired).toEqual([]);
+    const inst = await stateStore.load(tx, { sagaName: "Counter", instanceId: "i-1", tenantId: "default" });
+    expect(inst!.state.fired).toBe(0);
+  });
+
   it("narrows the UoW per item via forTenant before running the saga reaction", async () => {
     // A tenant-aware UoW that records which tenant each opened tx ran for.
     // Mirrors the PgUnitOfWork.forTenant pattern.

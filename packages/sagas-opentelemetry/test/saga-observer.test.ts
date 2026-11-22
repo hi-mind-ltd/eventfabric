@@ -239,6 +239,14 @@ describe("createSagaObserver — metrics", () => {
       tenantId: "t",
       timerId: "ghost",
     });
+    observer.onTimerSkipped!({
+      sagaName: "S",
+      instanceId: "i",
+      tenantId: "t",
+      timerId: "cancelled",
+      durationMs: 1,
+      reason: "not-claimed",
+    });
 
     const metrics = await collectMetrics();
     const fire = metrics.find(
@@ -247,7 +255,7 @@ describe("createSagaObserver — metrics", () => {
     const results = fire.dataPoints.map(
       (dp) => dp.attributes["eventfabric.result"] as string
     );
-    expect(results.sort()).toEqual(["fired", "orphaned", "released"]);
+    expect(results.sort()).toEqual(["fired", "orphaned", "released", "skipped"]);
   });
 });
 

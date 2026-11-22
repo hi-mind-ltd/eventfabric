@@ -149,6 +149,16 @@ export function createSagaObserver(opts: SagaOtelOptions): SagaObserver {
       timerFireDurationHistogram?.record(info.durationMs, attrs);
     },
 
+    onTimerSkipped(info) {
+      const attrs = {
+        ...timerAttrs(info),
+        "eventfabric.result": "skipped",
+        "eventfabric.reason": info.reason,
+      };
+      timerFireCounter?.add(1, attrs);
+      timerFireDurationHistogram?.record(info.durationMs, attrs);
+    },
+
     onTimerOrphaned(info) {
       timerFireCounter?.add(1, {
         ...timerAttrs(info),
