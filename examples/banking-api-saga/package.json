@@ -28,8 +28,9 @@
   },
   "scripts": {
     "start": "node --enable-source-maps dist/app.js",
-    "build": "tsc -p tsconfig.json",
-    "dev": "tsx watch src/app.ts",
+    "dev": "tsup src/app.ts --format esm --platform node --target node20 --sourcemap --out-dir dist --watch --onSuccess \"node --enable-source-maps dist/app.js\"",
+    "build": "tsup src/app.ts --format esm --platform node --target node20 --sourcemap --clean --out-dir dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests"
   }
 }

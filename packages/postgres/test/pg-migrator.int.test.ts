@@ -7,6 +7,7 @@ import { PgEventStore } from "../src/pg-event-store";
 import { PgSnapshotStore } from "../src/snapshots/pg-snapshot-store";
 import { PgProjectionCheckpointStore } from "../src/projections/pg-projection-checkpoint-store";
 import { PgPartitionManager } from "../src/partitioning/pg-partition-manager";
+import { endPool } from "./helpers/end-pool";
 
 type E = { type: "Tick"; version: 1; n: number };
 
@@ -20,7 +21,7 @@ describe("migrate() — fresh database", () => {
   }, 120000);
 
   afterAll(async () => {
-    if (pool) await pool.end();
+    if (pool) await endPool(pool);
     if (container) await container.stop();
   });
 
@@ -37,6 +38,7 @@ describe("migrate() — fresh database", () => {
       "008_tenant_id",
       "009_per_tenant_projection_checkpoints",
       "015_event_hash_chain",
+      "016_projection_dead_letters",
     ]);
     expect(result.partitioned).toBe(false);
   });
@@ -132,7 +134,7 @@ describe("migrate() — partitioning from scratch", () => {
   }, 120000);
 
   afterAll(async () => {
-    if (pool) await pool.end();
+    if (pool) await endPool(pool);
     if (container) await container.stop();
   });
 
@@ -151,6 +153,7 @@ describe("migrate() — partitioning from scratch", () => {
       "008_tenant_id",
       "009_per_tenant_projection_checkpoints",
       "015_event_hash_chain",
+      "016_projection_dead_letters",
       "007_partitioning",
     ]);
     expect(result.partitioned).toBe(true);
@@ -201,7 +204,7 @@ describe("migrate() — data integrity across all tables", () => {
   }, 120000);
 
   afterAll(async () => {
-    if (pool) await pool.end();
+    if (pool) await endPool(pool);
     if (container) await container.stop();
   });
 

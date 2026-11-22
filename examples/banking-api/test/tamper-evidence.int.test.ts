@@ -5,6 +5,7 @@ import { PgEventStore, SessionFactory, PgUnitOfWork, PgChainAnchorSealer, migrat
 import { AccountAggregate } from "../src/domain/account.aggregate";
 import type { BankingEvent } from "../src/domain/events";
 import { AccountOpened } from "../src/domain/account.events";
+import { endPool } from "./helpers/end-pool";
 
 const SECRET = "test-chain-secret";
 
@@ -32,7 +33,7 @@ beforeAll(async () => {
 }, 120000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

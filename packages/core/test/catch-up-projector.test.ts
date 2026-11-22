@@ -24,25 +24,27 @@ class MockUowFactory implements TenantScopedUnitOfWorkFactory<MockTx> {
 
 class MockEventStore implements EventStore<E, MockTx> {
   events: EventEnvelope<E>[] = [];
-  loadGlobalCalls: Array<{ fromGlobalPositionExclusive: bigint; limit: number; includeDismissed?: boolean; tenantId?: string }> = [];
+  loadGlobalCalls: Array<{ fromGlobalPositionExclusive: bigint; toGlobalPositionInclusive?: bigint; limit: number; includeDismissed?: boolean; tenantId?: string }> = [];
 
   async loadGlobal(
     tx: MockTx,
-    params: { fromGlobalPositionExclusive: bigint; limit: number; includeDismissed?: boolean; tenantId?: string }
+    params: { fromGlobalPositionExclusive: bigint; toGlobalPositionInclusive?: bigint; limit: number; includeDismissed?: boolean; tenantId?: string }
   ): Promise<EventEnvelope<E>[]> {
     this.loadGlobalCalls.push(params);
     return this.events
       .filter((e) => e.globalPosition > params.fromGlobalPositionExclusive)
+      .filter((e) => params.toGlobalPositionInclusive === undefined || e.globalPosition <= params.toGlobalPositionInclusive)
       .filter((e) => params.tenantId === undefined || e.tenantId === params.tenantId)
       .slice(0, params.limit);
   }
 
   async discoverActiveTenants(
     _tx: MockTx,
-    params: { fromGlobalPositionExclusive: bigint; limit?: number }
+    params: { fromGlobalPositionExclusive: bigint; toGlobalPositionInclusive?: bigint; limit?: number }
   ): Promise<string[]> {
     const tenants = new Set<string>();
     for (const e of this.events) {
+      if (params.toGlobalPositionInclusive !== undefined && e.globalPosition > params.toGlobalPositionInclusive) continue;
       if (e.globalPosition > params.fromGlobalPositionExclusive) tenants.add(e.tenantId);
     }
     return [...tenants].sort();
@@ -430,6 +432,127 @@ describe("CatchUpProjector", () => {
       expect(handled2).toHaveLength(1);
       expect(checkpoints.checkpoints.get("proj1" + "|default")?.lastGlobalPosition).toBe(1n);
       expect(checkpoints.checkpoints.get("proj2" + "|default")?.lastGlobalPosition).toBe(1n);
+    });
+  });
+  describe("high water mark", () => {
+    const ev = (pos: number, tenantId = "default"): EventEnvelope<E> => ({
+      globalPosition: BigInt(pos),
+      payload: { type: "TestEvent", version: 1, value: `event${pos}` },
+      tenantId,
+      aggregateName: "A",
+      aggregateId: String(pos),
+      aggregateVersion: 1,
+      occurredAt: new Date().toISOString(),
+      dismissed: false
+    });
+
+    class FakeHighWaterMark {
+      calls: Array<{ waitMs?: number }> = [];
+      constructor(public mark: bigint) {}
+      async safePosition(opts?: { waitMs?: number }) {
+        this.calls.push(opts ?? {});
+        return this.mark;
+      }
+    }
+
+    it("never reads or checkpoints past the high water mark", async () => {
+      const hwm = new FakeHighWaterMark(2n);
+      projector = new CatchUpProjector(uow, eventStore, checkpoints, hwm);
+      eventStore.events = [ev(1), ev(2), ev(3), ev(4)];
+      const handled: bigint[] = [];
+
+      await projector.catchUpProjection({ name: "p", async handle(_tx, env) { handled.push(env.globalPosition); } });
+
+      expect(handled).toEqual([1n, 2n]);
+      expect(checkpoints.checkpoints.get("p|default")?.lastGlobalPosition).toBe(2n);
+      expect(eventStore.loadGlobalCalls.every((c) => c.toGlobalPositionInclusive === 2n)).toBe(true);
+    });
+
+    it("picks up a late-committing event once the mark passes it", async () => {
+      // Position 1 is in flight (invisible); 2 has committed. The mark holds at 0.
+      const hwm = new FakeHighWaterMark(0n);
+      projector = new CatchUpProjector(uow, eventStore, checkpoints, hwm);
+      eventStore.events = [ev(2)];
+      const handled: bigint[] = [];
+      const p: CatchUpProjection<E, MockTx> = { name: "p", async handle(_tx, env) { handled.push(env.globalPosition); } };
+
+      await projector.catchUpProjection(p);
+      expect(handled).toEqual([]);
+
+      // Position 1 commits; nothing is in flight, so the mark moves to 2.
+      eventStore.events = [ev(1), ev(2)];
+      hwm.mark = 2n;
+      await projector.catchUpProjection(p);
+      expect(handled).toEqual([1n, 2n]);
+    });
+
+    it("passes highWaterMarkWaitMs through, defaulting to 2000", async () => {
+      const hwm = new FakeHighWaterMark(0n);
+      projector = new CatchUpProjector(uow, eventStore, checkpoints, hwm);
+      const p: CatchUpProjection<E, MockTx> = { name: "p", async handle() {} };
+
+      await projector.catchUpProjection(p);
+      await projector.catchUpProjection(p, { highWaterMarkWaitMs: 50 });
+      expect(hwm.calls.map((c) => c.waitMs)).toEqual([2000, 50]);
+    });
+
+    it("bounds tenant discovery by the mark", async () => {
+      const hwm = new FakeHighWaterMark(1n);
+      projector = new CatchUpProjector(uow, eventStore, checkpoints, hwm);
+      eventStore.events = [ev(1, "a"), ev(2, "b")];
+      const handled: string[] = [];
+
+      await projector.catchUpProjection({ name: "p", async handle(_tx, env) { handled.push(env.tenantId); } });
+
+      expect(handled).toEqual(["a"]);
+      expect(checkpoints.checkpoints.has("p|b")).toBe(false);
+    });
+  });
+  describe("checkpoint claims", () => {
+    const ev = (pos: number): EventEnvelope<E> => ({
+      globalPosition: BigInt(pos),
+      payload: { type: "TestEvent", version: 1, value: `event${pos}` },
+      tenantId: "default",
+      aggregateName: "A",
+      aggregateId: String(pos),
+      aggregateVersion: 1,
+      occurredAt: new Date().toISOString(),
+      dismissed: false
+    });
+
+    it("uses claim() when available and skips a tenant another instance holds", async () => {
+      eventStore.events = [ev(1)];
+      const claimStore = Object.assign(new MockCheckpointStore(), {
+        claims: 0,
+        async claim(): Promise<ProjectionCheckpoint | null> {
+          this.claims++;
+          return null; // busy
+        }
+      });
+      projector = new CatchUpProjector(uow, eventStore, claimStore);
+      const handled: bigint[] = [];
+
+      await projector.catchUpProjection({ name: "p", async handle(_tx, env) { handled.push(env.globalPosition); } });
+
+      expect(claimStore.claims).toBe(1);
+      expect(handled).toEqual([]);
+      expect(eventStore.loadGlobalCalls).toHaveLength(0);
+    });
+
+    it("processes from the claimed checkpoint", async () => {
+      eventStore.events = [ev(1), ev(2), ev(3)];
+      const claimStore = Object.assign(new MockCheckpointStore(), {
+        async claim(tx: MockTx, name: string, tenantId: string) {
+          return this.get(tx, name, tenantId);
+        }
+      });
+      await claimStore.set({ tenantId: "default" }, "p", "default", 1n);
+      projector = new CatchUpProjector(uow, eventStore, claimStore);
+      const handled: bigint[] = [];
+
+      await projector.catchUpProjection({ name: "p", async handle(_tx, env) { handled.push(env.globalPosition); } });
+
+      expect(handled).toEqual([2n, 3n]);
     });
   });
 });

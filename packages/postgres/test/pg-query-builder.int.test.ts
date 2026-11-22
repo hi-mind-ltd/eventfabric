@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
 import { query } from "../src/query/pg-query-builder";
+import { endPool } from "./helpers/end-pool";
 
 type AccountRow = {
   id: string;
@@ -59,7 +60,7 @@ beforeAll(async () => {
 }, 60000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

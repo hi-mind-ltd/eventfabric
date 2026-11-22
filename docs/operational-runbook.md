@@ -2,13 +2,21 @@
 
 ## What to monitor
 - Outbox backlog (`totalPending`, `oldestAgeSeconds`)
-- Projection checkpoint lag (tip - checkpoint)
+- Projection checkpoint lag (tip - checkpoint), per projection and tenant
+- Projection dead letters (`eventfabric.projection_dead_letters`): count and top errors
+- Long-running write transactions (`pg_stat_activity` where `backend_xid IS NOT NULL` and `xact_start` is old): they hold the projection high water mark back, so projections pause until they end
 - DLQ size and top errors
 - Command idempotency: count of `in_flight` rows older than 5 min (should be 0)
 - Saga pending commands: count of `claimed` rows older than 5 min (should be 0); count of `failed` rows (triage signal)
 - Saga timers: count of `claimed` rows older than 5 min (should be 0); count of `pending` rows with `fire_at < NOW() - INTERVAL '1 minute'` (overdue alert)
 
-## DLQ actions
+## Projection daemon actions
+- A projection is stuck: check for a long-running write transaction first (it holds the high water mark), then for dead letters and `onProjectorError` reports
+- Replay a dead letter after fixing its cause: `daemon.replayDeadLetter(id)` (runs out of order)
+- Rebuild a projection: `daemon.rebuild(name)` (calls `reset`, resets checkpoints, clears its dead letters, replays). Safe while other instances run
+- Scale out: run the daemon on more nodes; batches are claimed per (projection, tenant)
+
+## Outbox DLQ actions
 - Inspect dead letters
 - Requeue by DLQ id or global position
 - Purge if the event is permanently bad and your business can tolerate skipping

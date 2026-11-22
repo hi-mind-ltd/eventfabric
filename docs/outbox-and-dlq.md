@@ -54,7 +54,10 @@ WITH cte AS (
   SELECT id
   FROM eventfabric.outbox
   WHERE dead_lettered_at IS NULL
-    AND locked_at IS NULL
+    AND (
+      locked_at IS NULL
+      OR ($4::bigint IS NOT NULL AND locked_at < now() - $4::bigint * interval '1 millisecond')
+    )
     AND ($3::text IS NULL OR topic = $3)
   ORDER BY id ASC
   FOR UPDATE SKIP LOCKED
@@ -74,7 +77,8 @@ Key properties of this query:
 - **`FOR UPDATE SKIP LOCKED`**: Non-blocking concurrent access. If another worker already locked a row, this worker skips it instead of waiting. Multiple workers can poll simultaneously without deadlocks.
 - **Atomic lock + increment**: The `UPDATE` sets `locked_at`, `locked_by`, and increments `attempts` in one statement.
 - **Topic filter**: The optional `$3` parameter filters by topic, allowing workers to specialize.
-- **Ordered**: Rows are claimed in insertion order (`ORDER BY id ASC`).
+- **Lease**: `$4` is the runner's `leaseMs`. A row whose lock is older than the lease is treated as abandoned (its worker crashed or lost its connection after claiming) and can be claimed again. Choose a lease well above the worst-case time to process one batch; otherwise a slow-but-alive worker's rows can be reclaimed and processed twice.
+- **Insertion order, not commit order**: Rows are claimed by `id`. A row whose transaction commits late is claimed after rows inserted later. Nothing is skipped, because every row is delivered until it is acked, but delivery order across streams is not guaranteed.
 
 ### 3. Process + Ack/Release
 
@@ -102,11 +106,14 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
     batchSize: number;
     workerId: string;
     topic?: string | null;
+    leaseMs?: number;
   }): Promise<OutboxRow[]>;
 
   ack(tx: PgTx, id: OutboxRow["id"]): Promise<void>;
 
   releaseWithError(tx: PgTx, id: OutboxRow["id"], error: string): Promise<void>;
+
+  release(tx: PgTx, ids: OutboxRow["id"][]): Promise<void>;
 
   deadLetter(tx: PgTx, row: OutboxRow, reason: string): Promise<void>;
 }
@@ -114,9 +121,10 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
 
 | Method | Description |
 |--------|-------------|
-| `claimBatch` | Locks up to `batchSize` rows for this worker. Returns `OutboxRow[]` with `id`, `globalPosition`, `topic`, and `attempts`. |
+| `claimBatch` | Locks up to `batchSize` rows for this worker. Returns `OutboxRow[]` with `id`, `globalPosition`, `topic`, and `attempts`. With `leaseMs`, also reclaims rows whose lock is older than the lease; without it, locked rows are never reclaimed. |
 | `ack` | Deletes the row from the outbox. Called after successful processing. |
 | `releaseWithError` | Clears `locked_at` and `locked_by`, stores the error in `last_error`. The row becomes claimable again on the next poll. |
+| `release` | Unlocks claimed rows that were never attempted and undoes the claim's `attempts` increment. `last_error` is left as is. |
 | `deadLetter` | Copies the row to the DLQ table, then deletes it from the active outbox. |
 
 ### OutboxRow
@@ -136,8 +144,8 @@ PostgreSQL's `FOR UPDATE SKIP LOCKED` is the heart of the outbox pattern. It pro
 
 1. **Mutual exclusion**: Each row is locked by at most one worker at a time.
 2. **Non-blocking**: Workers never wait for each other. If a row is locked, it is skipped.
-3. **Fairness**: Rows are processed in order. A locked row is just temporarily invisible, not permanently skipped.
-4. **No coordination**: Workers don't need to know about each other. They all poll the same table.
+3. **Recovery**: A locked row is only temporarily invisible. A lock older than the runner's `leaseMs` is treated as abandoned (crashed worker) and the row is claimed again.
+4. **No coordination**: Workers don't need to know about each other. They all poll the same table. Each row is delivered to exactly one of them, so runners with different handlers must split the outbox with `claimTopic`.
 
 This is why EventFabric doesn't need an external message broker for the outbox pattern -- PostgreSQL provides all the coordination primitives natively.
 
@@ -343,6 +351,7 @@ The outbox tables are created as part of EventFabric's schema migration:
 ```sql
 CREATE TABLE eventfabric.outbox (
   id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',  -- origin tenant (for DLQ inspection)
   global_position BIGINT NOT NULL UNIQUE,
   topic TEXT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -356,6 +365,7 @@ CREATE TABLE eventfabric.outbox (
 
 CREATE TABLE eventfabric.outbox_dead_letters (
   id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
   outbox_id BIGINT,
   global_position BIGINT NOT NULL,
   topic TEXT NULL,
@@ -368,6 +378,7 @@ CREATE TABLE eventfabric.outbox_dead_letters (
 ## Related docs
 
 - [Async Projections](./projections/async-projections.md) -- the `AsyncProjectionRunner` that consumes the outbox
+- [Projection Daemon](./projections/projection-daemon.md) -- projections from the event log, with their own dead-letter table
 - [Catch-Up Projections](./projections/catch-up-projections.md) -- when to use catch-up instead of outbox
 - [Projections Overview](./projections/overview.md) -- the three projection tiers and decision matrix
 - [Observability](./observability.md) -- monitoring runner and DLQ activity with OpenTelemetry

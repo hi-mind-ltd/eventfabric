@@ -219,10 +219,13 @@ export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/postgres"
 
 # Build and run (migrations run automatically on startup)
 pnpm install
-pnpm build
+pnpm build            # builds the packages and bundles each example to dist/app.js
 cd examples/banking-api
-npx tsx src/app.ts
+pnpm start            # or `pnpm dev` to rebuild and restart on every change
 ```
+
+Every example has the same scripts: `build` (bundle with tsup), `start`,
+`dev` (watch mode), `typecheck` and `test`. Set `PORT` to change the port.
 
 Try it with curl:
 

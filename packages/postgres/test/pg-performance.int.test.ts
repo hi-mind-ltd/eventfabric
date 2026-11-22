@@ -5,6 +5,7 @@ import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore } from "../src/pg-event-store";
 import { PgOutboxStore } from "../src/outbox/pg-outbox-store";
 import { migrate } from "../src/pg-migrator";
+import { endPool } from "./helpers/end-pool";
 
 type E = { type: "Tick"; version: 1; n: number };
 
@@ -18,7 +19,7 @@ beforeAll(async () => {
 }, 60000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

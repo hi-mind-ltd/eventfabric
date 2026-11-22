@@ -32,9 +32,30 @@ export interface ProjectionCheckpointStore<TTx extends Transaction = Transaction
   get(tx: TTx, projectionName: string, tenantId: string): Promise<ProjectionCheckpoint>;
 
   /**
+   * Like `get`, but also takes an exclusive lock on the (projection, tenant)
+   * checkpoint for the rest of `tx`. Returns `null` without waiting when
+   * another transaction already holds it.
+   *
+   * The catch-up projector claims the checkpoint before reading a batch, so
+   * any number of projector instances (processes, nodes) can run the same
+   * projection at once: each batch is processed by exactly one of them, and
+   * the next instance only sees the checkpoint after that batch commits.
+   *
+   * Optional for backward compatibility. Without it, concurrent instances
+   * may read the same checkpoint and process the same events twice.
+   */
+  claim?(tx: TTx, projectionName: string, tenantId: string): Promise<ProjectionCheckpoint | null>;
+
+  /**
    * Update the checkpoint for a (projection, tenant) pair. Implementations
    * should use a monotonic write (only advance forward) so concurrent or
    * re-entrant runs cannot roll the checkpoint backward.
    */
   set(tx: TTx, projectionName: string, tenantId: string, lastGlobalPosition: bigint): Promise<void>;
+
+  /**
+   * Move the checkpoint back to 0 (unlike `set`, which only moves forward).
+   * Used by `ProjectionDaemon.rebuild`. Optional: rebuilds need it.
+   */
+  reset?(tx: TTx, projectionName: string, tenantId: string): Promise<void>;
 }

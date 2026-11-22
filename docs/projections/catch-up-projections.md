@@ -1,6 +1,8 @@
 # Catch-Up Projections
 
-Catch-up projections read events forward from the global event log, starting from their last saved checkpoint. They run **outside** the write transaction and are eventually consistent. Each projection tracks its own position in `eventfabric.projection_checkpoints`, so projections compose independently -- adding a new one doesn't affect existing ones.
+Catch-up projections read events forward from the global event log, starting from their last saved checkpoint. They run **outside** the write transaction and are eventually consistent. Each projection tracks its own position per tenant in `eventfabric.projection_checkpoints`, so projections compose independently -- adding a new one doesn't affect existing ones.
+
+> **Running in production?** Use the [Projection Daemon](./projection-daemon.md). It runs these same projections continuously, with retries, dead letters, rebuilds and multi-node safety. This page covers the underlying one-shot `CatchUpProjector`.
 
 For an overview of all projection tiers, see [Projections Overview](./overview.md).
 
@@ -12,6 +14,7 @@ For an overview of all projection tiers, see [Projections Overview](./overview.m
 export interface CatchUpProjection<E extends AnyEvent, TTx extends Transaction = Transaction> {
   name: string;
   handle(tx: TTx, env: EventEnvelope<E>): Promise<void>;
+  reset?(tx: TTx): Promise<void>; // used by ProjectionDaemon.rebuild
 }
 ```
 
@@ -19,6 +22,7 @@ export interface CatchUpProjection<E extends AnyEvent, TTx extends Transaction =
 |-------|------|-------------|
 | `name` | `string` | Unique identifier. Used as the key in `eventfabric.projection_checkpoints`. |
 | `handle` | `(tx, env) => Promise<void>` | Called once per event envelope. Must be **idempotent** (safe to retry). |
+| `reset` | `(tx) => Promise<void>` (optional) | Clears the read model for `tx.tenantId` before a [rebuild](./projection-daemon.md#rebuilding-a-projection). |
 
 The `name` is critical: it is the checkpoint key. If you rename a projection, it starts over from global position 0. If two projections share a name, they corrupt each other's checkpoint.
 
@@ -31,9 +35,10 @@ The `CatchUpProjector` is the core orchestration engine. It is database-agnostic
 
 export class CatchUpProjector<E extends AnyEvent, TTx extends Transaction = Transaction> {
   constructor(
-    private readonly uow: UnitOfWork<TTx>,
-    private readonly eventStore: EventStore<E, TTx>,
-    private readonly checkpoints: ProjectionCheckpointStore<TTx>
+    uowFactory: TenantScopedUnitOfWorkFactory<TTx>,
+    eventStore: EventStore<E, TTx>,
+    checkpoints: ProjectionCheckpointStore<TTx>,
+    highWaterMark?: HighWaterMark // the Postgres factory always supplies one
   ) {}
 
   async catchUpProjection(
@@ -50,7 +55,7 @@ export class CatchUpProjector<E extends AnyEvent, TTx extends Transaction = Tran
 
 ### `catchUpProjection(projection, options?)`
 
-Processes a single projection from its last checkpoint to the end of the event log. Loads events in batches, calls `projection.handle()` for each one (inside a transaction), then advances the checkpoint to the last processed position. Repeats until there are no more events.
+Processes a single projection, for every tenant with events, from its last checkpoint up to the [high water mark](#late-commits-and-the-high-water-mark). Loads events in batches, calls `projection.handle()` for each one (inside a transaction), then advances the checkpoint to the last processed position. Repeats until there are no more events up to the mark. A failing handler rolls back that tenant's batch. The failure is reported via `observer.onProjectorError`, and the next call retries from the same checkpoint.
 
 ### `catchUpAll(projections, options?)`
 
@@ -63,6 +68,7 @@ export type CatchUpOptions = {
   batchSize?: number;        // Events per batch. Default: 500.
   maxBatches?: number;       // Stop after this many batches. Default: unlimited.
   includeDismissed?: boolean; // Process dismissed events? Default: false.
+  highWaterMarkWaitMs?: number; // Wait for in-flight transactions. Default: 2000.
   observer?: CatchUpProjectorObserver; // Observability hooks. See observability docs.
 };
 ```
@@ -71,27 +77,42 @@ export type CatchUpOptions = {
 |--------|---------|-------------|
 | `batchSize` | 500 | Number of events loaded per iteration. Larger batches reduce round-trips but hold transactions longer. |
 | `maxBatches` | unlimited | Cap the number of batches per `catchUpProjection` call. Useful for testing or rate-limiting. |
-| `includeDismissed` | `false` | Whether to include events that have been dismissed (soft-deleted). |
+| `includeDismissed` | `false` | Whether to include events that have been dismissed (soft-deleted). The checkpoint moves past dismissed events either way. |
+| `highWaterMarkWaitMs` | 2000 | How long the call waits for transactions in flight right now to finish, so it can process everything committed before it started. Events still not safe are left for the next call. |
 | `observer` | `undefined` | Hooks for tracing and metrics. See [Observability](../observability.md). |
 
 ## Checkpoint tracking
 
-Checkpoints are stored in the `eventfabric.projection_checkpoints` table:
+Checkpoints are stored in `eventfabric.projection_checkpoints`, one row per (projection, tenant):
 
 ```sql
 CREATE TABLE eventfabric.projection_checkpoints (
-  projection_name TEXT PRIMARY KEY,
+  projection_name TEXT NOT NULL,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
   last_global_position BIGINT NOT NULL DEFAULT 0,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (projection_name, tenant_id)
 );
 ```
 
-The `PgProjectionCheckpointStore` implements the `ProjectionCheckpointStore` interface:
+`PgProjectionCheckpointStore` implements `ProjectionCheckpointStore`:
 
-- **`get(tx, projectionName)`**: Returns the checkpoint, creating one at position 0 if it doesn't exist (using `INSERT ... ON CONFLICT DO NOTHING`).
-- **`set(tx, projectionName, lastGlobalPosition)`**: Updates the checkpoint only if the new position is greater than or equal to the current one. This prevents accidental backwards movement.
+- **`get(tx, projection, tenant)`**: returns the checkpoint, creating it at 0 if missing.
+- **`claim(tx, projection, tenant)`**: like `get`, but locks the row for the rest of the transaction (`FOR UPDATE SKIP LOCKED`), or returns `null` without waiting if another transaction holds it. The projector claims before every batch; see [Running several instances](#running-several-instances).
+- **`set(tx, projection, tenant, position)`**: moves the checkpoint forward only.
+- **`reset(tx, projection, tenant)`**: moves it back to 0 (used by rebuilds).
 
-Both operations run inside the same transaction as the event processing, so the checkpoint and the projection's side effects are atomic.
+All of these run in the same transaction as the event processing, so the checkpoint and the projection's writes commit together.
+
+## Late commits and the high water mark
+
+`global_position` is allocated when an event is inserted, not when its transaction commits. Position 102 can become visible while 101 is still in flight. Reading "everything after the checkpoint" would move the checkpoint to 102 and skip 101 for good.
+
+So every read stops at the **high water mark**: the highest position at or below which every event is final. `PgHighWaterMark` works it out from PostgreSQL transaction snapshots: a sampled position becomes safe once every transaction that was in flight at the time has finished. It requires PostgreSQL 13+. A long-running write transaction anywhere in the database holds the mark back until it ends; see the [daemon docs](./projection-daemon.md#late-commits-and-the-high-water-mark) for the escape hatch.
+
+## Running several instances
+
+Running the same projection on several processes or nodes is safe. Each batch claims its (projection, tenant) checkpoint, so every batch is processed by exactly one instance. An instance that finds a checkpoint busy skips it until its next call.
 
 ## Creating a catch-up projector (PostgreSQL)
 
@@ -107,11 +128,11 @@ const store = new PgEventStore<BankingEvent>();
 const projector = createCatchUpProjector<BankingEvent>(pool, store);
 ```
 
-The factory wires up `PgUnitOfWork`, `PgEventStore`, and `PgProjectionCheckpointStore` for you.
+The factory wires up `PgUnitOfWork`, `PgProjectionCheckpointStore` and a `PgHighWaterMark` for you. Pass `{ highWaterMark: { skipLiveTransactionsAfterMs } }` as a third argument to tune the mark.
 
 ## Polling loop pattern
 
-Catch-up projections need a polling loop that repeatedly calls `catchUpAll` and sleeps when there's nothing to process. The standard pattern uses an async IIFE with the `sleep` utility:
+The [Projection Daemon](./projection-daemon.md) is the polling loop, with retries and dead letters built in. Prefer it. If you need your own loop, the pattern is to call `catchUpAll` and sleep when there's nothing to process:
 
 ```typescript
 import { createCatchUpProjector } from "@eventfabric/postgres";
@@ -251,7 +272,8 @@ Use the outbox/async tier when you need **external delivery** with at-least-once
 |-----------|----------|----------------|
 | Internal state transitions | Preferred | Possible but heavier |
 | External side effects (email, webhook) | Not recommended | Preferred |
-| Per-message retry & DLQ | Not built-in | Built-in |
+| Per-event retry & DLQ | Built into the [Projection Daemon](./projection-daemon.md) | Built-in |
+| Back-fill / rebuild | Yes | No |
 | Topic-based routing | Not built-in | Built-in |
 | Overhead per event | None (reads from events table) | One outbox row per event |
 | Process managers | Natural fit | Possible but catch-up is simpler |
@@ -259,6 +281,7 @@ Use the outbox/async tier when you need **external delivery** with at-least-once
 ## Related docs
 
 - [Projections Overview](./overview.md) -- the three projection tiers and decision matrix
+- [Projection Daemon](./projection-daemon.md) -- running catch-up projections continuously
 - [Inline Projections](./inline-projections.md) -- strong consistency inside the write transaction
 - [Async Projections](./async-projections.md) -- eventual consistency via outbox
 - [Single-Event Projections](./single-event-projections.md) -- narrowing to a single event type with `forEventType`

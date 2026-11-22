@@ -8,5 +8,6 @@ export * from "./in-memory-saga-command-queue";
 export * from "./in-memory-saga-timer-store";
 export * from "./saga-runner";
 export * from "./saga-as-async-projection";
+export * from "./saga-as-projection";
 export * from "./saga-command-dispatcher";
 export * from "./saga-timer-scheduler";

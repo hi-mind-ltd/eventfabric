@@ -63,4 +63,5 @@ app.post("/users/:id/change-email", async (req, res) => {
 app.use("/ops/dlq", createDlqRouter(dlq));
 app.use("/ops/outbox", createOutboxOpsRouter(outboxStats));
 
-app.listen(3000, () => console.log("Example API listening on :3000"));
+const PORT = Number(process.env.PORT ?? 3000);
+app.listen(PORT, () => console.log(`Example API listening on :${PORT}`));

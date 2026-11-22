@@ -31,6 +31,49 @@ export class PgProjectionCheckpointStore implements ProjectionCheckpointStore<Pg
     };
   }
 
+  async claim(tx: PgTx, projectionName: string, tenantId: string): Promise<ProjectionCheckpoint | null> {
+    // Lock an existing row, skipping it if another transaction holds it.
+    const sel = await tx.client.query(
+      `SELECT projection_name, tenant_id, last_global_position, updated_at
+       FROM ${this.tableName}
+       WHERE projection_name = $1 AND tenant_id = $2
+       FOR UPDATE SKIP LOCKED`,
+      [projectionName, tenantId]
+    );
+    if (sel.rowCount) return this.mapRow(sel.rows[0]);
+
+    // Either the row does not exist yet, or it is locked. Inserting it
+    // returns the new row (locked by this tx until commit); a conflict means
+    // it exists and someone else holds it.
+    const ins = await tx.client.query(
+      `INSERT INTO ${this.tableName} (projection_name, tenant_id, last_global_position)
+       VALUES ($1, $2, 0)
+       ON CONFLICT (projection_name, tenant_id) DO NOTHING
+       RETURNING projection_name, tenant_id, last_global_position, updated_at`,
+      [projectionName, tenantId]
+    );
+    return ins.rowCount ? this.mapRow(ins.rows[0]) : null;
+  }
+
+  async reset(tx: PgTx, projectionName: string, tenantId: string): Promise<void> {
+    await tx.client.query(
+      `INSERT INTO ${this.tableName} (projection_name, tenant_id, last_global_position, updated_at)
+       VALUES ($1, $2, 0, now())
+       ON CONFLICT (projection_name, tenant_id)
+       DO UPDATE SET last_global_position = 0, updated_at = now()`,
+      [projectionName, tenantId]
+    );
+  }
+
+  private mapRow(r: any): ProjectionCheckpoint {
+    return {
+      projectionName: r.projection_name,
+      tenantId: r.tenant_id,
+      lastGlobalPosition: BigInt(r.last_global_position),
+      updatedAt: new Date(r.updated_at).toISOString()
+    };
+  }
+
   async set(tx: PgTx, projectionName: string, tenantId: string, lastGlobalPosition: bigint): Promise<void> {
     await tx.client.query(
       `INSERT INTO ${this.tableName} (projection_name, tenant_id, last_global_position, updated_at)

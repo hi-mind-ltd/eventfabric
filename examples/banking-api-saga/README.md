@@ -28,7 +28,7 @@ POST /transfers
   emits TransactionInitiated + TransactionStarted
        │
        ▼
-  sagaAsAsyncProjection (on the outbox runner)
+  sagaAsProjection (on the projection daemon)
        │  correlate(TransactionStarted) → fresh instance, state seeded
        │  reaction:
        │    commands: [WithdrawFromAccount]
@@ -38,7 +38,7 @@ POST /transfers
        │  claims pending row → CommandBus.send → handler
        │    handler emits WithdrawalCompleted
        ▼
-  sagaAsAsyncProjection sees WithdrawalCompleted
+  sagaAsProjection sees WithdrawalCompleted
        │  reaction:
        │    commands: [DepositToAccount]
        │    cancel:   [withdraw-timeout]
@@ -55,7 +55,7 @@ timer instead, and the saga emits `FailTransaction`.
 
 | File | Purpose |
 |---|---|
-| [`src/app.ts`](src/app.ts) | Wires `CommandBus`, registers handlers, builds saga stores + observer, starts `SagaCommandDispatcher` + `SagaTimerScheduler`, adds the saga as an async projection on the outbox runner |
+| [`src/app.ts`](src/app.ts) | Wires `CommandBus`, registers handlers, builds saga stores + observer, starts `SagaCommandDispatcher` + `SagaTimerScheduler`, runs the saga (`sagaAsProjection`) and deposit-audit on a `ProjectionDaemon`, and email on the outbox runner |
 | [`src/sagas/funds-transfer.saga.ts`](src/sagas/funds-transfer.saga.ts) | The state machine — pure reducer, no IO |
 | [`src/sagas/funds-transfer.commands.ts`](src/sagas/funds-transfer.commands.ts) | Command envelope types the saga emits |
 | [`src/sagas/funds-transfer.handlers.ts`](src/sagas/funds-transfer.handlers.ts) | Command handlers — port of the projection logic, run via the bus |
@@ -70,13 +70,14 @@ timer instead, and the saga emits `FailTransaction`.
 | `GET /transactions/:id` | Read the terminal state of a saga-driven transaction. |
 | `GET /accounts/search`, `/accounts/with-customers` | Same read-model queries as `banking-api`. |
 | `/ops/dlq`, `/ops/outbox`, `/ops/partitions` | Same ops routers. |
+| `GET /ops/projections/dead-letters`, `POST /ops/projections/dead-letters/:id/replay` | Events the projection daemon (saga, deposit-audit) gave up on after `maxAttempts`; replay one after fixing the cause. |
 | `GET /ops/sagas/active` | **New.** Lists active `FundsTransfer` instances for triage. |
 
 ## What's kept from `banking-api`
 
 - `domain/` (identical aggregates + events)
 - `projections/email-projection.ts` — external delivery, runs on the outbox
-- `projections/deposit-audit.ts` — single-event-type audit, runs catch-up
+- `projections/deposit-audit.ts` — single-event-type audit, runs on the projection daemon
 - `ops/` routers
 
 ## Observability

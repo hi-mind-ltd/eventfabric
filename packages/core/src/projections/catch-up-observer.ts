@@ -38,7 +38,15 @@ export type CatchUpProjectorErrorInfo = {
   error: Error;
 };
 
+export type CatchUpEventDeadLetteredInfo = CatchUpHandlerInfo & {
+  tenantId: string;
+  attempts: number;
+  lastError: string | null;
+};
+
 export type CatchUpProjectorObserver = {
+  /** ProjectionDaemon only: an event exceeded maxAttempts and was dead-lettered. */
+  onEventDeadLettered?(info: CatchUpEventDeadLetteredInfo): void;
   onBatchLoaded?(info: CatchUpBatchLoadedInfo): void;
   onEventHandled?(info: CatchUpEventHandledInfo): void;
   onEventFailed?(info: CatchUpEventFailedInfo): void;

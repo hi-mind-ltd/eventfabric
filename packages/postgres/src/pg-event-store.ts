@@ -87,6 +87,8 @@ export type LoadGlobalParams = {
    * The catch-up projector always sets this.
    */
   tenantId?: string;
+  /** Optional inclusive upper bound (the catch-up projector passes the high water mark). */
+  toGlobalPositionInclusive?: bigint;
 };
 
 export type PgEventStoreOptions<E extends AnyEvent> = {
@@ -125,6 +127,11 @@ export type PgEventStoreOptions<E extends AnyEvent> = {
 
 export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore<E, PgTx> {
   private readonly eventsTable: string;
+
+  /** Schema-qualified events table this store reads and writes. */
+  get eventsTableName(): string {
+    return this.eventsTable;
+  }
   private readonly outboxTable: string;
   private readonly upcaster?: EventUpcaster<E>;
   private readonly streamVersionsTable: string;
@@ -236,6 +243,14 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
     const newVersion = expectedAggregateVersion + eventCount;
 
     // Atomic concurrency gate via stream_versions table.
+    //
+    // INVARIANT (relied on by PgHighWaterMark): every path below writes or
+    // row-locks stream_versions BEFORE inserting into the events table. That
+    // gives this transaction a transaction id before it allocates any
+    // global_position, so an in-flight append is always visible as an
+    // in-progress xid in other sessions' snapshots. Do not move the events
+    // INSERT ahead of the stream_versions statement.
+    //
     // This replaces the previous SELECT MAX + UNIQUE constraint approach.
     // A single UPDATE ... WHERE current_version = expected is atomic — no
     // TOCTOU race, no need for a UNIQUE constraint on the events table.
@@ -489,25 +504,22 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
     // catch-up projector can read a batch of one tenant's events without
     // pulling other tenants' rows over the wire. Index
     // `events_stream_covering_idx` leads with tenant_id.
-    const res = p.tenantId === undefined
-      ? await tx.client.query(
-          `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
-                  dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
-           FROM ${this.eventsTable}
-           WHERE global_position > $1
-           ORDER BY global_position ASC
-           LIMIT $2`,
-          [p.fromGlobalPositionExclusive.toString(), p.limit]
-        )
-      : await tx.client.query(
-          `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
-                  dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
-           FROM ${this.eventsTable}
-           WHERE tenant_id = $1 AND global_position > $2
-           ORDER BY global_position ASC
-           LIMIT $3`,
-          [p.tenantId, p.fromGlobalPositionExclusive.toString(), p.limit]
-        );
+    const res = await tx.client.query(
+      `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
+              dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
+       FROM ${this.eventsTable}
+       WHERE global_position > $1
+         AND ($2::bigint IS NULL OR global_position <= $2::bigint)
+         AND ($3::text IS NULL OR tenant_id = $3::text)
+       ORDER BY global_position ASC
+       LIMIT $4`,
+      [
+        p.fromGlobalPositionExclusive.toString(),
+        p.toGlobalPositionInclusive?.toString() ?? null,
+        p.tenantId ?? null,
+        p.limit
+      ]
+    );
     const envs = res.rows.map((r) => this.mapRow(r));
     return p.includeDismissed ? envs : envs.filter(e => !e.dismissed);
   }
@@ -524,16 +536,17 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
    */
   async discoverActiveTenants(
     tx: PgTx,
-    params: { fromGlobalPositionExclusive: bigint; limit?: number }
+    params: { fromGlobalPositionExclusive: bigint; toGlobalPositionInclusive?: bigint; limit?: number }
   ): Promise<string[]> {
     const limit = params.limit ?? 10_000;
     const res = await tx.client.query(
       `SELECT DISTINCT tenant_id
        FROM ${this.eventsTable}
        WHERE global_position > $1
+         AND ($3::bigint IS NULL OR global_position <= $3::bigint)
        ORDER BY tenant_id ASC
        LIMIT $2`,
-      [params.fromGlobalPositionExclusive.toString(), limit]
+      [params.fromGlobalPositionExclusive.toString(), limit, params.toGlobalPositionInclusive?.toString() ?? null]
     );
     return res.rows.map((r: any) => r.tenant_id as string);
   }

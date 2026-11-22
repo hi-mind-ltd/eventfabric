@@ -5,6 +5,7 @@ import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore, ConcurrencyError, RowShapeError } from "../src/pg-event-store";
 import { migrate } from "../src/pg-migrator";
 import type { AnyEvent } from "@eventfabric/core";
+import { endPool } from "./helpers/end-pool";
 
 type E = { type: "A"; version: 1; n: number };
 
@@ -18,7 +19,7 @@ beforeAll(async () => {
 }, 120000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

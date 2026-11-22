@@ -11,6 +11,7 @@ import {
   createDepositProjection,
   createTransactionCompletionProjection
 } from "../src/projections/eventual-transfer-projections";
+import { endPool } from "./helpers/end-pool";
 
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
@@ -22,7 +23,7 @@ beforeAll(async () => {
 }, 120000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

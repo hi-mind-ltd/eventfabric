@@ -20,14 +20,18 @@ export interface OutboxStore<TTx extends Transaction = Transaction> {
   /**
    * Claims a batch of messages from the outbox for processing.
    * Messages are locked to prevent concurrent processing by multiple workers.
-   * 
+   *
+   * When `leaseMs` is set, rows whose lock is older than `leaseMs` are treated
+   * as abandoned (e.g. the claiming worker crashed) and may be claimed again.
+   * When omitted, only unlocked rows are claimed.
+   *
    * @param tx - Transaction context
    * @param opts - Options for claiming messages
    * @returns Array of claimed outbox rows
    */
   claimBatch(
     tx: TTx,
-    opts: { batchSize: number; workerId: string; topic?: string | null }
+    opts: { batchSize: number; workerId: string; topic?: string | null; leaseMs?: number }
   ): Promise<OutboxRow[]>;
 
   /**
@@ -47,6 +51,17 @@ export interface OutboxStore<TTx extends Transaction = Transaction> {
    * @param error - Error message to store
    */
   releaseWithError(tx: TTx, id: OutboxRow["id"], error: string): Promise<void>;
+
+  /**
+   * Releases claimed messages that were never attempted (e.g. the runner
+   * stopped or bailed out before reaching them). Unlocks the rows and undoes
+   * the `attempts` increment applied by `claimBatch`, leaving `last_error`
+   * untouched, so the release does not count towards `maxAttempts`.
+   *
+   * @param tx - Transaction context
+   * @param ids - IDs of the outbox rows to release
+   */
+  release(tx: TTx, ids: OutboxRow["id"][]): Promise<void>;
 
   /**
    * Moves a message to the dead letter queue after exceeding max attempts.

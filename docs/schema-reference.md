@@ -30,6 +30,7 @@ Run this before any migration. Migration `001_init.sql` includes this statement.
 | `008_tenant_id.sql`             | Adds `tenant_id` column + composite indexes to event-store + outbox + snapshot tables for multi-tenancy |
 | `009_per_tenant_projection_checkpoints.sql` | Replaces `projection_checkpoints.last_global_position` with per-tenant checkpoint rows |
 | `015_event_hash_chain.sql`      | Tamper-evidence (opt-in per aggregate): adds `events.event_hash`, `stream_versions.head_hash`, and the `event_chain_anchors` + `event_chain_anchor_members` tables. Dormant unless a `hashChain.secret` is configured. See [Tamper Evidence](./tamper-evidence.md). |
+| `016_projection_dead_letters.sql` | `eventfabric.projection_dead_letters` table: events the `ProjectionDaemon` gave up on after `maxAttempts` |
 
 ### Mediator extension (shipped by `@eventfabric/mediator-postgres`)
 
@@ -222,14 +223,16 @@ Migration 015.
 
 ## Table: eventfabric.projection_checkpoints
 
-Tracks the last processed `global_position` for each catch-up or async
-projection. One row per projection name.
+Tracks the last processed `global_position` per catch-up projection and
+tenant (catch-up projector and `ProjectionDaemon`). One row per
+(projection, tenant). The outbox `AsyncProjectionRunner` does not use it.
 
 ### Columns
 
 | Column                  | Type          | Nullable | Default  | Description                                                     |
 | ----------------------- | ------------- | -------- | -------- | --------------------------------------------------------------- |
-| `projection_name`       | `TEXT`        | NOT NULL | --       | **PRIMARY KEY.** Unique name of the projection (e.g. `"deposit-audit"`, `"email-notification"`). |
+| `projection_name`       | `TEXT`        | NOT NULL | --       | Unique name of the projection (e.g. `"deposit-audit"`). Part of the primary key. |
+| `tenant_id`             | `TEXT`        | NOT NULL | `'default'` | Tenant whose events this checkpoint tracks. Part of the primary key. |
 | `last_global_position`  | `BIGINT`     | NOT NULL | `0`      | The `global_position` of the last event successfully processed by this projection. The projection reads events with `global_position > last_global_position`. |
 | `updated_at`            | `TIMESTAMPTZ` | NOT NULL | `now()`  | Timestamp of the last checkpoint update. Useful for monitoring staleness. |
 
@@ -237,7 +240,36 @@ projection. One row per projection name.
 
 | Constraint                        | Type        | Description                    |
 | --------------------------------- | ----------- | ------------------------------ |
-| `projection_checkpoints_pkey`     | PRIMARY KEY | `(projection_name)`.           |
+| `projection_checkpoints_pkey`     | PRIMARY KEY | `(projection_name, tenant_id)`. The projector locks the row (`FOR UPDATE SKIP LOCKED`) for each batch. |
+
+---
+
+## Table: eventfabric.projection_dead_letters
+
+Events a `ProjectionDaemon` projection failed to handle `maxAttempts` times.
+The daemon records the event here and moves the projection's checkpoint
+past it. `ProjectionDaemon.replayDeadLetter(id)` runs it again.
+
+### Columns
+
+| Column             | Type          | Nullable | Default     | Description |
+| ------------------ | ------------- | -------- | ----------- | ----------- |
+| `id`               | `BIGSERIAL`   | NOT NULL | --          | **PRIMARY KEY.** |
+| `projection_name`  | `TEXT`        | NOT NULL | --          | Projection that failed. |
+| `tenant_id`        | `TEXT`        | NOT NULL | `'default'` | Tenant of the event. |
+| `global_position`  | `BIGINT`      | NOT NULL | --          | Position of the event in `eventfabric.events`. |
+| `event_id`         | `UUID`        | NOT NULL | --          | The event's id. |
+| `event_type`       | `TEXT`        | NOT NULL | --          | The event's type. |
+| `attempts`         | `INT`         | NOT NULL | --          | Handler attempts made. |
+| `last_error`       | `TEXT`        | NULL     | --          | Last error (stack trace). |
+| `dead_lettered_at` | `TIMESTAMPTZ` | NOT NULL | `now()`     | When it was dead-lettered. |
+
+### Indexes
+
+| Name | Type | Columns / notes |
+| ---- | ---- | --------------- |
+| `projection_dead_letters_event_key` | UNIQUE | `(projection_name, tenant_id, global_position)`. Re-dead-lettering updates the row. |
+| `projection_dead_letters_age_idx` | B-tree | `(dead_lettered_at)` |
 
 ---
 
@@ -618,7 +650,7 @@ eventfabric.saga_scheduled_messages
                                  │
                                  │   (events emitted by command handlers
                                  │    feed back into the saga via the
-                                 │    outbox runner → sagaAsAsyncProjection)
+                                 │    projection daemon → sagaAsProjection)
                                  ▼
                       eventfabric.events  ←  the source of truth
 ```
@@ -626,7 +658,7 @@ eventfabric.saga_scheduled_messages
 Notes:
 - The foreign key relationships between `outbox.global_position` and `events.global_position` are enforced **by application logic**, not by SQL `REFERENCES` constraints. This is intentional — it avoids lock contention on the events table during outbox operations.
 - The mediator and saga tables likewise have no SQL foreign keys to `events` (or to each other). The dispatcher → bus → handler → events flow is enforced by transactions, not constraints.
-- The saga's `last_event_pos` makes replay idempotent: events with `globalPosition <= last_event_pos` are silently skipped, so re-delivery from the outbox is a no-op.
+- The saga's `last_event_pos` makes redelivery idempotent: events with `globalPosition <= last_event_pos` are skipped. This relies on in-order delivery, which the projection daemon (`sagaAsProjection`) guarantees and the outbox runner does not: on the outbox path a late-committing event can be skipped wrongly. Dead-letter replays bypass the check, and `last_event_pos` never moves backwards.
 
 ## Related documentation
 

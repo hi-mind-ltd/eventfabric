@@ -12,6 +12,7 @@ import {
 import { UserAggregate, type UserState } from "../src/domain/user.aggregate";
 import { UserRegistered, UserEmailChanged } from "../src/domain/user.events";
 import type { UserEvent } from "../src/domain/user.events";
+import { endPool } from "./helpers/end-pool";
 
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
@@ -34,7 +35,7 @@ beforeAll(async () => {
 }, 120000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 
