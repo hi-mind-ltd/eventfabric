@@ -39,8 +39,12 @@ export interface OutboxStore<TTx extends Transaction = Transaction> {
    * 
    * @param tx - Transaction context
    * @param id - ID of the outbox row to acknowledge
+   * @param workerId - When given, the ack only succeeds while this worker
+   *   still holds the row's lease. If another worker has taken the row over
+   *   (the lease expired), it throws {@link LeaseLostError}, so the caller's
+   *   transaction, including the handler's writes, rolls back.
    */
-  ack(tx: TTx, id: OutboxRow["id"]): Promise<void>;
+  ack(tx: TTx, id: OutboxRow["id"], workerId?: string): Promise<void>;
 
   /**
    * Releases a message back to the outbox after a processing error.
@@ -49,8 +53,10 @@ export interface OutboxStore<TTx extends Transaction = Transaction> {
    * @param tx - Transaction context
    * @param id - ID of the outbox row to release
    * @param error - Error message to store
+   * @param workerId - When given, only releases the row while this worker
+   *   still holds its lease (a no-op otherwise).
    */
-  releaseWithError(tx: TTx, id: OutboxRow["id"], error: string): Promise<void>;
+  releaseWithError(tx: TTx, id: OutboxRow["id"], error: string, workerId?: string): Promise<void>;
 
   /**
    * Releases claimed messages that were never attempted (e.g. the runner
@@ -60,8 +66,10 @@ export interface OutboxStore<TTx extends Transaction = Transaction> {
    *
    * @param tx - Transaction context
    * @param ids - IDs of the outbox rows to release
+   * @param workerId - When given, only releases rows this worker still holds
+   *   the lease on.
    */
-  release(tx: TTx, ids: OutboxRow["id"][]): Promise<void>;
+  release(tx: TTx, ids: OutboxRow["id"][], workerId?: string): Promise<void>;
 
   /**
    * Moves a message to the dead letter queue after exceeding max attempts.
@@ -70,6 +78,20 @@ export interface OutboxStore<TTx extends Transaction = Transaction> {
    * @param tx - Transaction context
    * @param row - Outbox row to dead letter
    * @param reason - Reason for dead lettering
+   * @param workerId - When given, throws {@link LeaseLostError} if this
+   *   worker no longer holds the row's lease.
    */
-  deadLetter(tx: TTx, row: OutboxRow, reason: string): Promise<void>;
+  deadLetter(tx: TTx, row: OutboxRow, reason: string, workerId?: string): Promise<void>;
+}
+
+/**
+ * Thrown by `ack` / `deadLetter` when the worker's lease on an outbox row was
+ * taken over by another worker (the handler outlived `leaseMs`). Throwing
+ * rolls back the transaction, so the handler's writes are not committed twice.
+ */
+export class LeaseLostError extends Error {
+  constructor(public readonly outboxId: OutboxRow["id"], public readonly workerId: string) {
+    super(`Lease on outbox row ${outboxId} was lost by worker ${workerId}: another worker took it over`);
+    this.name = "LeaseLostError";
+  }
 }

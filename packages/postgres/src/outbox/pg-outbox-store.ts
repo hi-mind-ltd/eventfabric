@@ -1,4 +1,4 @@
-import type { OutboxStore, OutboxRow as CoreOutboxRow } from "@eventfabric/core";
+import { LeaseLostError, type OutboxStore, type OutboxRow as CoreOutboxRow } from "@eventfabric/core";
 import type { PgTx } from "../unitofwork/pg-transaction";
 import { RowShapeError } from "../pg-event-store";
 
@@ -74,47 +74,56 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
     });
   }
 
-  async ack(tx: PgTx, id: OutboxRow["id"]): Promise<void> {
-    await tx.client.query(`DELETE FROM ${this.outboxTable} WHERE id = $1`, [id]);
+  // Every write below takes an optional workerId. With it, the statement only
+  // touches the row while that worker still holds the lease (locked_by), so a
+  // worker whose handler outlived leaseMs cannot ack, release or dead-letter
+  // a row another worker has taken over.
+
+  async ack(tx: PgTx, id: OutboxRow["id"], workerId?: string): Promise<void> {
+    const res = await tx.client.query(
+      `DELETE FROM ${this.outboxTable} WHERE id = $1 AND ($2::text IS NULL OR locked_by = $2)`,
+      [id, workerId ?? null]
+    );
+    if (workerId !== undefined && res.rowCount === 0) throw new LeaseLostError(id, workerId);
   }
 
-  async releaseWithError(tx: PgTx, id: OutboxRow["id"], error: string): Promise<void> {
+  async releaseWithError(tx: PgTx, id: OutboxRow["id"], error: string, workerId?: string): Promise<void> {
     await tx.client.query(
       `UPDATE ${this.outboxTable}
        SET locked_at = NULL, locked_by = NULL, last_error = $2
-       WHERE id = $1`,
-      [id, error]
+       WHERE id = $1 AND ($3::text IS NULL OR locked_by = $3)`,
+      [id, error, workerId ?? null]
     );
   }
 
-  async release(tx: PgTx, ids: OutboxRow["id"][]): Promise<void> {
+  async release(tx: PgTx, ids: OutboxRow["id"][], workerId?: string): Promise<void> {
     if (ids.length === 0) return;
     await tx.client.query(
       `UPDATE ${this.outboxTable}
        SET locked_at = NULL, locked_by = NULL, attempts = GREATEST(attempts - 1, 0)
-       WHERE id = ANY($1::bigint[])`,
-      [ids.map(String)]
+       WHERE id = ANY($1::bigint[]) AND ($2::text IS NULL OR locked_by = $2)`,
+      [ids.map(String), workerId ?? null]
     );
   }
 
-  async deadLetter(tx: PgTx, row: OutboxRow, reason: string): Promise<void> {
-    // copy details then delete from outbox
+  async deadLetter(tx: PgTx, row: OutboxRow, _reason: string, workerId?: string): Promise<void> {
+    // Delete first so the lease check and the removal are one statement, then
+    // copy the deleted row's details into the DLQ.
+    const del = await tx.client.query(
+      `DELETE FROM ${this.outboxTable}
+       WHERE id = $1 AND ($2::text IS NULL OR locked_by = $2)
+       RETURNING tenant_id, id, global_position, topic, attempts, last_error`,
+      [row.id, workerId ?? null]
+    );
+    if (del.rowCount === 0) {
+      if (workerId !== undefined) throw new LeaseLostError(row.id, workerId);
+      return;
+    }
+    const r = del.rows[0];
     await tx.client.query(
       `INSERT INTO ${this.dlqTable} (tenant_id, outbox_id, global_position, topic, attempts, last_error, dead_lettered_at)
-       SELECT tenant_id, id, global_position, topic, attempts, last_error, now()
-       FROM ${this.outboxTable}
-       WHERE id = $1`,
-      [row.id]
+       VALUES ($1, $2, $3, $4, $5, $6, now())`,
+      [r.tenant_id, r.id, r.global_position, r.topic, r.attempts, r.last_error]
     );
-
-    await tx.client.query(
-      `UPDATE ${this.outboxTable}
-       SET dead_lettered_at = now(), dead_letter_reason = $2
-       WHERE id = $1`,
-      [row.id, reason]
-    );
-
-    // remove from active queue
-    await tx.client.query(`DELETE FROM ${this.outboxTable} WHERE id = $1`, [row.id]);
   }
 }

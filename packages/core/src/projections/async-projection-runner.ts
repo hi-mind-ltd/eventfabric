@@ -190,7 +190,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
   private async releaseUnattempted(rows: OutboxRow[]): Promise<void> {
     if (rows.length === 0) return;
     try {
-      await this.uow.withTransaction((tx) => this.outbox.release(tx, rows.map(r => r.id)));
+      await this.uow.withTransaction((tx) => this.outbox.release(tx, rows.map(r => r.id), this.opts.workerId));
     } catch {
       // Swallow: must not mask the error that ended the batch.
     }
@@ -198,13 +198,18 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
 
   private async processBatch(claimed: OutboxRow[], includeDismissed: boolean, maxAttempts: number): Promise<void> {
     const observer = this.opts.observer;
+    // The row being worked on when the batch tx fails. Only that row is
+    // charged an attempt; the others are handed back uncharged, so one
+    // failing row cannot push healthy rows claimed with it to maxAttempts.
+    let current: OutboxRow | undefined;
     try {
       await this.uow.withTransaction(async (tx) => {
         // Dead letter messages that exceeded max attempts
         for (const row of claimed) {
           if (row.attempts > maxAttempts) {
+            current = row;
             const reason = `Exceeded maxAttempts=${maxAttempts}`;
-            await this.outbox.deadLetter(tx, row, reason);
+            await this.outbox.deadLetter(tx, row, reason, this.opts.workerId);
             this.fireHook(observer?.onMessageDeadLettered, {
               workerId: this.opts.workerId,
               outboxId: row.id,
@@ -227,8 +232,9 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
         const loaded = new Set(envs.map(e => e.globalPosition.toString()));
         for (const row of remaining) {
           if (loaded.has(row.globalPosition.toString())) continue;
+          current = row;
           const reason = `Event not found for globalPosition=${row.globalPosition.toString()}`;
-          await this.outbox.deadLetter(tx, row, reason);
+          await this.outbox.deadLetter(tx, row, reason, this.opts.workerId);
           this.fireHook(observer?.onMessageDeadLettered, {
             workerId: this.opts.workerId,
             outboxId: row.id,
@@ -241,9 +247,10 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
         for (const env of envs) {
           const row = rowByPos.get(env.globalPosition.toString());
           if (!row) continue;
+          current = row;
 
           if (env.dismissed && !includeDismissed) {
-            await this.outbox.ack(tx, row.id);
+            await this.outbox.ack(tx, row.id, this.opts.workerId);
             this.fireHook(observer?.onMessageAcked, {
               workerId: this.opts.workerId,
               outboxId: row.id
@@ -261,12 +268,13 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
             await this.runProjectionHandler(p, scopedTx, env, row.attempts);
           }
 
-          await this.outbox.ack(tx, row.id);
+          await this.outbox.ack(tx, row.id, this.opts.workerId);
           this.fireHook(observer?.onMessageAcked, {
             workerId: this.opts.workerId,
             outboxId: row.id
           });
         }
+        current = undefined;
       });
     } catch (err: unknown) {
       // Main tx rolled back — release all claimed rows in a fresh tx so they
@@ -277,14 +285,19 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
       const msg = error.stack || error.message;
       try {
         await this.uow.withTransaction(async (tx) => {
-          for (const row of claimed) {
-            await this.outbox.releaseWithError(tx, row.id, msg);
+          // A failure tied to one row charges that row only. A failure not
+          // tied to a row (e.g. loading the events) charges them all.
+          const charged = current ? [current] : claimed;
+          const uncharged = current ? claimed.filter(r => r !== current) : [];
+          for (const row of charged) {
+            await this.outbox.releaseWithError(tx, row.id, msg, this.opts.workerId);
             this.fireHook(observer?.onMessageReleased, {
               workerId: this.opts.workerId,
               outboxId: row.id,
               error
             });
           }
+          await this.outbox.release(tx, uncharged.map(r => r.id), this.opts.workerId);
         });
       } catch {
         // Best-effort. If release also fails, the runner backs off on the
@@ -300,7 +313,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
       await this.uow.withTransaction(async (tx) => {
         if (row.attempts > maxAttempts) {
           const reason = `Exceeded maxAttempts=${maxAttempts}`;
-          await this.outbox.deadLetter(tx, row, reason);
+          await this.outbox.deadLetter(tx, row, reason, this.opts.workerId);
           this.fireHook(observer?.onMessageDeadLettered, {
             workerId: this.opts.workerId,
             outboxId: row.id,
@@ -314,7 +327,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
         const env = envs[0];
         if (!env) {
           const reason = `Event not found for globalPosition=${row.globalPosition.toString()}`;
-          await this.outbox.deadLetter(tx, row, reason);
+          await this.outbox.deadLetter(tx, row, reason, this.opts.workerId);
           this.fireHook(observer?.onMessageDeadLettered, {
             workerId: this.opts.workerId,
             outboxId: row.id,
@@ -325,7 +338,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
         }
 
         if (env.dismissed && !includeDismissed) {
-          await this.outbox.ack(tx, row.id);
+          await this.outbox.ack(tx, row.id, this.opts.workerId);
           this.fireHook(observer?.onMessageAcked, {
             workerId: this.opts.workerId,
             outboxId: row.id
@@ -340,7 +353,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
           await this.runProjectionHandler(p, scopedTx, env, row.attempts);
         }
 
-        await this.outbox.ack(tx, row.id);
+        await this.outbox.ack(tx, row.id, this.opts.workerId);
         this.fireHook(observer?.onMessageAcked, {
           workerId: this.opts.workerId,
           outboxId: row.id
@@ -352,7 +365,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
       const error = toError(err);
       const msg = error.stack || error.message;
       await this.uow.withTransaction(async (tx) => {
-        await this.outbox.releaseWithError(tx, row.id, msg);
+        await this.outbox.releaseWithError(tx, row.id, msg, this.opts.workerId);
       });
       this.fireHook(observer?.onMessageReleased, {
         workerId: this.opts.workerId,

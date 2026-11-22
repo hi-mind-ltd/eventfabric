@@ -441,3 +441,77 @@ describe("concurrent catch-up projectors", () => {
     expect(duplicates).toEqual([]);
   }, 30000);
 });
+
+// ---------------------------------------------------------------------------
+// 5. A failing row must not be charged to the rest of its batch
+// ---------------------------------------------------------------------------
+
+describe("batch mode: failure attribution", () => {
+  it("dead-letters only the failing row, not the healthy rows claimed with it", async () => {
+    await appendOne("poison");
+    await appendOne("ok-1");
+    await appendOne("ok-2");
+
+    const handled: string[] = [];
+    const projection = recordingProjection("poison-batch", handled, (env) => {
+      if (env.payload.id === "poison") throw new Error("always fails");
+    });
+    const r = startRunner([projection], { workerId: "poison-w", transactionMode: "batch", batchSize: 3, maxAttempts: 2 });
+    await waitFor(async () => (await outboxCount()) === 0, 8000);
+    await r.stop();
+
+    const dlq = await pool.query(
+      `SELECT e.payload->>'id' AS id FROM eventfabric.outbox_dead_letters d
+         JOIN eventfabric.events e ON e.global_position = d.global_position`
+    );
+    expect(dlq.rows.map((x: any) => x.id)).toEqual(["poison"]);
+    expect(handled).toEqual(expect.arrayContaining(["ok-1", "ok-2"]));
+  }, 20000);
+});
+
+// ---------------------------------------------------------------------------
+// 6. Lease fencing: a worker whose lease was taken over must not ack / release
+// ---------------------------------------------------------------------------
+
+describe("lease fencing", () => {
+  it("a worker that lost its lease cannot ack: its handler's writes roll back and the row stays with the new owner", async () => {
+    await appendOne("slow");
+    const outbox = new PgOutboxStore();
+    const uow = new PgUnitOfWork(pool);
+    await pool.query(`CREATE TABLE IF NOT EXISTS public.fence_effects (worker text)`);
+    await pool.query(`DELETE FROM public.fence_effects`);
+
+    const [a] = await uow.withTransaction((tx) => outbox.claimBatch(tx, { batchSize: 1, workerId: "A" }));
+    // A's lease expires while its handler runs; B takes the row over.
+    await pool.query(`UPDATE eventfabric.outbox SET locked_at = now() - interval '1 hour'`);
+    const [b] = await uow.withTransaction((tx) => outbox.claimBatch(tx, { batchSize: 1, workerId: "B", leaseMs: 1000 }));
+    expect(b!.id).toBe(a!.id);
+
+    // A finishes late: writes its effect and acks in one tx.
+    await expect(
+      uow.withTransaction(async (tx) => {
+        await tx.client.query(`INSERT INTO public.fence_effects VALUES ('A')`);
+        await outbox.ack(tx, a!.id, "A");
+      })
+    ).rejects.toThrow(/lease/i);
+
+    expect((await pool.query(`SELECT * FROM public.fence_effects`)).rowCount).toBe(0);
+    const row = await pool.query(`SELECT locked_by FROM eventfabric.outbox WHERE id = $1`, [a!.id]);
+    expect(row.rows[0]?.locked_by).toBe("B");
+  }, 20000);
+
+  it("a worker that lost its lease cannot release the new owner's lock", async () => {
+    await appendOne("slow-2");
+    const outbox = new PgOutboxStore();
+    const uow = new PgUnitOfWork(pool);
+    const [a] = await uow.withTransaction((tx) => outbox.claimBatch(tx, { batchSize: 1, workerId: "A" }));
+    await pool.query(`UPDATE eventfabric.outbox SET locked_at = now() - interval '1 hour'`);
+    await uow.withTransaction((tx) => outbox.claimBatch(tx, { batchSize: 1, workerId: "B", leaseMs: 1000 }));
+
+    await uow.withTransaction((tx) => outbox.releaseWithError(tx, a!.id, "late failure", "A"));
+    await uow.withTransaction((tx) => outbox.release(tx, [a!.id], "A"));
+
+    const row = await pool.query(`SELECT locked_by, attempts FROM eventfabric.outbox WHERE id = $1`, [a!.id]);
+    expect(row.rows[0]).toEqual({ locked_by: "B", attempts: 2 });
+  }, 20000);
+});
