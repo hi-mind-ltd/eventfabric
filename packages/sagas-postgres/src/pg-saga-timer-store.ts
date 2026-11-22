@@ -136,12 +136,31 @@ export class PgSagaTimerStore implements SagaTimerStore<PgTx> {
       id: string;
     }
   ): Promise<void> {
+    // Only a still-claimed row: when the reaction re-scheduled the same id
+    // (a recurring timer) the row is pending again and must stay pending.
     await tx.client.query(
       `UPDATE ${this.tableName}
           SET status = 'fired'
-        WHERE tenant_id = $1 AND saga_name = $2 AND instance_id = $3 AND id = $4`,
+        WHERE tenant_id = $1 AND saga_name = $2 AND instance_id = $3 AND id = $4
+          AND status = 'claimed'`,
       [params.tenantId, params.sagaName, params.instanceId, params.id]
     );
+  }
+
+  async lockClaimed(
+    tx: PgTx,
+    params: { tenantId: string; sagaName: string; instanceId: string; id: string }
+  ): Promise<boolean> {
+    // Row lock held until the delivery tx ends: a cancel or re-schedule
+    // arriving meanwhile waits, and one that committed first is seen here.
+    const res = await tx.client.query(
+      `SELECT 1 FROM ${this.tableName}
+        WHERE tenant_id = $1 AND saga_name = $2 AND instance_id = $3 AND id = $4
+          AND status = 'claimed'
+        FOR UPDATE`,
+      [params.tenantId, params.sagaName, params.instanceId, params.id]
+    );
+    return (res.rowCount ?? 0) > 0;
   }
 
   /**

@@ -42,14 +42,14 @@ export class InMemorySagaTimerStore implements SagaTimerStore<Transaction> {
       message: TimerMessage;
     }
   ): Promise<void> {
-    // Replace any existing pending row with the same key — re-scheduling
-    // an id is the documented way to update fireAt or payload.
-    const existing = this.rows.find(
-      (r) => this.match(r, params) && r.status === "pending"
-    );
+    // Replace any existing row with the same key, whatever its status, and
+    // make it pending again. Re-scheduling an id is the documented way to
+    // update fireAt or payload. (Same as the Postgres upsert.)
+    const existing = this.rows.find((r) => this.match(r, params));
     if (existing) {
       existing.fireAt = new Date(params.fireAt);
       existing.message = structuredClone(params.message);
+      existing.status = "pending";
       return;
     }
     this.rows.push({
@@ -121,6 +121,13 @@ export class InMemorySagaTimerStore implements SagaTimerStore<Transaction> {
       (r) => this.match(r, params) && r.status === "claimed"
     );
     if (row) row.status = "fired";
+  }
+
+  async lockClaimed(
+    _tx: Transaction,
+    params: { tenantId: string; sagaName: string; instanceId: string; id: string }
+  ): Promise<boolean> {
+    return this.rows.some((r) => this.match(r, params) && r.status === "claimed");
   }
 
   /**

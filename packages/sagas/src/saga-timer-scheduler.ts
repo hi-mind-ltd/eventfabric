@@ -100,6 +100,12 @@ export interface TimerSchedulerRoundResult {
   readonly fired: number;
   readonly released: number;
   readonly orphaned: number;
+  /**
+   * Claimed timers that were no longer claimed at delivery (cancelled or
+   * re-scheduled after the claim, or fired by another scheduler) and so
+   * were not delivered.
+   */
+  readonly skipped: number;
 }
 
 /**
@@ -152,12 +158,13 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
     );
 
     if (claimed.length === 0) {
-      return { claimed: 0, fired: 0, released: 0, orphaned: 0 };
+      return { claimed: 0, fired: 0, released: 0, orphaned: 0, skipped: 0 };
     }
 
     let fired = 0;
     let released = 0;
     let orphaned = 0;
+    let skipped = 0;
 
     for (const item of claimed) {
       // Narrow the UoW per item so the saga reaction + markFired commit
@@ -219,6 +226,18 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
       };
 
       const result = await itemUow.withTransaction(async (tx) => {
+        // The claim committed in its own tx, so the timer may have been
+        // cancelled or re-scheduled since. Re-check (and lock) it first.
+        if (this.timerStore.lockClaimed) {
+          const stillClaimed = await this.timerStore.lockClaimed(tx, {
+            tenantId: item.tenantId,
+            sagaName: item.sagaName,
+            instanceId: item.instanceId,
+            id: item.id,
+          });
+          if (!stillClaimed) return "stale" as const;
+        }
+
         const outcome = await applySagaTransition(
           handler.saga,
           {
@@ -240,7 +259,8 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
         }
 
         // applied | skipped → mark fired in the same Tx so saga state and
-        // timer status commit atomically.
+        // timer status commit atomically. markFired only touches a claimed
+        // row, so a reaction that re-scheduled this id keeps it pending.
         await this.timerStore.markFired(tx, {
           tenantId: item.tenantId,
           sagaName: item.sagaName,
@@ -266,7 +286,9 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
       });
 
       const durationMs = Date.now() - startedAt;
-      if (result === "concurrent") {
+      if (result === "stale") {
+        skipped++;
+      } else if (result === "concurrent") {
         safeEmit(() =>
           this.observer?.onTimerReleased?.({
             ...baseInfo,
@@ -283,7 +305,7 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
       }
     }
 
-    return { claimed: claimed.length, fired, released, orphaned };
+    return { claimed: claimed.length, fired, released, orphaned, skipped };
   }
 
   async start(): Promise<void> {

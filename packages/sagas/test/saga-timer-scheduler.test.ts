@@ -87,7 +87,7 @@ describe("SagaTimerScheduler", () => {
 
     const scheduler = new SagaTimerScheduler(new NoOpUow(), timerStore, handlers);
     const round = await scheduler.runOnce();
-    expect(round).toEqual({ claimed: 1, fired: 1, released: 0, orphaned: 0 });
+    expect(round).toEqual({ claimed: 1, fired: 1, released: 0, orphaned: 0, skipped: 0 });
 
     const inst = await stateStore.load(tx, {
       sagaName: "Counter",
@@ -113,7 +113,7 @@ describe("SagaTimerScheduler", () => {
 
     const scheduler = new SagaTimerScheduler(new NoOpUow(), timerStore, handlers);
     const round = await scheduler.runOnce();
-    expect(round).toEqual({ claimed: 0, fired: 0, released: 0, orphaned: 0 });
+    expect(round).toEqual({ claimed: 0, fired: 0, released: 0, orphaned: 0, skipped: 0 });
   });
 
   it("handles end:true reactions by terminating the saga and not running again", async () => {

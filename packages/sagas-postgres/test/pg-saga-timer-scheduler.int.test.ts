@@ -592,3 +592,104 @@ describe("PgSagaTimerStore + SagaTimerScheduler (integration)", () => {
     expect(remaining.rows).toEqual([{ id: "t-cancelled", status: "cancelled" }]);
   });
 });
+
+describe("timer delivery re-checks the claim", () => {
+  type PollState = { polls: number };
+  const pollSaga: Saga<PollState, CounterEvent> = {
+    name: "Counter",
+    version: 1,
+    correlate: (env) => env.payload.counterId,
+    startsNewInstance: () => true,
+    initialState: () => ({ polls: 0 }),
+    reactToEvent: (state) => ({ newState: state }),
+    // A recurring timer: every firing schedules the same id again.
+    reactToTimer: (state, timer) => ({
+      newState: { polls: (state.polls ?? 0) + 1 },
+      schedule: [{ id: timer.id, fireAt: new Date(Date.now() + 60_000), message: timer }],
+    }),
+  };
+
+  function setup(saga: Saga<any, any>, afterClaim?: () => Promise<void>) {
+    const stateStore = new PgSagaStateStore<any>();
+    const timerStore = new PgSagaTimerStore();
+    const commandQueue = new InMemorySagaCommandQueue();
+    const inner = new PgUnitOfWork(pool);
+    let calls = 0;
+    // Runs `afterClaim` once the claim tx has committed, before delivery.
+    const uow = {
+      withTransaction: async <T>(fn: (tx: PgTx) => Promise<T>): Promise<T> => {
+        const r = await inner.withTransaction(fn);
+        if (calls++ === 0 && afterClaim) await afterClaim();
+        return r;
+      },
+    };
+    const handlers = new Map<string, SagaTimerHandler<PgTx>>([
+      ["Counter", { saga, stores: { stateStore, commandQueue, timerStore } }],
+    ]);
+    return { scheduler: new SagaTimerScheduler(uow as any, timerStore, handlers), timerStore, stateStore, inner };
+  }
+
+  const scheduleDue = (timerStore: PgSagaTimerStore, id: string, fireAt = new Date(Date.now() - 1000)) =>
+    new PgUnitOfWork(pool).withTransaction((tx: PgTx) =>
+      timerStore.schedule(tx, {
+        tenantId: "default",
+        sagaName: "Counter",
+        instanceId: "i-1",
+        id,
+        fireAt,
+        message: { type: "$timer", id, payload: null },
+      })
+    );
+
+  const timerRow = async (id: string) =>
+    (await pool.query(`SELECT status, fire_at FROM eventfabric.saga_scheduled_messages WHERE id = $1`, [id])).rows[0];
+
+  it("a timer that reschedules its own id stays pending for the next run", async () => {
+    await seedInstance("i-1");
+    const { scheduler, timerStore } = setup(pollSaga as Saga<any, any>);
+    await scheduleDue(timerStore, "poll");
+
+    expect(await scheduler.runOnce()).toMatchObject({ claimed: 1, fired: 1 });
+
+    const row = await timerRow("poll");
+    expect(row.status).toBe("pending");
+    expect(new Date(row.fire_at).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it("a timer cancelled after it was claimed does not fire", async () => {
+    await seedInstance("i-1");
+    const { scheduler, timerStore, stateStore } = setup(counterSaga as Saga<any, any>, () =>
+      new PgUnitOfWork(pool).withTransaction(async (tx: PgTx) => {
+        await timerStore.cancel(tx, { tenantId: "default", sagaName: "Counter", instanceId: "i-1", ids: ["tick"] });
+      })
+    );
+    await scheduleDue(timerStore, "tick");
+
+    await scheduler.runOnce();
+
+    expect((await timerRow("tick")).status).toBe("cancelled");
+    const inst = await new PgUnitOfWork(pool).withTransaction((tx: PgTx) =>
+      stateStore.load(tx, { sagaName: "Counter", instanceId: "i-1", tenantId: "default" })
+    );
+    expect(inst!.state.fired).toBe(0);
+  });
+
+  it("a timer rescheduled after it was claimed fires at the new time, not now", async () => {
+    await seedInstance("i-1");
+    const later = new Date(Date.now() + 60_000);
+    const { scheduler, timerStore, stateStore } = setup(counterSaga as Saga<any, any>, () =>
+      scheduleDue(timerStore, "tick", later)
+    );
+    await scheduleDue(timerStore, "tick");
+
+    await scheduler.runOnce();
+
+    const row = await timerRow("tick");
+    expect(row.status).toBe("pending");
+    expect(new Date(row.fire_at).getTime()).toBe(later.getTime());
+    const inst = await new PgUnitOfWork(pool).withTransaction((tx: PgTx) =>
+      stateStore.load(tx, { sagaName: "Counter", instanceId: "i-1", tenantId: "default" })
+    );
+    expect(inst!.state.fired).toBe(0);
+  });
+});
