@@ -19,4 +19,12 @@ export interface CatchUpProjection<E extends AnyEvent, TTx extends Transaction =
    * @param env - Event envelope to process
    */
   handle(tx: TTx, env: EventEnvelope<E>): Promise<void>;
+
+  /**
+   * Optional. Clears this projection's read model for one tenant before a
+   * rebuild (`ProjectionDaemon.rebuild`). `tx` is scoped to that tenant, and
+   * the checkpoint is reset to 0 in the same transaction. Without it, a
+   * rebuild replays every event on top of the existing read model.
+   */
+  reset?(tx: TTx): Promise<void>;
 }

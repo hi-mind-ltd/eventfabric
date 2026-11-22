@@ -55,6 +55,16 @@ export class PgProjectionCheckpointStore implements ProjectionCheckpointStore<Pg
     return ins.rowCount ? this.mapRow(ins.rows[0]) : null;
   }
 
+  async reset(tx: PgTx, projectionName: string, tenantId: string): Promise<void> {
+    await tx.client.query(
+      `INSERT INTO ${this.tableName} (projection_name, tenant_id, last_global_position, updated_at)
+       VALUES ($1, $2, 0, now())
+       ON CONFLICT (projection_name, tenant_id)
+       DO UPDATE SET last_global_position = 0, updated_at = now()`,
+      [projectionName, tenantId]
+    );
+  }
+
   private mapRow(r: any): ProjectionCheckpoint {
     return {
       projectionName: r.projection_name,

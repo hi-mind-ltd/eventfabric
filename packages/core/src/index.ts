@@ -24,6 +24,8 @@ export * from './projections/async-processor-config';
 export * from './projections/async-projection-runner';
 export * from './projections/catch-up-projector';
 export * from './projections/high-water-mark';
+export * from './projections/projection-daemon';
+export * from './projections/projection-dead-letter-store';
 export * from './projections/inline-projector';
 
 // Projection builders / ergonomic helpers

@@ -372,34 +372,12 @@ describe("DLQ requeue", () => {
 // ---------------------------------------------------------------------------
 
 describe("multiple runners on one outbox", () => {
-  it("two runners with different projections each see every event", async () => {
-    const N = 20;
-    for (let i = 0; i < N; i++) await appendOne(`e${i}`);
-
-    const handledA: string[] = [];
-    const handledB: string[] = [];
-    const slow = () => delay(10);
-    // The docs recommend "run two separate runners" for mixed internal/external handlers.
-    const ra = startRunner([recordingProjection("read-model", handledA, slow)], {
-      workerId: "runner-a",
-      transactionMode: "perRow",
-      batchSize: 1
-    });
-    const rb = startRunner([recordingProjection("email", handledB, slow)], {
-      workerId: "runner-b",
-      transactionMode: "perRow",
-      batchSize: 1
-    });
-
-    await waitFor(async () => (await outboxCount()) === 0, 10000);
-    await delay(200);
-    await Promise.all([ra.stop(), rb.stop()]);
-
-    // BUG: whichever runner claims a row runs only its own projections and
-    // then deletes the row, so each projection sees only a subset.
-    expect(handledA).toHaveLength(N);
-    expect(handledB).toHaveLength(N);
-  }, 30000);
+  // "Two runners with different projections each see every event" moved to
+  // pg-projection-daemon.int.test.ts ("daemons running different projections
+  // each see every event"). Projections now run on the ProjectionDaemon, which
+  // keeps a checkpoint per projection. The outbox runner is for external
+  // delivery: each outbox row is delivered once, to whichever runner claims it,
+  // so runners with different handlers must split the outbox with claimTopic.
 
   it("two replicas of the same runner do not skip each other's in-flight events", async () => {
     for (let i = 1; i <= 10; i++) await appendOne(`e${i}`);

@@ -52,4 +52,10 @@ export interface ProjectionCheckpointStore<TTx extends Transaction = Transaction
    * re-entrant runs cannot roll the checkpoint backward.
    */
   set(tx: TTx, projectionName: string, tenantId: string, lastGlobalPosition: bigint): Promise<void>;
+
+  /**
+   * Move the checkpoint back to 0 (unlike `set`, which only moves forward).
+   * Used by `ProjectionDaemon.rebuild`. Optional: rebuilds need it.
+   */
+  reset?(tx: TTx, projectionName: string, tenantId: string): Promise<void>;
 }

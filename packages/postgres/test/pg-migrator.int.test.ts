@@ -37,6 +37,7 @@ describe("migrate() — fresh database", () => {
       "008_tenant_id",
       "009_per_tenant_projection_checkpoints",
       "015_event_hash_chain",
+      "016_projection_dead_letters",
     ]);
     expect(result.partitioned).toBe(false);
   });
@@ -151,6 +152,7 @@ describe("migrate() — partitioning from scratch", () => {
       "008_tenant_id",
       "009_per_tenant_projection_checkpoints",
       "015_event_hash_chain",
+      "016_projection_dead_letters",
       "007_partitioning",
     ]);
     expect(result.partitioned).toBe(true);
