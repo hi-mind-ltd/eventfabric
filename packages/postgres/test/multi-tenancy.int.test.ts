@@ -14,6 +14,7 @@ import {
 import type { PgTx } from "../src";
 import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { AggregateRoot, type HandlerMap, type CatchUpProjection, type AsyncProjection, sleep } from "@eventfabric/core";
+import { endPool } from "./helpers/end-pool";
 
 // ============================================================================
 // Test domain
@@ -52,7 +53,7 @@ beforeAll(async () => {
 }, 120000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

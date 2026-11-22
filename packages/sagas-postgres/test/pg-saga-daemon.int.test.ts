@@ -10,6 +10,7 @@ import {
 } from "@eventfabric/sagas";
 import { PgSagaStateStore, sagasMigrations } from "../src";
 import { PgEventStore, PgUnitOfWork, createProjectionDaemon, migrate, type PgTx } from "@eventfabric/postgres";
+import { endPool } from "./helpers/end-pool";
 
 // Sagas fed by the ProjectionDaemon: events arrive in global_position order,
 // never past the high water mark, so the saga's lastEventPos guard is sound.
@@ -48,7 +49,7 @@ beforeAll(async () => {
 }, 60000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

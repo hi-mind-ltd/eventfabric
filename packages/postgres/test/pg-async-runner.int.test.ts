@@ -6,6 +6,7 @@ import { PgEventStore } from "../src/pg-event-store";
 import { createAsyncProjectionRunner } from "../src/projections/pg-async-projection-runner";
 import { PgProjectionCheckpointStore } from "../src/projections/pg-projection-checkpoint-store";
 import { migrate } from "../src/pg-migrator";
+import { endPool } from "./helpers/end-pool";
 
 type E = { type: "X"; version: 1; id: string };
 
@@ -19,7 +20,7 @@ beforeAll(async () => {
 }, 60000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

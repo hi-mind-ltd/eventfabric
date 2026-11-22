@@ -4,6 +4,7 @@ import { Pool } from "pg";
 import type { FastifyInstance } from "fastify";
 import { buildInsuranceApp, runMigrations, type InsuranceApp } from "../src/build-app";
 import { ClaimSubmitted } from "../src/domain/claim.events";
+import { endPool } from "./helpers/end-pool";
 
 const ACME = "acme";
 const SECRET = "test-chain-secret";
@@ -29,7 +30,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (app) await app.close();
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

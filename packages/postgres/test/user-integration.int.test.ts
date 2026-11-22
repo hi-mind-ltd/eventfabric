@@ -8,6 +8,7 @@ import { PgSnapshotStore } from "../src/snapshots/pg-snapshot-store";
 import { createAsyncProjectionRunner } from "../src/projections/pg-async-projection-runner";
 import { migrate } from "../src/pg-migrator";
 import type { PgTx } from "../src/unitofwork/pg-transaction";
+import { endPool } from "./helpers/end-pool";
 
 // User Events - Define event metadata once
 const UserRegisteredEvent = defineEvent("UserRegistered", 1);
@@ -100,7 +101,7 @@ beforeAll(async () => {
 }, 60000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

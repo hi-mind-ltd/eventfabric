@@ -6,6 +6,7 @@ import { PgEventStore } from "../src/pg-event-store";
 import { SessionFactory } from "../src/session";
 import { migrate } from "../src/pg-migrator";
 import { AggregateRoot, type HandlerMap } from "@eventfabric/core";
+import { endPool } from "./helpers/end-pool";
 
 type E = { type: "A"; version: 1; n: number };
 const SECRET = "test-hmac-secret";
@@ -20,7 +21,7 @@ beforeAll(async () => {
 }, 120000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

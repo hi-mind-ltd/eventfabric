@@ -4,6 +4,7 @@ import { Pool } from "pg";
 import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgSnapshotStore, type Snapshot } from "../src/snapshots/pg-snapshot-store";
 import { migrate } from "../src/pg-migrator";
+import { endPool } from "./helpers/end-pool";
 
 type StateV1 = { count: number };
 type StateV2 = { count: number; label: string };
@@ -18,7 +19,7 @@ beforeAll(async () => {
 }, 60000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

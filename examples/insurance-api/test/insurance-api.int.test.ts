@@ -26,6 +26,7 @@ import { premiumAuditProjection } from "../src/projections/premium-audit";
 import { createClaimSettlementProjection } from "../src/projections/claim-settlement-projection";
 import { createCatchUpProjector, PgEventStore, type PgTx } from "@eventfabric/postgres";
 import { createCatchUpObserver } from "@eventfabric/opentelemetry";
+import { endPool } from "./helpers/end-pool";
 
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
 let pool: Pool;
@@ -71,7 +72,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (app) await app.close();
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 

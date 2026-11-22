@@ -20,6 +20,7 @@ import {
   migrate,
   type PgTx,
 } from "@eventfabric/postgres";
+import { endPool } from "./helpers/end-pool";
 
 const TodoCreatedEvent = defineEvent("TodoCreated", 1);
 const TodoCompletedEvent = defineEvent("TodoCompleted", 1);
@@ -74,7 +75,7 @@ beforeAll(async () => {
 }, 60000);
 
 afterAll(async () => {
-  if (pool) await pool.end();
+  if (pool) await endPool(pool);
   if (container) await container.stop();
 });
 
