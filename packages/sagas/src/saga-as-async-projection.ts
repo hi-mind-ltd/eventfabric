@@ -17,7 +17,18 @@ export interface SagaAsAsyncProjectionOptions {
 
 /**
  * Wraps a saga as an `AsyncProjection`, so it can run on the existing
- * outbox-based async projection runner with no new infrastructure. Each
+ * outbox-based async projection runner with no new infrastructure.
+ *
+ * **Prefer `sagaAsProjection` on the `ProjectionDaemon`.** The outbox runner
+ * does not deliver events in `global_position` order: rows are claimed in
+ * insertion order (not commit order), retries and released rows come back
+ * later, and runner replicas overtake each other. The saga skips any event
+ * at or below the instance's `lastEventPos`, so an event that arrives after
+ * a later one for the same instance is silently dropped, and a row requeued
+ * from the outbox DLQ is dropped too. This adapter is safe only when every
+ * instance's events are produced one at a time (each event caused by the
+ * previous one) and you never requeue saga rows. Wolverine documents the
+ * same limitation for its at-commit "event forwarding". Each
  * incoming event is correlated to a saga instance, the reaction is
  * computed, and the resulting commands / timers / state advance commit
  * inside the runner's transaction.

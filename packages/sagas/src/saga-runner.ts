@@ -28,6 +28,12 @@ export type SagaTransitionOutcome<TState> =
 interface ApplyOptions {
   readonly now?: () => Date;
   readonly observer?: SagaObserver;
+  /**
+   * The event is being re-run from a dead-letter store, out of order. Skip
+   * the `globalPosition <= lastEventPos` duplicate check: the instance has
+   * moved past this event because it failed, not because it was applied.
+   */
+  readonly replay?: boolean;
 }
 
 function safeEmit(fn: (() => void) | undefined): void {
@@ -48,6 +54,10 @@ function safeEmit(fn: (() => void) | undefined): void {
  *   2. Load the instance. Skip or seed-new based on `startsNewInstance`.
  *   3. Idempotency check — events with `globalPosition <= lastEventPos`
  *      are dropped. Timers don't have a position, so they always run.
+ *      This check is only sound when events reach the saga in position
+ *      order, which the ProjectionDaemon guarantees (`sagaAsProjection`)
+ *      and the outbox runner does not. Dead-letter replays (`replay`)
+ *      bypass it.
  *   4. Run the appropriate `react*` method.
  *   5. Persist new state (optimistic CAS), commands, timer changes, and
  *      `lastEventPos` advance — all in `tx`.
@@ -113,6 +123,7 @@ export async function applySagaTransition<
     }
 
     if (
+      !opts.replay &&
       instance.lastEventPos !== null &&
       delivery.envelope.globalPosition <= instance.lastEventPos
     ) {
@@ -250,8 +261,11 @@ export async function applySagaTransition<
     state: reaction.newState,
     stateVersion: instance.stateVersion + 1,
     status: reaction.end ? "completed" : instance.status,
+    // Never move backwards: a replayed (older) event must not rewind the
+    // position, or events between the two could be applied a second time.
     lastEventPos:
-      delivery.kind === "event"
+      delivery.kind === "event" &&
+      (instance.lastEventPos === null || delivery.envelope.globalPosition > instance.lastEventPos)
         ? delivery.envelope.globalPosition
         : instance.lastEventPos,
     updatedAt: now().toISOString(),

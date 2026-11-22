@@ -23,6 +23,12 @@ are in [`examples/banking-api`](../banking-api).
 
 ## How the saga path flows
 
+> **Note:** this example feeds the saga from the outbox runner
+> (`sagaAsAsyncProjection`). That path can drop an event that commits
+> after a later one for the same transfer. New code should use
+> `sagaAsProjection` on the projection daemon; see
+> [Sagas: `sagaAsAsyncProjection` limitations](../../docs/sagas.md#sagaasasyncprojection-outbox-runner--limitations).
+
 ```
 POST /transfers
   emits TransactionInitiated + TransactionStarted

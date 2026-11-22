@@ -355,6 +355,27 @@ describe("ProjectionDaemon", () => {
     expect(await d.replayDeadLetter(999)).toEqual({ replayed: false, reason: "Dead letter not found" });
   });
 
+  it("passes { replay: false } normally and { replay: true } when replaying a dead letter", async () => {
+    store.events = [ev(1)];
+    let broken = true;
+    const seen: Array<boolean | undefined> = [];
+    const projection: CatchUpProjection<E, MockTx> = {
+      name: "p",
+      async handle(_tx, _env, ctx) {
+        seen.push(ctx?.replay);
+        if (broken) throw new Error("down");
+      }
+    };
+    const d = daemon([projection], { maxAttempts: 1 });
+    for (let i = 0; i < 5 && dlq.items.length === 0; i++) {
+      await d.runOnce();
+      await tick();
+    }
+    broken = false;
+    await d.replayDeadLetter(dlq.items[0]!.id);
+    expect(seen).toEqual([false, true]);
+  });
+
   it("replayDeadLetter keeps the dead letter when the handler still fails", async () => {
     store.events = [ev(1)];
     const { projection } = recorder("p", () => { throw new Error("still down"); });

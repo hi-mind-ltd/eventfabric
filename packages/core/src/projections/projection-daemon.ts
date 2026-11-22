@@ -1,6 +1,6 @@
 import type { AnyEvent, EventEnvelope, Transaction, EventStore } from "../types";
 import type { ProjectionCheckpointStore } from "./projection-checkpoint-store";
-import type { CatchUpProjection } from "./catch-up-projection";
+import type { CatchUpProjection, ProjectionHandleContext } from "./catch-up-projection";
 import type { CatchUpProjectorObserver, CatchUpHandlerInfo } from "./catch-up-observer";
 import type { TenantScopedUnitOfWorkFactory } from "./catch-up-projector";
 import type { HighWaterMark } from "./high-water-mark";
@@ -200,7 +200,7 @@ export class ProjectionDaemon<E extends AnyEvent, TTx extends Transaction = Tran
     return this.uowFactory.forTenant(item.tenantId).withTransaction(async (tx) => {
       const [env] = await this.eventStore.loadByGlobalPositions(tx, [item.globalPosition]);
       if (!env) return { replayed: false, reason: `Event not found for globalPosition=${item.globalPosition}` };
-      await this.runHandler(projection, tx, env);
+      await this.runHandler(projection, tx, env, { replay: true });
       await this.deadLetters.delete(tx, id);
       return { replayed: true };
     });
@@ -338,7 +338,7 @@ export class ProjectionDaemon<E extends AnyEvent, TTx extends Transaction = Tran
           }
 
           try {
-            await this.runHandler(projection, tx, env);
+            await this.runHandler(projection, tx, env, { replay: false });
           } catch (err) {
             throw new HandlerFailure(env as EventEnvelope<AnyEvent>, toError(err));
           }
@@ -401,7 +401,12 @@ export class ProjectionDaemon<E extends AnyEvent, TTx extends Transaction = Tran
     }
   }
 
-  private async runHandler(projection: CatchUpProjection<E, TTx>, tx: TTx, env: EventEnvelope<E>): Promise<void> {
+  private async runHandler(
+    projection: CatchUpProjection<E, TTx>,
+    tx: TTx,
+    env: EventEnvelope<E>,
+    ctx: ProjectionHandleContext
+  ): Promise<void> {
     const info: CatchUpHandlerInfo = {
       projection: projection.name,
       eventType: env.payload.type,
@@ -410,9 +415,9 @@ export class ProjectionDaemon<E extends AnyEvent, TTx extends Transaction = Tran
     const start = Date.now();
     try {
       if (this.observer?.runHandler) {
-        await this.observer.runHandler(() => projection.handle(tx, env), info);
+        await this.observer.runHandler(() => projection.handle(tx, env, ctx), info);
       } else {
-        await projection.handle(tx, env);
+        await projection.handle(tx, env, ctx);
       }
       this.fireHook(this.observer?.onEventHandled, { ...info, durationMs: Date.now() - start });
     } catch (err) {

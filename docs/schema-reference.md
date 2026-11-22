@@ -650,7 +650,7 @@ eventfabric.saga_scheduled_messages
                                  │
                                  │   (events emitted by command handlers
                                  │    feed back into the saga via the
-                                 │    outbox runner → sagaAsAsyncProjection)
+                                 │    projection daemon → sagaAsProjection)
                                  ▼
                       eventfabric.events  ←  the source of truth
 ```
@@ -658,7 +658,7 @@ eventfabric.saga_scheduled_messages
 Notes:
 - The foreign key relationships between `outbox.global_position` and `events.global_position` are enforced **by application logic**, not by SQL `REFERENCES` constraints. This is intentional — it avoids lock contention on the events table during outbox operations.
 - The mediator and saga tables likewise have no SQL foreign keys to `events` (or to each other). The dispatcher → bus → handler → events flow is enforced by transactions, not constraints.
-- The saga's `last_event_pos` makes replay idempotent: events with `globalPosition <= last_event_pos` are silently skipped, so re-delivery from the outbox is a no-op.
+- The saga's `last_event_pos` makes redelivery idempotent: events with `globalPosition <= last_event_pos` are skipped. This relies on in-order delivery, which the projection daemon (`sagaAsProjection`) guarantees and the outbox runner does not: on the outbox path a late-committing event can be skipped wrongly. Dead-letter replays bypass the check, and `last_event_pos` never moves backwards.
 
 ## Related documentation
 

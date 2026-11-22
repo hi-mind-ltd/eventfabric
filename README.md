@@ -316,8 +316,8 @@ sequenceDiagram
     actor User
     participant API as Request handler
     participant DB as Postgres
-    participant Runner as AsyncProjectionRunner
-    participant Saga as FundsTransfer saga<br/>(sagaAsAsyncProjection)
+    participant Runner as ProjectionDaemon
+    participant Saga as FundsTransfer saga<br/>(sagaAsProjection)
     participant Disp as SagaCommandDispatcher
     participant Bus as CommandBus
     participant H as Command handler
@@ -327,7 +327,7 @@ sequenceDiagram
     API->>DB: INSERT events  (TransactionInitiated + TransactionStarted)<br/>INSERT outbox
     API-->>User: 202 Accepted
 
-    Runner->>DB: claim outbox
+    Runner->>DB: claim saga checkpoint, load events up to the high water mark
     Runner->>Saga: handle(tx, TransactionStarted)
     rect rgb(232, 244, 233)
     Note over Saga,DB: All under one transaction
@@ -344,7 +344,7 @@ sequenceDiagram
         Bus-->>Disp: result
         Disp->>DB: DELETE saga_pending_commands  (ack)
 
-        Runner->>DB: claim outbox  (next round)
+        Runner->>DB: claim saga checkpoint  (next round)
         Runner->>Saga: handle(tx, WithdrawalCompleted)
         rect rgb(232, 244, 233)
         Note over Saga,DB: Same transactional pattern
@@ -366,7 +366,9 @@ state row, CAS-locked on `state_version`), `saga_pending_commands`
 `saga_scheduled_messages` (the timer queue). Plus everything from
 steps 1, 2, and 3 — events, outbox, inline projections, command
 idempotency. The saga is **purely additive**: it doesn't replace the
-event store or the outbox runner; it composes with them.
+event store; it reads it through the projection daemon
+(`sagaAsProjection`), in `global_position` order, so an event that
+commits late is waited for rather than skipped.
 
 ### What sticks across all four
 

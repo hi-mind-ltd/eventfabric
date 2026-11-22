@@ -6,7 +6,7 @@ and terminates cleanly when its job is done.
 
 | Package | Contains |
 |---|---|
-| `@eventfabric/sagas` | `Saga<S, E>` interface, `applySagaTransition` runner, `sagaAsAsyncProjection` adapter, `SagaCommandDispatcher`, `SagaTimerScheduler`, in-memory stores, vendor-neutral observer hooks. Sagas emit commands via `@eventfabric/mediator`. |
+| `@eventfabric/sagas` | `Saga<S, E>` interface, `applySagaTransition` runner, `sagaAsProjection` (projection daemon) and `sagaAsAsyncProjection` (outbox) adapters, `SagaCommandDispatcher`, `SagaTimerScheduler`, in-memory stores, vendor-neutral observer hooks. Sagas emit commands via `@eventfabric/mediator`. |
 | `@eventfabric/sagas-postgres` | `PgSagaStateStore`, `PgSagaCommandQueue`, `PgSagaTimerStore`, stuck-claimed watchdogs on all three, `sagasMigrations` (migrations 011-013). |
 | `@eventfabric/sagas-opentelemetry` | `createSagaObserver` (tracing + counters + duration histograms for instance lifecycle / command dispatch / timer fire), `createSagaQueueGauges` (observable gauges for queue lag and the overdue-timer alert). |
 
@@ -210,9 +210,10 @@ import { PgIdempotencyStore } from "@eventfabric/mediator-postgres";
 import {
   SagaCommandDispatcher,
   SagaTimerScheduler,
-  sagaAsAsyncProjection,
+  sagaAsProjection,
   type SagaTimerHandler,
 } from "@eventfabric/sagas";
+import { createProjectionDaemon } from "@eventfabric/postgres";
 import {
   PgSagaStateStore,
   PgSagaCommandQueue,
@@ -243,11 +244,13 @@ const sagaStores = {
   timerStore: sagaTimerStore,
 };
 
-// 3. Saga as an async projection — events flow in via the existing
-//    outbox/async-runner path, no new event-delivery infrastructure.
-const sagaProjection = sagaAsAsyncProjection(fundsTransferSaga, sagaStores);
-// Pass `sagaProjection` to your AsyncProjectionRunner alongside other
-// projections (email notifications, etc.).
+// 3. Feed the saga from the projection daemon: events arrive in
+//    global_position order, never past the high water mark.
+const daemon = createProjectionDaemon(pool, eventStore, [
+  sagaAsProjection(fundsTransferSaga, sagaStores),
+  // ...other projections
+]);
+daemon.start(abortController.signal).catch((err) => console.error("daemon:", err));
 
 // 4. Two long-lived workers: command dispatcher + timer scheduler.
 const dispatcher = new SagaCommandDispatcher(uow, sagaCommandQueue, bus);
@@ -263,21 +266,60 @@ scheduler.start().catch((err) => console.error("scheduler:", err));
 await migrate(pool, { extensions: [commandsMigrations, sagasMigrations] });
 ```
 
-### `sagaAsAsyncProjection` — the easy path
+### `sagaAsProjection` — feeding events to a saga
 
-Most sagas should run as **async projections on the existing outbox
-runner**. The adapter `sagaAsAsyncProjection(saga, stores)` returns an
-`AsyncProjection` that:
+Run sagas on the [Projection Daemon](./projections/projection-daemon.md).
+`sagaAsProjection(saga, stores)` returns a `CatchUpProjection` that:
 
-- Sees every event the outbox runner claims
+- Sees each tenant's events in `global_position` order, never past the
+  high water mark, so an event whose transaction commits late is waited
+  for, not skipped
 - Calls `correlate()` and skips events with no instance
-- Applies the reaction inside the runner's transaction
-- Surfaces a `ConcurrencyError` if the state CAS misses — the runner
-  releases the message and retries on the next round
+- Applies the reaction (state, commands, timers, `lastEventPos`) inside
+  the daemon's batch transaction, together with the checkpoint
+- Throws a `ConcurrencyError` if the state CAS misses (e.g. a timer fired
+  at the same moment); the daemon retries the event with backoff
+- Gets dead-lettered by the daemon after `maxAttempts`;
+  `daemon.replayDeadLetter(id)` re-applies the event against the
+  instance's current state, out of order
 
-This means **all the existing async-projection infrastructure** —
-outbox, checkpointing, retries, dead-lettering, observability — works
-for sagas with zero additional plumbing.
+Several daemon instances can run side by side: each tenant's batches are
+claimed by one instance at a time, so a saga instance never sees two
+events concurrently from the daemon.
+
+Don't `rebuild` a saga projection: replaying the log would re-run
+reactions.
+
+#### Duplicate protection: `lastEventPos`
+
+Each instance stores `lastEventPos`, the highest `global_position` it has
+applied, and skips events at or below it. That check is only correct
+when events arrive in position order, which the daemon guarantees.
+Dead-letter replays bypass it (`ProjectionHandleContext.replay`), and
+`lastEventPos` never moves backwards.
+
+### `sagaAsAsyncProjection` (outbox runner) — limitations
+
+`sagaAsAsyncProjection(saga, stores)` runs a saga on the outbox
+`AsyncProjectionRunner`. **It can lose events.** The outbox does not
+deliver in `global_position` order:
+
+- rows are claimed in insertion order, not commit order, so an event
+  whose transaction commits late arrives after later events;
+- released and retried rows come back after rows behind them;
+- runner replicas overtake each other.
+
+When a later event for an instance is applied first, `lastEventPos` moves
+past the earlier one, and the earlier one is then skipped as "already
+applied". The saga never sees it. A saga row requeued from the outbox DLQ
+is skipped the same way.
+
+It is only safe when each instance's events are produced strictly one
+after another (each caused by the previous step), with a single runner,
+and you never requeue saga rows. Wolverine documents the same limitation
+for its at-commit "event forwarding" ("There is no guarantee about
+ordering in this case") and recommends its daemon-based event
+subscriptions instead. Prefer `sagaAsProjection`.
 
 ## Workers
 
@@ -474,9 +516,9 @@ same-keyed saga instances in different tenants are independent:
   `tenant_id`
 - `applySagaTransition(saga, delivery, { tx, tenantId }, stores)`
   requires `tenantId` on its context
-- `sagaAsAsyncProjection` reads `tenantId` from the event envelope
-  (`env.tenantId`) — the outbox runner narrows its batch per tenant
-  before calling the projection's `handle`, so this is automatic
+- `sagaAsProjection` / `sagaAsAsyncProjection` read `tenantId` from the
+  event envelope (`env.tenantId`); the daemon processes one tenant per
+  batch transaction, so this is automatic
 
 For workers that serve **many tenants from one process** (the typical
 dispatcher and scheduler setup), the framework narrows the UoW per
@@ -552,7 +594,7 @@ const sagaObserver = createSagaObserver({
 });
 
 // Thread the observer into all three workers.
-const projection = sagaAsAsyncProjection(saga, stores, { observer: sagaObserver });
+const projection = sagaAsProjection(saga, stores, { observer: sagaObserver });
 const dispatcher = new SagaCommandDispatcher(uow, queue, bus, { observer: sagaObserver });
 const scheduler = new SagaTimerScheduler(uow, timerStore, handlers, { observer: sagaObserver });
 ```
