@@ -1,5 +1,12 @@
 # @eventfabric/sagas-opentelemetry
 
+## 0.4.0
+
+### Patch Changes
+
+- Updated dependencies [015b888]
+  - @eventfabric/sagas@0.4.0
+
 ## 0.3.0
 
 ### Patch Changes
