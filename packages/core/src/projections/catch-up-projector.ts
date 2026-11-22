@@ -150,7 +150,11 @@ export class CatchUpProjector<E extends AnyEvent, TTx extends Transaction = Tran
         fromGlobalPositionExclusive: cp.lastGlobalPosition,
         toGlobalPositionInclusive: upTo,
         limit: batchSize,
-        includeDismissed,
+        // Always load dismissed events and skip them below. Stores may filter
+        // dismissed rows after applying the LIMIT, so a batch made entirely of
+        // dismissed events would come back empty and look "caught up",
+        // leaving the checkpoint stuck in front of them.
+        includeDismissed: true,
         tenantId
       });
 

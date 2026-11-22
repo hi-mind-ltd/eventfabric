@@ -185,6 +185,40 @@ describe("PgCatchUpProjector", () => {
     expect(handled[0]!.payload.n).toBe(2);
   });
 
+  it("moves past a full batch of dismissed events", async () => {
+    const uow = new PgUnitOfWork(pool);
+    const eventStore = new PgEventStore<E>();
+    const projector = createCatchUpProjector<E>(pool, eventStore);
+
+    const ids: string[] = [];
+    for (const n of [1, 2, 3]) {
+      const r = await uow.withTransaction((tx) =>
+        eventStore.append(tx, {
+          aggregateName: "User",
+          aggregateId: `dismiss-run-${n}`,
+          expectedAggregateVersion: 0,
+          events: [{ type: "A", version: 1, n }]
+        })
+      );
+      ids.push(r.appended[0]!.eventId);
+    }
+    // The first two events fill a whole batch (batchSize 2) and are dismissed.
+    await uow.withTransaction(async (tx) => {
+      await eventStore.dismiss(tx, ids[0]!);
+      await eventStore.dismiss(tx, ids[1]!);
+    });
+
+    const handled: number[] = [];
+    await projector.catchUpProjection(
+      { name: "dismissed-run", async handle(_tx: any, env: any) { handled.push(env.payload.n); } },
+      { batchSize: 2 }
+    );
+
+    // Previously the dismissed events were filtered after LIMIT, the batch
+    // came back empty, and the projector stopped in front of them for good.
+    expect(handled).toEqual([3]);
+  });
+
   it("includes dismissed events when includeDismissed is true", async () => {
     const uow = new PgUnitOfWork(pool);
     const eventStore = new PgEventStore<E>();
