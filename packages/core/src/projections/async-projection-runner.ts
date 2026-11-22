@@ -16,9 +16,19 @@ export type AsyncRunnerOptions = {
   maxAttempts?: number;
   transactionMode?: "batch" | "perRow";
   backoff?: BackoffOptions;
+  /**
+   * How long a claimed outbox row stays locked before another worker may
+   * reclaim it, in milliseconds. Recovers rows held by a worker that crashed
+   * (or lost its connection) after claiming. Must comfortably exceed the
+   * worst-case time to process one claimed batch, otherwise a slow-but-alive
+   * worker's rows can be reclaimed and processed twice. Default: 300000 (5 min).
+   */
+  leaseMs?: number;
   /** Optional observability hooks. See AsyncRunnerObserver for details. */
   observer?: AsyncRunnerObserver;
 };
+
+const DEFAULT_LEASE_MS = 5 * 60 * 1000;
 
 function toError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
@@ -101,6 +111,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
     const maxAttempts = this.opts.maxAttempts ?? 10;
     const txMode = this.opts.transactionMode ?? "batch";
     const backoff = this.opts.backoff ?? { minMs: 250, maxMs: 15000, factor: 2, jitter: 0.2 };
+    const leaseMs = this.opts.leaseMs ?? DEFAULT_LEASE_MS;
     const observer = this.opts.observer;
 
     let attempt = 0;
@@ -111,7 +122,8 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
           return this.outbox.claimBatch(tx, {
             batchSize,
             workerId: this.opts.workerId,
-            topic: this.opts.claimTopic ?? null
+            topic: this.opts.claimTopic ?? null,
+            leaseMs
           });
         });
 
@@ -130,9 +142,19 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
         if (txMode === "batch") {
           await this.processBatch(claimed, includeDismissed, maxAttempts);
         } else {
-          for (const row of claimed) {
-            if (signal.aborted) break;
-            await this.processOne(row, includeDismissed, maxAttempts);
+          // Count rows whose processing was started; processOne acks,
+          // dead-letters or releases those itself. Anything after that point
+          // (abort, or a failure that ends the loop) must be handed back, or
+          // it stays locked until the lease expires.
+          let started = 0;
+          try {
+            for (const row of claimed) {
+              if (signal.aborted) break;
+              started++;
+              await this.processOne(row, includeDismissed, maxAttempts);
+            }
+          } finally {
+            await this.releaseUnattempted(claimed.slice(started));
           }
         }
 
@@ -145,6 +167,19 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
         attempt++;
         await sleep(computeBackoffMs(attempt, backoff), signal);
       }
+    }
+  }
+
+  /**
+   * Hand back claimed rows that were never attempted. Best-effort: if this
+   * fails too, the rows are recovered once their lease expires.
+   */
+  private async releaseUnattempted(rows: OutboxRow[]): Promise<void> {
+    if (rows.length === 0) return;
+    try {
+      await this.uow.withTransaction((tx) => this.outbox.release(tx, rows.map(r => r.id)));
+    } catch {
+      // Swallow: must not mask the error that ended the batch.
     }
   }
 
@@ -173,6 +208,21 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
         const envs = await this.eventStore.loadByGlobalPositions(tx, remaining.map(r => r.globalPosition));
         const rowByPos = new Map<string, OutboxRow>();
         for (const r of remaining) rowByPos.set(r.globalPosition.toString(), r);
+
+        // Rows whose event no longer exists can never succeed. Dead-letter
+        // them (as perRow mode does) instead of leaving them locked.
+        const loaded = new Set(envs.map(e => e.globalPosition.toString()));
+        for (const row of remaining) {
+          if (loaded.has(row.globalPosition.toString())) continue;
+          const reason = `Event not found for globalPosition=${row.globalPosition.toString()}`;
+          await this.outbox.deadLetter(tx, row, reason);
+          this.fireHook(observer?.onMessageDeadLettered, {
+            workerId: this.opts.workerId,
+            outboxId: row.id,
+            reason,
+            attempts: row.attempts
+          });
+        }
 
         // Process each event
         for (const env of envs) {

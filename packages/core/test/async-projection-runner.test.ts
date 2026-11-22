@@ -53,7 +53,14 @@ class MockOutboxStore implements OutboxStore<MockTx> {
   released: Array<{ id: OutboxRow["id"]; error: string }> = [];
   deadLettered: Array<{ row: OutboxRow; reason: string }> = [];
 
-  async claimBatch(_tx: MockTx, _opts: { batchSize: number; workerId: string; topic?: string | null }): Promise<OutboxRow[]> {
+  claimOpts: Array<{ batchSize: number; workerId: string; topic?: string | null; leaseMs?: number }> = [];
+  unattemptedReleased: Array<OutboxRow["id"]> = [];
+
+  async claimBatch(
+    _tx: MockTx,
+    opts: { batchSize: number; workerId: string; topic?: string | null; leaseMs?: number }
+  ): Promise<OutboxRow[]> {
+    this.claimOpts.push(opts);
     return this.claimed;
   }
   async ack(_tx: MockTx, id: OutboxRow["id"]): Promise<void> {
@@ -61,6 +68,9 @@ class MockOutboxStore implements OutboxStore<MockTx> {
   }
   async releaseWithError(_tx: MockTx, id: OutboxRow["id"], error: string): Promise<void> {
     this.released.push({ id, error });
+  }
+  async release(_tx: MockTx, ids: OutboxRow["id"][]): Promise<void> {
+    this.unattemptedReleased.push(...ids);
   }
   async deadLetter(_tx: MockTx, row: OutboxRow, reason: string): Promise<void> {
     this.deadLettered.push({ row, reason });
@@ -294,9 +304,20 @@ describe("AsyncProjectionRunner", () => {
       
       const row1: OutboxRow = { id: 1, globalPosition: 1n, topic: "test", attempts: 5 };
       const row2: OutboxRow = { id: 2, globalPosition: 2n, topic: "test", attempts: 11 }; // Exceeds maxAttempts=10
-      
+      eventStore.events.set("1", {
+        eventId: "evt-1",
+        globalPosition: 1n,
+        payload: { type: "TestEvent", version: 1, value: "event1" },
+        tenantId: "default",
+        aggregateName: "A",
+        aggregateId: "1",
+        aggregateVersion: 1,
+        occurredAt: new Date().toISOString()
+      });
+
       await (runner as any).processBatch([row1, row2], false, 10);
-      
+
+      expect(outbox.acked).toEqual([1]);
       expect(outbox.deadLettered).toHaveLength(1);
       expect(outbox.deadLettered[0]!.row.id).toBe(2);
       expect(outbox.deadLettered[0]!.reason).toContain("maxAttempts=10");
@@ -426,6 +447,122 @@ describe("AsyncProjectionRunner", () => {
       await expect((runner as any).processOne(row, false, 10)).rejects.toThrow("Failed");
       expect(outbox.released).toHaveLength(1);
       expect(outbox.released[0]!.id).toBe(1);
+    });
+  });
+
+  describe("claimed-row recovery", () => {
+    function addEvent(pos: number) {
+      eventStore.events.set(String(pos), {
+        eventId: `evt-${pos}`,
+        globalPosition: BigInt(pos),
+        payload: { type: "TestEvent", version: 1, value: `event${pos}` },
+        tenantId: "default",
+        aggregateName: "A",
+        aggregateId: String(pos),
+        aggregateVersion: 1,
+        occurredAt: new Date().toISOString()
+      });
+    }
+
+    /** Make claimBatch hand out `rows` once, then nothing; abort on the second claim. */
+    function claimOnce(rows: OutboxRow[], ac: AbortController) {
+      let calls = 0;
+      outbox.claimBatch = async (_tx, opts) => {
+        outbox.claimOpts.push(opts);
+        calls++;
+        if (calls === 1) return rows;
+        ac.abort();
+        return [];
+      };
+    }
+
+    /** start() rejects with AbortError when aborted mid-sleep; that is a normal stop. */
+    async function runUntilStopped(ac: AbortController) {
+      await runner.start(ac.signal).catch((e) => {
+        if (e?.name !== "AbortError") throw e;
+      });
+    }
+
+    const rows = (): OutboxRow[] => [
+      { id: 1, globalPosition: 1n, topic: null, attempts: 1 },
+      { id: 2, globalPosition: 2n, topic: null, attempts: 1 },
+      { id: 3, globalPosition: 3n, topic: null, attempts: 1 }
+    ];
+
+    it("passes the default lease to claimBatch", async () => {
+      const ac = new AbortController();
+      claimOnce([], ac);
+      runner = createRunner([{ name: "p", async handle() {} }]);
+      await runUntilStopped(ac);
+      expect(outbox.claimOpts[0]!.leaseMs).toBe(300_000);
+    });
+
+    it("passes a custom lease to claimBatch", async () => {
+      const ac = new AbortController();
+      claimOnce([], ac);
+      runner = createRunner([{ name: "p", async handle() {} }], { leaseMs: 1234 });
+      await runUntilStopped(ac);
+      expect(outbox.claimOpts[0]!.leaseMs).toBe(1234);
+    });
+
+    it("perRow: a failing row releases the unattempted rows after it", async () => {
+      [1, 2, 3].forEach(addEvent);
+      const ac = new AbortController();
+      claimOnce(rows(), ac);
+      runner = createRunner(
+        [{ name: "p", async handle(_tx, env) { if (env.globalPosition === 1n) throw new Error("boom"); } }],
+        { transactionMode: "perRow", backoff: { minMs: 1, maxMs: 1, factor: 1, jitter: 0 } }
+      );
+      await runUntilStopped(ac);
+
+      expect(outbox.released.map((r) => r.id)).toEqual([1]);
+      expect(outbox.unattemptedReleased).toEqual([2, 3]);
+      expect(outbox.acked).toEqual([]);
+    });
+
+    it("perRow: aborting mid-batch releases the unattempted rows", async () => {
+      [1, 2, 3].forEach(addEvent);
+      const ac = new AbortController();
+      claimOnce(rows(), ac);
+      runner = createRunner(
+        [{ name: "p", async handle(_tx, env) { if (env.globalPosition === 1n) ac.abort(); } }],
+        { transactionMode: "perRow" }
+      );
+      await runUntilStopped(ac);
+
+      expect(outbox.acked).toEqual([1]);
+      expect(outbox.unattemptedReleased).toEqual([2, 3]);
+    });
+
+    it("perRow: a fully processed batch releases nothing", async () => {
+      [1, 2, 3].forEach(addEvent);
+      const ac = new AbortController();
+      claimOnce(rows(), ac);
+      runner = createRunner([{ name: "p", async handle() {} }], { transactionMode: "perRow" });
+      await runUntilStopped(ac);
+
+      expect(outbox.acked).toEqual([1, 2, 3]);
+      expect(outbox.unattemptedReleased).toEqual([]);
+    });
+
+    it("batch: dead-letters rows whose event cannot be loaded", async () => {
+      addEvent(1);
+      const handled: bigint[] = [];
+      runner = createRunner([{ name: "p", async handle(_tx, env) { handled.push(env.globalPosition); } }]);
+      await (runner as any).processBatch(
+        [
+          { id: 1, globalPosition: 1n, topic: null, attempts: 1 },
+          { id: 2, globalPosition: 99n, topic: null, attempts: 1 }
+        ],
+        false,
+        10
+      );
+
+      expect(handled).toEqual([1n]);
+      expect(outbox.acked).toEqual([1]);
+      expect(outbox.deadLettered).toHaveLength(1);
+      expect(outbox.deadLettered[0]!.row.id).toBe(2);
+      expect(outbox.deadLettered[0]!.reason).toBe("Event not found for globalPosition=99");
     });
   });
 

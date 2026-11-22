@@ -199,6 +199,88 @@ describe("PgOutboxStore", () => {
     });
   });
 
+  describe("claimBatch lease", () => {
+    it("does not reclaim a row locked within the lease", async () => {
+      const uow = new PgUnitOfWork(pool);
+      const store = new PgOutboxStore();
+      await pool.query(`
+        INSERT INTO eventfabric.outbox (global_position, topic, locked_at, locked_by, attempts)
+        VALUES (100, 'user', now() - interval '10 seconds', 'worker-1', 1)
+      `);
+
+      const claimed = await uow.withTransaction((tx) =>
+        store.claimBatch(tx, { batchSize: 10, workerId: "worker-2", leaseMs: 60_000 })
+      );
+      expect(claimed).toHaveLength(0);
+    });
+
+    it("reclaims a row whose lock is older than the lease", async () => {
+      const uow = new PgUnitOfWork(pool);
+      const store = new PgOutboxStore();
+      await pool.query(`
+        INSERT INTO eventfabric.outbox (global_position, topic, locked_at, locked_by, attempts)
+        VALUES (100, 'user', now() - interval '2 minutes', 'dead-worker', 1)
+      `);
+
+      const claimed = await uow.withTransaction((tx) =>
+        store.claimBatch(tx, { batchSize: 10, workerId: "worker-2", leaseMs: 60_000 })
+      );
+      expect(claimed).toHaveLength(1);
+      expect(claimed[0]!.attempts).toBe(2);
+
+      const row = await pool.query(`SELECT locked_by FROM eventfabric.outbox`);
+      expect(row.rows[0].locked_by).toBe("worker-2");
+    });
+
+    it("never reclaims locked rows when no lease is given", async () => {
+      const uow = new PgUnitOfWork(pool);
+      const store = new PgOutboxStore();
+      await pool.query(`
+        INSERT INTO eventfabric.outbox (global_position, topic, locked_at, locked_by)
+        VALUES (100, 'user', now() - interval '1 day', 'dead-worker')
+      `);
+
+      const claimed = await uow.withTransaction((tx) =>
+        store.claimBatch(tx, { batchSize: 10, workerId: "worker-2" })
+      );
+      expect(claimed).toHaveLength(0);
+    });
+  });
+
+  describe("release", () => {
+    it("unlocks rows and undoes the claim's attempts increment, keeping last_error", async () => {
+      const uow = new PgUnitOfWork(pool);
+      const store = new PgOutboxStore();
+      await pool.query(`
+        INSERT INTO eventfabric.outbox (global_position, topic, attempts, last_error)
+        VALUES (100, 'user', 2, 'earlier failure'), (200, 'user', 0, NULL), (300, 'user', 0, NULL)
+      `);
+
+      const claimed = await uow.withTransaction((tx) =>
+        store.claimBatch(tx, { batchSize: 2, workerId: "worker-1" })
+      );
+      expect(claimed).toHaveLength(2);
+
+      await uow.withTransaction((tx) => store.release(tx, claimed.map((r) => r.id)));
+
+      const rows = await pool.query(
+        `SELECT global_position, attempts, locked_at, locked_by, last_error
+         FROM eventfabric.outbox ORDER BY global_position`
+      );
+      expect(rows.rows.map((r) => [Number(r.global_position), r.attempts, r.locked_at, r.locked_by, r.last_error])).toEqual([
+        [100, 2, null, null, "earlier failure"],
+        [200, 0, null, null, null],
+        [300, 0, null, null, null]
+      ]);
+    });
+
+    it("is a no-op for an empty id list", async () => {
+      const uow = new PgUnitOfWork(pool);
+      const store = new PgOutboxStore();
+      await uow.withTransaction((tx) => store.release(tx, []));
+    });
+  });
+
   describe("ack", () => {
     it("deletes message from outbox", async () => {
       const uow = new PgUnitOfWork(pool);

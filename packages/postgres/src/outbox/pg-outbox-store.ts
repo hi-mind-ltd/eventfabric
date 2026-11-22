@@ -31,15 +31,23 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
     private readonly dlqTable: string = "eventfabric.outbox_dead_letters"
   ) {}
 
-  async claimBatch(tx: PgTx, opts: { batchSize: number; workerId: string; topic?: string | null }): Promise<OutboxRow[]> {
-    const { batchSize, workerId, topic } = opts;
+  async claimBatch(
+    tx: PgTx,
+    opts: { batchSize: number; workerId: string; topic?: string | null; leaseMs?: number }
+  ): Promise<OutboxRow[]> {
+    const { batchSize, workerId, topic, leaseMs } = opts;
 
+    // A row is claimable when unlocked, or (with a lease) when its lock is
+    // older than the lease — i.e. its worker died after claiming it.
     const res = await tx.client.query(
       `WITH cte AS (
          SELECT id
          FROM ${this.outboxTable}
          WHERE dead_lettered_at IS NULL
-           AND locked_at IS NULL
+           AND (
+             locked_at IS NULL
+             OR ($4::bigint IS NOT NULL AND locked_at < now() - $4::bigint * interval '1 millisecond')
+           )
            AND ($3::text IS NULL OR topic = $3)
          ORDER BY id ASC
          FOR UPDATE SKIP LOCKED
@@ -52,7 +60,7 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
        FROM cte
        WHERE o.id = cte.id
        RETURNING o.id, o.global_position, o.topic, o.attempts`,
-      [batchSize, workerId, topic ?? null]
+      [batchSize, workerId, topic ?? null, leaseMs ?? null]
     );
 
     return res.rows.map((r: unknown) => {
@@ -76,6 +84,16 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
        SET locked_at = NULL, locked_by = NULL, last_error = $2
        WHERE id = $1`,
       [id, error]
+    );
+  }
+
+  async release(tx: PgTx, ids: OutboxRow["id"][]): Promise<void> {
+    if (ids.length === 0) return;
+    await tx.client.query(
+      `UPDATE ${this.outboxTable}
+       SET locked_at = NULL, locked_by = NULL, attempts = GREATEST(attempts - 1, 0)
+       WHERE id = ANY($1::bigint[])`,
+      [ids.map(String)]
     );
   }
 

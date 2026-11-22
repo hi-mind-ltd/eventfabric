@@ -77,6 +77,7 @@ class MockOutbox implements OutboxStore<MockTx> {
   async releaseWithError(_tx: MockTx, id: OutboxRow["id"], error: string): Promise<void> {
     this.released.push({ id, error });
   }
+  async release(): Promise<void> {}
   async deadLetter(_tx: MockTx, row: OutboxRow, reason: string): Promise<void> {
     this.deadLettered.push({ row, reason });
   }

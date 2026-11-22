@@ -54,7 +54,10 @@ WITH cte AS (
   SELECT id
   FROM eventfabric.outbox
   WHERE dead_lettered_at IS NULL
-    AND locked_at IS NULL
+    AND (
+      locked_at IS NULL
+      OR ($4::bigint IS NOT NULL AND locked_at < now() - $4::bigint * interval '1 millisecond')
+    )
     AND ($3::text IS NULL OR topic = $3)
   ORDER BY id ASC
   FOR UPDATE SKIP LOCKED
@@ -74,6 +77,7 @@ Key properties of this query:
 - **`FOR UPDATE SKIP LOCKED`**: Non-blocking concurrent access. If another worker already locked a row, this worker skips it instead of waiting. Multiple workers can poll simultaneously without deadlocks.
 - **Atomic lock + increment**: The `UPDATE` sets `locked_at`, `locked_by`, and increments `attempts` in one statement.
 - **Topic filter**: The optional `$3` parameter filters by topic, allowing workers to specialize.
+- **Lease**: `$4` is the runner's `leaseMs`. A row whose lock is older than the lease is treated as abandoned (its worker crashed or lost its connection after claiming) and can be claimed again. Choose a lease well above the worst-case time to process one batch; otherwise a slow-but-alive worker's rows can be reclaimed and processed twice.
 - **Ordered**: Rows are claimed in insertion order (`ORDER BY id ASC`).
 
 ### 3. Process + Ack/Release
@@ -102,11 +106,14 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
     batchSize: number;
     workerId: string;
     topic?: string | null;
+    leaseMs?: number;
   }): Promise<OutboxRow[]>;
 
   ack(tx: PgTx, id: OutboxRow["id"]): Promise<void>;
 
   releaseWithError(tx: PgTx, id: OutboxRow["id"], error: string): Promise<void>;
+
+  release(tx: PgTx, ids: OutboxRow["id"][]): Promise<void>;
 
   deadLetter(tx: PgTx, row: OutboxRow, reason: string): Promise<void>;
 }
@@ -114,9 +121,10 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
 
 | Method | Description |
 |--------|-------------|
-| `claimBatch` | Locks up to `batchSize` rows for this worker. Returns `OutboxRow[]` with `id`, `globalPosition`, `topic`, and `attempts`. |
+| `claimBatch` | Locks up to `batchSize` rows for this worker. Returns `OutboxRow[]` with `id`, `globalPosition`, `topic`, and `attempts`. With `leaseMs`, also reclaims rows whose lock is older than the lease; without it, locked rows are never reclaimed. |
 | `ack` | Deletes the row from the outbox. Called after successful processing. |
 | `releaseWithError` | Clears `locked_at` and `locked_by`, stores the error in `last_error`. The row becomes claimable again on the next poll. |
+| `release` | Unlocks claimed rows that were never attempted and undoes the claim's `attempts` increment. `last_error` is left as is. |
 | `deadLetter` | Copies the row to the DLQ table, then deletes it from the active outbox. |
 
 ### OutboxRow

@@ -72,6 +72,7 @@ export type AsyncRunnerOptions = {
   maxAttempts?: number;
   transactionMode?: "batch" | "perRow";
   backoff?: BackoffOptions;
+  leaseMs?: number;
   observer?: AsyncRunnerObserver;
 };
 ```
@@ -86,6 +87,7 @@ export type AsyncRunnerOptions = {
 | `maxAttempts` | 10 | After this many failed attempts, the message is dead-lettered. |
 | `transactionMode` | `"batch"` | How to group processing into transactions. See below. |
 | `backoff` | `{ minMs: 250, maxMs: 15000, factor: 2, jitter: 0.2 }` | Exponential backoff between runner-level retries after unrecoverable errors. |
+| `leaseMs` | 300000 (5 min) | How long a claimed row stays locked before another worker may reclaim it. Recovers rows held by a crashed worker. Must exceed the worst-case time to process one batch. |
 | `observer` | `undefined` | Hooks for tracing and metrics. See [Observability](../observability.md). |
 
 ## Transaction modes
@@ -201,7 +203,10 @@ WITH cte AS (
   SELECT id
   FROM eventfabric.outbox
   WHERE dead_lettered_at IS NULL
-    AND locked_at IS NULL
+    AND (
+      locked_at IS NULL
+      OR ($4::bigint IS NOT NULL AND locked_at < now() - $4::bigint * interval '1 millisecond')
+    )
     AND ($3::text IS NULL OR topic = $3)
   ORDER BY id ASC
   FOR UPDATE SKIP LOCKED
@@ -220,6 +225,7 @@ Key properties:
 
 - **Non-blocking.** `SKIP LOCKED` skips rows already locked by another worker. Multiple runners can poll concurrently without deadlocks.
 - **Atomic lock + increment.** The `UPDATE` sets `locked_at`, `locked_by`, and increments `attempts` in one statement.
+- **Lease.** `$4` is the runner's `leaseMs`. A row whose lock is older than the lease is treated as abandoned (its worker crashed or lost its connection after claiming) and can be claimed again. Choose a lease well above the worst-case time to process one batch; otherwise a slow-but-alive worker's rows can be reclaimed and processed twice.
 - **Ordered.** Rows are claimed in `id` order, preserving insertion order within a topic.
 
 ## Ack, release, and dead-letter
@@ -230,6 +236,8 @@ After processing, each outbox row follows one of three paths:
 |---------|--------|--------|
 | **Success** | `ack(tx, id)` | Deletes the row from the outbox. |
 | **Failure (retryable)** | `releaseWithError(tx, id, error)` | Clears `locked_at` and `locked_by`, stores the error in `last_error`. The row becomes claimable again. |
+| **Not attempted** (runner stopped, or an earlier row in a `perRow` batch failed) | `release(tx, ids)` | Clears the lock and undoes the claim's `attempts` increment, so the row is claimable again without counting towards `maxAttempts`. |
+| **Event missing** (no event at the row's `global_position`) | `deadLetter(tx, row, reason)` | Dead-lettered with reason `Event not found for globalPosition=…`, in both transaction modes. |
 | **Failure (exceeded max attempts)** | `deadLetter(tx, row, reason)` | Copies the row to `eventfabric.outbox_dead_letters`, then deletes it from the active outbox. |
 
 The dead-letter check happens at claim time: if `row.attempts > maxAttempts`, the runner dead-letters the message immediately instead of attempting to process it again.
