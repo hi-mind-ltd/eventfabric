@@ -29,7 +29,6 @@ import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore } from "../src/pg-event-store";
 import { createAsyncProjectionRunner } from "../src/projections/pg-async-projection-runner";
 import { createCatchUpProjector } from "../src/projections/pg-catch-up-projector";
-import { PgProjectionCheckpointStore } from "../src/projections/pg-projection-checkpoint-store";
 import { PgOutboxStore } from "../src/outbox/pg-outbox-store";
 import { PgDlqService } from "../src/outbox/pg-dlq-service";
 import { migrate } from "../src/pg-migrator";
@@ -401,10 +400,6 @@ describe("multiple runners on one outbox", () => {
 
   it("two replicas of the same runner do not skip each other's in-flight events", async () => {
     for (let i = 1; i <= 10; i++) await appendOne(`e${i}`);
-    // Pre-seed the checkpoint row so replicas don't serialise on its INSERT.
-    const uow = new PgUnitOfWork(pool);
-    await uow.withTransaction((tx) => new PgProjectionCheckpointStore().get(tx, "replicated", "default"));
-
     const entered = deferred();
     const release = deferred();
     const handled: string[] = [];

@@ -59,7 +59,7 @@ Use this matrix to pick the right tier for your projection:
 | Does it need topic-based routing? | No | No | Yes |
 | Is write latency critical? | Avoid | Preferred | Preferred |
 | Is it a process manager (reacts to events, emits more events)? | No | Yes | Possible but catch-up is simpler |
-| Should it survive application restarts? | N/A (transactional) | Yes (checkpoint) | Yes (outbox + checkpoint) |
+| Should it survive application restarts? | N/A (transactional) | Yes (checkpoint) | Yes (outbox) |
 
 **Rules of thumb:**
 

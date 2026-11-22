@@ -21,7 +21,7 @@ export interface AsyncProjection<E extends AnyEvent, TTx extends Transaction = T
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | `string` | Unique identifier. Used as the checkpoint key in `eventfabric.projection_checkpoints`. |
+| `name` | `string` | Unique identifier, used in logs, metrics and traces. |
 | `topicFilter` | `TopicFilter` (optional) | Controls which outbox messages this projection sees. See [Topic filtering](#topic-filtering). |
 | `routes` | `readonly string[]` (optional) | Adapter-specific routing. For Kafka: topic names. For queues: queue names. Outbox adapter uses `topicFilter` instead. |
 | `handle` | `(tx, env) => Promise<void>` | Called once per event. Must be **idempotent** (safe to retry). |
@@ -38,7 +38,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
     uow: UnitOfWork<TTx>,
     eventStore: EventStore<E, TTx>,
     outbox: OutboxStore<TTx>,
-    checkpoints: ProjectionCheckpointStore<TTx>,
+    checkpoints: ProjectionCheckpointStore<TTx> | undefined, // deprecated, ignored
     projections: AsyncProjection<E, TTx>[],
     opts: AsyncRunnerOptions
   ) {}
@@ -46,6 +46,20 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
   async start(signal: AbortSignal): Promise<void>;
 }
 ```
+
+### Delivery tracking
+
+The outbox row is the only record of whether an event still has to be delivered. The runner deletes (acks) a row in the same transaction as the handlers that processed it, so a committed handler run and a deleted row always go together. If the transaction rolls back, the row stays and is retried.
+
+The runner does **not** use projection checkpoints. Global positions are allocated when an event is inserted, not when its transaction commits, so a rule like "position at or below the checkpoint means already handled" would silently drop:
+
+- events whose transaction commits after a higher position was already processed,
+- rows requeued from the DLQ, and
+- rows processed out of order by concurrent workers.
+
+Delivery is at least once. A row can be handled more than once, for example when its lock expires (`leaseMs`) while a slow worker is still processing it, or when a requeued event had in fact succeeded. Handlers must be idempotent.
+
+The `checkpoints` constructor argument is deprecated and ignored; `createAsyncProjectionRunner` no longer passes one.
 
 ### `start(signal)`
 

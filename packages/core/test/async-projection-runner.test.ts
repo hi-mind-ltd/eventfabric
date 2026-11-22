@@ -136,7 +136,7 @@ describe("AsyncProjectionRunner", () => {
   }
   
   describe("processBatch mode", () => {
-    it("processes events and updates checkpoints", async () => {
+    it("processes events and acks their outbox rows", async () => {
       const handled: string[] = [];
       const projection: AsyncProjection<E, MockTx> = {
         name: "test-proj",
@@ -181,7 +181,8 @@ describe("AsyncProjectionRunner", () => {
       
       expect(handled).toEqual(["event1", "event2"]);
       expect(outbox.acked).toEqual([1, 2]);
-      expect(checkpoints.checkpoints.get("test-proj" + "|default")?.lastGlobalPosition).toBe(2n);
+      // Delivery is tracked by the outbox row alone; checkpoints are not touched.
+      expect(checkpoints.checkpoints.size).toBe(0);
     });
     
     it("filters events by topic", async () => {
@@ -353,7 +354,7 @@ describe("AsyncProjectionRunner", () => {
       expect(outbox.released[0]!.error).toContain("Projection failed");
     });
     
-    it("skips events already processed (checkpoint check)", async () => {
+    it("handles an event below an existing checkpoint (outbox row is the source of truth)", async () => {
       const handled: string[] = [];
       const projection: AsyncProjection<E, MockTx> = {
         name: "test-proj",
@@ -365,7 +366,8 @@ describe("AsyncProjectionRunner", () => {
       
       runner = createRunner([projection], { transactionMode: "batch" });
       
-      // Set checkpoint to 2, so event at position 1 should be skipped
+      // A checkpoint past the event (e.g. a later event committed first, or the
+      // row was requeued from the DLQ) must not cause the event to be skipped.
       await checkpoints.set(({ tenantId: "default" }), "test-proj", "default", 2n);
       
       const row: OutboxRow = { id: 1, globalPosition: 1n, topic: "test", attempts: 0 };
@@ -383,8 +385,8 @@ describe("AsyncProjectionRunner", () => {
       
       await (runner as any).processBatch([row], false, 10);
       
-      expect(handled).toHaveLength(0); // Skipped because checkpoint is at 2
-      expect(outbox.acked).toEqual([1]); // Still acked
+      expect(handled).toEqual(["event1"]);
+      expect(outbox.acked).toEqual([1]);
     });
   });
   

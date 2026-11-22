@@ -685,49 +685,38 @@ describe("PgAsyncProjectionRunner", () => {
       expect(handled2[0]).toBe("1");
     }, 15000);
 
-    it("maintains separate checkpoints for each projection", async () => {
+    it("delivers every event to every matching projection", async () => {
       const uow = new PgUnitOfWork(pool);
       const store = new PgEventStore<E>();
-      const checkpoints = new PgProjectionCheckpointStore();
-
-      let globalPos1: bigint | undefined;
-      let globalPos2: bigint | undefined;
 
       await uow.withTransaction(async (tx) => {
-        const result1 = await store.append(tx, {
-          aggregateName: "Agg",
-          aggregateId: "checkpoint-1",
-          expectedAggregateVersion: 0,
-          events: [{ type: "X", version: 1, id: "1" }],
-          enqueueOutbox: true,
-          outboxTopic: "user"
-        });
-        globalPos1 = result1.appended[0]!.globalPosition;
-
-        const result2 = await store.append(tx, {
-          aggregateName: "Agg",
-          aggregateId: "checkpoint-2",
-          expectedAggregateVersion: 0,
-          events: [{ type: "X", version: 1, id: "2" }],
-          enqueueOutbox: true,
-          outboxTopic: "user"
-        });
-        globalPos2 = result2.appended[0]!.globalPosition;
+        for (const id of ["1", "2"]) {
+          await store.append(tx, {
+            aggregateName: "Agg",
+            aggregateId: `multi-proj-${id}`,
+            expectedAggregateVersion: 0,
+            events: [{ type: "X", version: 1, id }],
+            enqueueOutbox: true,
+            outboxTopic: "user"
+          });
+        }
       });
 
+      const handled1: string[] = [];
+      const handled2: string[] = [];
       const projection1 = {
-        name: "checkpoint-proj-1",
+        name: "multi-proj-1",
         topicFilter: { mode: "include", topics: ["user"] },
-        async handle(tx: any, env: any) {}
+        async handle(_tx: any, env: any) { handled1.push(env.payload.id); }
       };
       const projection2 = {
-        name: "checkpoint-proj-2",
+        name: "multi-proj-2",
         topicFilter: { mode: "include", topics: ["user"] },
-        async handle(tx: any, env: any) {}
+        async handle(_tx: any, env: any) { handled2.push(env.payload.id); }
       };
 
       const runner = createAsyncProjectionRunner<E>(pool, store, [projection1 as any, projection2 as any], {
-        workerId: "checkpoint-worker",
+        workerId: "multi-proj-worker",
         batchSize: 10,
         transactionMode: "perRow",
         idleSleepMs: 50
@@ -746,48 +735,38 @@ describe("PgAsyncProjectionRunner", () => {
 
       ac.abort();
       await runnerPromise;
-      await new Promise(resolve => setTimeout(resolve, 500));
 
-      // Check that both projections have checkpoints
-      const cp1 = await uow.withTransaction(async (tx) => {
-        return checkpoints.get(tx, "checkpoint-proj-1", "default");
-      });
-      const cp2 = await uow.withTransaction(async (tx) => {
-        return checkpoints.get(tx, "checkpoint-proj-2", "default");
-      });
-
-      expect(cp1.lastGlobalPosition).toBe(globalPos2);
-      expect(cp2.lastGlobalPosition).toBe(globalPos2);
+      expect(outboxCount).toBe(0);
+      expect(handled1).toEqual(["1", "2"]);
+      expect(handled2).toEqual(["1", "2"]);
     }, 15000);
   });
 
-  describe("checkpoint management", () => {
-    it("updates checkpoint after processing event", async () => {
+  describe("delivery tracking", () => {
+    it("tracks delivery by outbox row only and does not write projection checkpoints", async () => {
       const uow = new PgUnitOfWork(pool);
       const store = new PgEventStore<E>();
-      const checkpoints = new PgProjectionCheckpointStore();
 
-      let globalPos: bigint | undefined;
       await uow.withTransaction(async (tx) => {
-        const result = await store.append(tx, {
+        await store.append(tx, {
           aggregateName: "Agg",
-          aggregateId: "checkpoint-test",
+          aggregateId: "no-checkpoint",
           expectedAggregateVersion: 0,
           events: [{ type: "X", version: 1, id: "1" }],
           enqueueOutbox: true,
           outboxTopic: "user"
         });
-        globalPos = result.appended[0]!.globalPosition;
       });
 
+      const handled: string[] = [];
       const projection = {
-        name: "checkpoint-update",
+        name: "no-checkpoint",
         topicFilter: { mode: "include", topics: ["user"] },
-        async handle(tx: any, env: any) {}
+        async handle(_tx: any, env: any) { handled.push(env.payload.id); }
       };
 
       const runner = createAsyncProjectionRunner<E>(pool, store, [projection as any], {
-        workerId: "checkpoint-update-worker",
+        workerId: "no-checkpoint-worker",
         batchSize: 10,
         transactionMode: "perRow",
         idleSleepMs: 50
@@ -806,37 +785,30 @@ describe("PgAsyncProjectionRunner", () => {
 
       ac.abort();
       await runnerPromise;
-      await new Promise(resolve => setTimeout(resolve, 500));
 
-      const cp = await uow.withTransaction(async (tx) => {
-        return checkpoints.get(tx, "checkpoint-update", "default");
-      });
-
-      expect(cp.lastGlobalPosition).toBe(globalPos);
+      expect(handled).toEqual(["1"]);
+      const cps = await pool.query(`SELECT COUNT(*)::int AS c FROM eventfabric.projection_checkpoints`);
+      expect(cps.rows[0].c).toBe(0);
     }, 15000);
 
-    it("skips events already processed (checkpoint check)", async () => {
+    it("handles events at or below an existing checkpoint (outbox row is the source of truth)", async () => {
       const uow = new PgUnitOfWork(pool);
       const store = new PgEventStore<E>();
       const checkpoints = new PgProjectionCheckpointStore();
 
-      let globalPos1: bigint | undefined;
       let globalPos2: bigint | undefined;
-
       await uow.withTransaction(async (tx) => {
-        const result1 = await store.append(tx, {
+        await store.append(tx, {
           aggregateName: "Agg",
-          aggregateId: "skip-1",
+          aggregateId: "stale-cp-1",
           expectedAggregateVersion: 0,
           events: [{ type: "X", version: 1, id: "1" }],
           enqueueOutbox: true,
           outboxTopic: "user"
         });
-        globalPos1 = result1.appended[0]!.globalPosition;
-
         const result2 = await store.append(tx, {
           aggregateName: "Agg",
-          aggregateId: "skip-2",
+          aggregateId: "stale-cp-2",
           expectedAggregateVersion: 0,
           events: [{ type: "X", version: 1, id: "2" }],
           enqueueOutbox: true,
@@ -845,22 +817,21 @@ describe("PgAsyncProjectionRunner", () => {
         globalPos2 = result2.appended[0]!.globalPosition;
       });
 
-      // Set checkpoint to second event (simulating previous processing)
+      // A checkpoint left over from an older release (or written by anything
+      // else) must not cause outbox rows to be skipped.
       await uow.withTransaction(async (tx) => {
-        await checkpoints.set(tx, "skip-projection", "default", globalPos2!);
+        await checkpoints.set(tx, "stale-cp-projection", "default", globalPos2!);
       });
 
       const handled: string[] = [];
       const projection = {
-        name: "skip-projection",
+        name: "stale-cp-projection",
         topicFilter: { mode: "include", topics: ["user"] },
-        async handle(tx: any, env: any) {
-          handled.push(env.payload.id);
-        }
+        async handle(_tx: any, env: any) { handled.push(env.payload.id); }
       };
 
       const runner = createAsyncProjectionRunner<E>(pool, store, [projection as any], {
-        workerId: "skip-worker",
+        workerId: "stale-cp-worker",
         batchSize: 10,
         transactionMode: "perRow",
         idleSleepMs: 50
@@ -869,16 +840,19 @@ describe("PgAsyncProjectionRunner", () => {
       const ac = new AbortController();
       const runnerPromise = runner.start(ac.signal).catch(() => {});
 
-      // Wait a bit for processing
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      let outboxCount = 2;
+      const startTime = Date.now();
+      while (outboxCount > 0 && Date.now() - startTime < 10000) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        const outbox = await pool.query(`SELECT COUNT(*)::int AS count FROM eventfabric.outbox`);
+        outboxCount = outbox.rows[0]?.count ?? 0;
+      }
 
       ac.abort();
       await runnerPromise;
-      await new Promise(resolve => setTimeout(resolve, 500));
 
-      // Should not handle any events (both are <= checkpoint)
-      expect(handled).toHaveLength(0);
-    }, 10000);
+      expect(handled).toEqual(["1", "2"]);
+    }, 15000);
   });
 
   describe("error handling and backoff", () => {

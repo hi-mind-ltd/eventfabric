@@ -42,8 +42,16 @@ function toError(err: unknown): Error {
  * outbox is a cross-tenant queue keyed by `global_position`, so these ops
  * don't need tenant filtering. Handler invocations narrow the tx to the
  * event's tenant so `loadStream`/`append` inside the handler read/write the
- * correct tenant's data. Per-tenant checkpoints let one tenant's failing
- * handler advance independently of other tenants.
+ * correct tenant's data.
+ *
+ * Delivery tracking: the outbox row is the only record of whether an event
+ * still has to be delivered. A row is acked in the same transaction as the
+ * handlers that processed it, so a committed handler run and a deleted row
+ * always go together. The runner deliberately does NOT consult projection
+ * checkpoints: global positions are allocated at INSERT, not at COMMIT, so a
+ * "position <= checkpoint means already handled" rule would silently drop
+ * events that commit late, rows requeued from the DLQ, and rows processed
+ * out of order by concurrent workers.
  */
 export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction = Transaction> {
   private readonly uow: { withTransaction<T>(fn: (tx: TTx) => Promise<T>): Promise<T> };
@@ -52,7 +60,12 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
     private readonly uowFactory: TenantScopedUnitOfWorkFactory<TTx>,
     private readonly eventStore: EventStore<E, TTx>,
     private readonly outbox: OutboxStore<TTx>,
-    private readonly checkpoints: ProjectionCheckpointStore<TTx>,
+    /**
+     * @deprecated Ignored. The async runner no longer reads or writes
+     * projection checkpoints; the outbox row alone tracks delivery. Kept
+     * so existing call sites compile; will be removed in a future release.
+     */
+    _checkpoints: ProjectionCheckpointStore<TTx> | undefined,
     private readonly projections: AsyncProjection<E, TTx>[],
     private readonly opts: AsyncRunnerOptions
   ) {
@@ -245,17 +258,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
 
           for (const p of this.projections) {
             if (!matchesTopic(p.topicFilter, row.topic)) continue;
-
-            // Checkpoints are per-tenant — use the envelope's tenantId, not
-            // the outer tx's. The outer tx writes the checkpoint row even
-            // though it's for a different tenant; that's fine because
-            // projection_checkpoints is keyed by (projection_name, tenant_id)
-            // and the writes don't conflict across tenants.
-            const cp = await this.checkpoints.get(tx, p.name, env.tenantId);
-            if (env.globalPosition <= cp.lastGlobalPosition) continue;
-
             await this.runProjectionHandler(p, scopedTx, env, row.attempts);
-            await this.checkpoints.set(tx, p.name, env.tenantId, env.globalPosition);
           }
 
           await this.outbox.ack(tx, row.id);
@@ -269,8 +272,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
       // Main tx rolled back — release all claimed rows in a fresh tx so they
       // can be reclaimed on the next iteration. Without this, releaseWithError
       // would roll back with the rest of the tx and rows would stay locked
-      // forever (claimBatch filters WHERE locked_at IS NULL), stranding the
-      // whole batch with no retry and no DLQ path.
+      // until their lease expires.
       const error = toError(err);
       const msg = error.stack || error.message;
       try {
@@ -335,12 +337,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
 
         for (const p of this.projections) {
           if (!matchesTopic(p.topicFilter, row.topic)) continue;
-
-          const cp = await this.checkpoints.get(tx, p.name, env.tenantId);
-          if (env.globalPosition <= cp.lastGlobalPosition) continue;
-
           await this.runProjectionHandler(p, scopedTx, env, row.attempts);
-          await this.checkpoints.set(tx, p.name, env.tenantId, env.globalPosition);
         }
 
         await this.outbox.ack(tx, row.id);
