@@ -66,7 +66,7 @@ export class PgIdempotencyStore implements IdempotencyStore<PgTx> {
     }
 
     const existing = await tx.client.query(
-      `SELECT status, result FROM ${this.tableName}
+      `SELECT status, result, command_type FROM ${this.tableName}
         WHERE tenant_id = $1 AND idempotency_key = $2`,
       [tenantId, params.key]
     );
@@ -89,9 +89,9 @@ export class PgIdempotencyStore implements IdempotencyStore<PgTx> {
       return { state: "in_flight" };
     }
 
-    const row = existing.rows[0] as { status: string; result: unknown };
+    const row = existing.rows[0] as { status: string; result: unknown; command_type: string };
     if (row.status === "completed") {
-      return { state: "completed", result: row.result };
+      return { state: "completed", result: row.result, commandType: row.command_type };
     }
     return { state: "in_flight" };
   }

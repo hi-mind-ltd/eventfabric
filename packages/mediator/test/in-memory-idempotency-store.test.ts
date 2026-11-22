@@ -22,7 +22,7 @@ describe("InMemoryIdempotencyStore", () => {
     await store.claim(tx, { key: "k1", commandType: "X", commandId: "c1" });
     await store.complete(tx, { key: "k1", result: { ok: true } });
     const second = await store.claim(tx, { key: "k1", commandType: "X", commandId: "c2" });
-    expect(second).toEqual({ state: "completed", result: { ok: true } });
+    expect(second).toEqual({ state: "completed", result: { ok: true }, commandType: "X" });
   });
 
   it("release clears the slot, next claim wins", async () => {

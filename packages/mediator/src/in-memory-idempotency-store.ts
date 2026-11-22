@@ -2,8 +2,8 @@ import type { Transaction } from "@eventfabric/core";
 import type { ClaimResult, IdempotencyStore } from "./idempotency-store";
 
 type Slot =
-  | { status: "in_flight"; commandId: string }
-  | { status: "completed"; result: unknown };
+  | { status: "in_flight"; commandId: string; commandType: string }
+  | { status: "completed"; result: unknown; commandType: string };
 
 /**
  * Process-local idempotency store. Suitable for unit tests and single-process
@@ -27,11 +27,11 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
     const slotKey = this.slotKey(params.tenantId, params.key);
     const existing = this.slots.get(slotKey);
     if (!existing) {
-      this.slots.set(slotKey, { status: "in_flight", commandId: params.commandId });
+      this.slots.set(slotKey, { status: "in_flight", commandId: params.commandId, commandType: params.commandType });
       return { state: "claimed" };
     }
     if (existing.status === "completed") {
-      return { state: "completed", result: existing.result };
+      return { state: "completed", result: existing.result, commandType: existing.commandType };
     }
     return { state: "in_flight" };
   }
@@ -41,7 +41,8 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
     params: { key: string; tenantId?: string; result: unknown }
   ): Promise<void> {
     const slotKey = this.slotKey(params.tenantId, params.key);
-    this.slots.set(slotKey, { status: "completed", result: params.result });
+    const commandType = this.slots.get(slotKey)?.commandType ?? "";
+    this.slots.set(slotKey, { status: "completed", result: params.result, commandType });
   }
 
   async release(

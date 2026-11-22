@@ -4,6 +4,7 @@ import type { Command, CommandHandler, CommandMiddleware } from "../src";
 import {
   CommandBus,
   ConcurrentCommandInFlightError,
+  IdempotencyKeyConflictError,
   InMemoryIdempotencyStore,
   MissingTenantIdError,
   NoHandlerRegisteredError,
@@ -117,6 +118,23 @@ describe("CommandBus", () => {
     expect(first).toEqual({ newBalance: 100 });
     expect(second).toEqual({ newBalance: 100 });
     expect(handle).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an idempotency key reused for a different command type instead of returning its result", async () => {
+    const bus = new CommandBus<TxToken>({
+      uow: new CountingUnitOfWork(),
+      idempotencyStore: new InMemoryIdempotencyStore(),
+    });
+    bus.register({ commandType: "Deposit", handle: async () => ({ newBalance: 100 }) } as CommandHandler<DepositCommand, { newBalance: number }, TxToken>);
+    const withdraw = vi.fn(async () => ({ newBalance: 0 }));
+    bus.register({ commandType: "Withdraw", handle: withdraw } as any);
+
+    await bus.send(makeCommand());
+    const err = await bus.send({ ...makeCommand(), type: "Withdraw" } as any).catch((e) => e);
+
+    expect(err).toBeInstanceOf(IdempotencyKeyConflictError);
+    expect(err).toMatchObject({ commandType: "Withdraw", originalCommandType: "Deposit" });
+    expect(withdraw).not.toHaveBeenCalled();
   });
 
   it("releases the slot when the handler throws so a retry re-runs it", async () => {

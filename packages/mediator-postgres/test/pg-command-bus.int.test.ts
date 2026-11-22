@@ -3,6 +3,7 @@ import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
 import {
   CommandBus,
+  IdempotencyKeyConflictError,
   NoHandlerRegisteredError,
   type Command,
   type CommandHandler,
@@ -94,6 +95,21 @@ describe("CommandBus + PgIdempotencyStore", () => {
     expect(first).toEqual({ newBalance: 250 });
     expect(second).toEqual({ newBalance: 250 });
     expect(handle).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an idempotency key reused for a different command type", async () => {
+    const bus = new CommandBus<PgTx>({ uow: new PgUnitOfWork(pool), idempotencyStore: new PgIdempotencyStore() });
+    bus.register({ commandType: "Deposit", handle: async () => ({ ok: true }) } as CommandHandler<DepositCommand, { ok: boolean }, PgTx>);
+    const withdraw = vi.fn(async () => ({ ok: false }));
+    bus.register({ commandType: "Withdraw", handle: withdraw } as any);
+
+    await bus.send(makeCommand({ idempotencyKey: "k-reused" }));
+    const err = await bus
+      .send({ ...makeCommand({ idempotencyKey: "k-reused" }), type: "Withdraw" } as any)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(IdempotencyKeyConflictError);
+    expect(withdraw).not.toHaveBeenCalled();
   });
 
   it("rolls back the slot when the handler throws so a retry re-runs it", async () => {

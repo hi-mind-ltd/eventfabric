@@ -2,7 +2,17 @@ import type { Transaction } from "@eventfabric/core";
 
 export type ClaimResult =
   | { state: "claimed" }
-  | { state: "completed"; result: unknown }
+  | {
+      state: "completed";
+      result: unknown;
+      /**
+       * The command type the key was first used with. When it differs from
+       * the command being sent, the middleware throws
+       * `IdempotencyKeyConflictError` instead of returning another
+       * command's result. Stores that don't record it skip the check.
+       */
+      commandType?: string;
+    }
   | { state: "in_flight" };
 
 /**

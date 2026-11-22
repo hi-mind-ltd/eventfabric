@@ -33,6 +33,25 @@ export class ConcurrentCommandInFlightError extends Error {
 }
 
 /**
+ * Thrown by idempotency middleware when an idempotency key that already
+ * completed is reused for a different command type. Returning the stored
+ * result would report success for a command that never ran.
+ */
+export class IdempotencyKeyConflictError extends Error {
+  constructor(
+    public readonly idempotencyKey: string,
+    public readonly commandType: string,
+    public readonly originalCommandType: string
+  ) {
+    super(
+      `Idempotency key ${idempotencyKey} was already used for a "${originalCommandType}" command; ` +
+      `it cannot be reused for "${commandType}"`
+    );
+    this.name = "IdempotencyKeyConflictError";
+  }
+}
+
+/**
  * Thrown when bus.send is called for a command type that has no
  * registered handler.
  */

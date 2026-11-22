@@ -2,7 +2,7 @@ import type { Transaction } from "@eventfabric/core";
 import type { Command } from "./command";
 import type { CommandContext } from "./command-handler";
 import type { IdempotencyStore } from "./idempotency-store";
-import { ConcurrentCommandInFlightError } from "./errors";
+import { ConcurrentCommandInFlightError, IdempotencyKeyConflictError } from "./errors";
 
 /**
  * A middleware wraps the rest of the chain. Each middleware decides whether
@@ -99,6 +99,11 @@ export function createIdempotencyMiddleware<TTx extends Transaction>(
     }
 
     if (claim.state === "completed") {
+      // A key reused for a different command must not answer with the
+      // first command's result: the new command would be silently dropped.
+      if (claim.commandType && claim.commandType !== cmd.type) {
+        throw new IdempotencyKeyConflictError(cmd.metadata.idempotencyKey, cmd.type, claim.commandType);
+      }
       return claim.result;
     }
 
