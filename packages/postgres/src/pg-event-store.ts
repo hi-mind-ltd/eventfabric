@@ -204,7 +204,11 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
         eventId: eventIds[i]!,
         type: evt.type,
         version: evt.version,
-        payload: evt,
+        // Hash exactly what is stored: the payload after its JSON round trip
+        // (a Date becomes an ISO string, toJSON() is applied, undefined is
+        // dropped). Verification hashes the stored jsonb, so hashing the raw
+        // object would report tampering for such payloads.
+        payload: JSON.parse(JSON.stringify(evt)),
         correlationId: meta?.correlationId ?? null,
         causationId: meta?.causationId ?? null,
       });
@@ -297,53 +301,72 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
         }
         throw err;
       }
-    } else if (chained) {
-      // Chained existing stream — lock the row to read the current head atomically,
-      // then bump version + head together. Same isolation outcome as the blind
-      // UPDATE below, with one extra round-trip to fetch the prev hash.
-      const locked = await tx.client.query(
-        `SELECT current_version, head_hash FROM ${this.streamVersionsTable}
-         WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3
-         FOR UPDATE`,
-        [tenantId, aggregateName, aggregateId]
-      );
-      const row = locked.rows[0];
-      const actualVersion = row ? Number(row.current_version) : undefined;
-      if (actualVersion !== expectedAggregateVersion) {
-        throw new ConcurrencyError(
-          `Expected version ${expectedAggregateVersion} but stream ${aggregateName}:${aggregateId} is at ${actualVersion ?? "(stream not found)"}`
-        );
-      }
-      // head_hash is NULL when the stream predates tamper-evidence being enabled;
-      // start the chain from genesis so events from here forward are protected.
-      const prev: Buffer =
-        (row.head_hash as Buffer | null) ?? streamGenesis(this.hashSecret!, tenantId, aggregateName, aggregateId);
-      const r = this.chainBatch(prev, tenantId, aggregateName, aggregateId, base, eventIds, params.events, params.meta);
-      eventHashes = r.hashes;
-      await tx.client.query(
-        `UPDATE ${this.streamVersionsTable}
-         SET current_version = $4, head_hash = $5, updated_at = now()
-         WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
-        [tenantId, aggregateName, aggregateId, newVersion, r.head]
-      );
     } else {
-      // Existing stream — atomic version bump. 0 rows updated = someone else moved the version.
-      const result = await tx.client.query(
-        `UPDATE ${this.streamVersionsTable}
-         SET current_version = $4, updated_at = now()
-         WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3 AND current_version = $5`,
-        [tenantId, aggregateName, aggregateId, newVersion, expectedAggregateVersion]
-      );
-      if (result.rowCount === 0) {
-        // Fetch actual version for a helpful error message
-        const actual = await tx.client.query(
-          `SELECT current_version FROM ${this.streamVersionsTable}
-           WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
+      // Whether the stream is chained is decided by the database as well as
+      // by registration: a process that has not registered the aggregate
+      // (a worker, an ops script) must still extend an existing chain, not
+      // break it with an unhashed event.
+      let chainThis = chained;
+      if (!chainThis) {
+        // Existing stream — atomic version bump. 0 rows updated = someone
+        // else moved the version, or the stream is chained in the database.
+        const result = await tx.client.query(
+          `UPDATE ${this.streamVersionsTable}
+           SET current_version = $4, updated_at = now()
+           WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3 AND current_version = $5
+             AND head_hash IS NULL`,
+          [tenantId, aggregateName, aggregateId, newVersion, expectedAggregateVersion]
+        );
+        if (result.rowCount === 0) {
+          const actual = await tx.client.query(
+            `SELECT current_version, head_hash FROM ${this.streamVersionsTable}
+             WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
+            [tenantId, aggregateName, aggregateId]
+          );
+          const row = actual.rows[0];
+          if (row && Number(row.current_version) === expectedAggregateVersion && row.head_hash != null) {
+            if (!this.hashFeatureOn) {
+              throw new Error(
+                `Stream ${aggregateName}:${aggregateId} is tamper-evident (hash-chained), but this ` +
+                `PgEventStore has no hashChain.secret. Appending would break its chain.`
+              );
+            }
+            chainThis = true;
+          } else {
+            throw new ConcurrencyError(
+              `Expected version ${expectedAggregateVersion} but stream ${aggregateName}:${aggregateId} is at ${row?.current_version ?? "(stream not found)"}`
+            );
+          }
+        }
+      }
+      if (chainThis) {
+        // Chained existing stream — lock the row to read the current head atomically,
+        // then bump version + head together. Same isolation outcome as the blind
+        // UPDATE below, with one extra round-trip to fetch the prev hash.
+        const locked = await tx.client.query(
+          `SELECT current_version, head_hash FROM ${this.streamVersionsTable}
+           WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3
+           FOR UPDATE`,
           [tenantId, aggregateName, aggregateId]
         );
-        const actualVersion = actual.rows[0]?.current_version ?? "(stream not found)";
-        throw new ConcurrencyError(
-          `Expected version ${expectedAggregateVersion} but stream ${aggregateName}:${aggregateId} is at ${actualVersion}`
+        const row = locked.rows[0];
+        const actualVersion = row ? Number(row.current_version) : undefined;
+        if (actualVersion !== expectedAggregateVersion) {
+          throw new ConcurrencyError(
+            `Expected version ${expectedAggregateVersion} but stream ${aggregateName}:${aggregateId} is at ${actualVersion ?? "(stream not found)"}`
+          );
+        }
+        // head_hash is NULL when the stream predates tamper-evidence being enabled;
+        // start the chain from genesis so events from here forward are protected.
+        const prev: Buffer =
+          (row.head_hash as Buffer | null) ?? streamGenesis(this.hashSecret!, tenantId, aggregateName, aggregateId);
+        const r = this.chainBatch(prev, tenantId, aggregateName, aggregateId, base, eventIds, params.events, params.meta);
+        eventHashes = r.hashes;
+        await tx.client.query(
+          `UPDATE ${this.streamVersionsTable}
+           SET current_version = $4, head_hash = $5, updated_at = now()
+           WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
+          [tenantId, aggregateName, aggregateId, newVersion, r.head]
         );
       }
     }

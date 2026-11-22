@@ -174,6 +174,61 @@ describe("PgEventStore hash chaining", () => {
     expect(result.firstBrokenAt).toBe(1);
   });
 
+  it("a store that has not registered the aggregate still extends an existing chain", async () => {
+    const uow = new PgUnitOfWork(pool);
+    await uow.withTransaction((tx) =>
+      chainedStore().append(tx, { aggregateName: "Audit", aggregateId: "u1", expectedAggregateVersion: 0, events: [ev(1)] })
+    );
+    // Same secret, but "Audit" is not registered in this process (a worker, an ops script).
+    const unregistered = new PgEventStore<E>({ hashChain: { secret: SECRET } });
+    await uow.withTransaction((tx) =>
+      unregistered.append(tx, { aggregateName: "Audit", aggregateId: "u1", expectedAggregateVersion: 1, events: [ev(2)] })
+    );
+
+    const result = await uow.withTransaction((tx) => chainedStore().verifyStream(tx, { aggregateName: "Audit", aggregateId: "u1" }));
+    expect(result).toMatchObject({ ok: true, eventsChecked: 2 });
+  });
+
+  it("a store without the chain secret refuses to append to a chained stream", async () => {
+    const uow = new PgUnitOfWork(pool);
+    await uow.withTransaction((tx) =>
+      chainedStore().append(tx, { aggregateName: "Audit", aggregateId: "u2", expectedAggregateVersion: 0, events: [ev(1)] })
+    );
+    const noSecret = new PgEventStore<E>();
+    await expect(
+      uow.withTransaction((tx) =>
+        noSecret.append(tx, { aggregateName: "Audit", aggregateId: "u2", expectedAggregateVersion: 1, events: [ev(2)] })
+      )
+    ).rejects.toThrow(/tamper-evident/);
+
+    const result = await uow.withTransaction((tx) => chainedStore().verifyStream(tx, { aggregateName: "Audit", aggregateId: "u2" }));
+    expect(result).toMatchObject({ ok: true, eventsChecked: 1 });
+  });
+
+  it("an unchained stream still reports a version conflict", async () => {
+    const uow = new PgUnitOfWork(pool);
+    const store = chainedStore();
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Plain", aggregateId: "p1", expectedAggregateVersion: 0, events: [ev(1)] })
+    );
+    await expect(
+      uow.withTransaction((tx) =>
+        store.append(tx, { aggregateName: "Plain", aggregateId: "p1", expectedAggregateVersion: 5, events: [ev(2)] })
+      )
+    ).rejects.toThrow(/Expected version 5/);
+  });
+
+  it("verifies events whose payload holds a Date (hashed as stored, not as the JS object)", async () => {
+    const uow = new PgUnitOfWork(pool);
+    const store = chainedStore();
+    const withDate = { ...ev(1), at: new Date("2026-01-02T03:04:05.000Z") } as unknown as E;
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "d1", expectedAggregateVersion: 0, events: [withDate] })
+    );
+    const result = await uow.withTransaction((tx) => store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "d1" }));
+    expect(result).toMatchObject({ ok: true, eventsChecked: 1 });
+  });
+
   it("verifyAggregate reports every stream of the aggregate", async () => {
     const store = chainedStore();
     const uow = new PgUnitOfWork(pool);
