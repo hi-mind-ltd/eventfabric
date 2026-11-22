@@ -34,7 +34,7 @@ export class PgIdempotencyStore implements IdempotencyStore<PgTx> {
 
   async claim(
     tx: PgTx,
-    params: { key: string; commandType: string; commandId: string; tenantId?: string }
+    params: { key: string; commandType: string; commandId: string; tenantId?: string; requestHash?: string }
   ): Promise<ClaimResult> {
     const tenantId = params.tenantId ?? tx.tenantId;
     // Single-statement claim that also recovers from 'failed' rows the
@@ -46,11 +46,12 @@ export class PgIdempotencyStore implements IdempotencyStore<PgTx> {
     // then SELECT to distinguish the two.
     const claimed = await tx.client.query(
       `INSERT INTO ${this.tableName}
-         (tenant_id, idempotency_key, command_type, command_id, status)
-       VALUES ($1, $2, $3, $4, 'in_flight')
+         (tenant_id, idempotency_key, command_type, command_id, status, request_hash)
+       VALUES ($1, $2, $3, $4, 'in_flight', $5)
        ON CONFLICT (tenant_id, idempotency_key) DO UPDATE
          SET command_type = EXCLUDED.command_type,
              command_id = EXCLUDED.command_id,
+             request_hash = EXCLUDED.request_hash,
              status = 'in_flight',
              result = NULL,
              error_message = NULL,
@@ -58,7 +59,7 @@ export class PgIdempotencyStore implements IdempotencyStore<PgTx> {
              completed_at = NULL
          WHERE ${this.tableName}.status = 'failed'
        RETURNING idempotency_key`,
-      [tenantId, params.key, params.commandType, params.commandId]
+      [tenantId, params.key, params.commandType, params.commandId, params.requestHash ?? null]
     );
 
     if (claimed.rowCount && claimed.rowCount > 0) {
@@ -66,7 +67,7 @@ export class PgIdempotencyStore implements IdempotencyStore<PgTx> {
     }
 
     const existing = await tx.client.query(
-      `SELECT status, result, command_type FROM ${this.tableName}
+      `SELECT status, result, command_type, request_hash FROM ${this.tableName}
         WHERE tenant_id = $1 AND idempotency_key = $2`,
       [tenantId, params.key]
     );
@@ -76,11 +77,11 @@ export class PgIdempotencyStore implements IdempotencyStore<PgTx> {
       // other transaction must have rolled back. Try the INSERT again.
       const retry = await tx.client.query(
         `INSERT INTO ${this.tableName}
-           (tenant_id, idempotency_key, command_type, command_id, status)
-         VALUES ($1, $2, $3, $4, 'in_flight')
+           (tenant_id, idempotency_key, command_type, command_id, status, request_hash)
+         VALUES ($1, $2, $3, $4, 'in_flight', $5)
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
          RETURNING idempotency_key`,
-        [tenantId, params.key, params.commandType, params.commandId]
+        [tenantId, params.key, params.commandType, params.commandId, params.requestHash ?? null]
       );
       if (retry.rowCount && retry.rowCount > 0) {
         return { state: "claimed" };
@@ -89,9 +90,14 @@ export class PgIdempotencyStore implements IdempotencyStore<PgTx> {
       return { state: "in_flight" };
     }
 
-    const row = existing.rows[0] as { status: string; result: unknown; command_type: string };
+    const row = existing.rows[0] as { status: string; result: unknown; command_type: string; request_hash: string | null };
     if (row.status === "completed") {
-      return { state: "completed", result: row.result, commandType: row.command_type };
+      return {
+        state: "completed",
+        result: row.result,
+        commandType: row.command_type,
+        ...(row.request_hash ? { requestHash: row.request_hash } : {}),
+      };
     }
     return { state: "in_flight" };
   }

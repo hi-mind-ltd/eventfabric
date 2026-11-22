@@ -1,7 +1,7 @@
 import type { Transaction } from "@eventfabric/core";
 import type { Command } from "./command";
 import type { CommandContext } from "./command-handler";
-import type { IdempotencyStore } from "./idempotency-store";
+import { commandRequestHash, type IdempotencyStore } from "./idempotency-store";
 import { ConcurrentCommandInFlightError, IdempotencyKeyConflictError } from "./errors";
 
 /**
@@ -86,6 +86,7 @@ export function createIdempotencyMiddleware<TTx extends Transaction>(
       commandType: cmd.type,
       commandId: cmd.metadata.commandId,
       tenantId: cmd.metadata.tenantId,
+      requestHash: commandRequestHash(cmd.payload),
     };
 
     // Single claim attempt per middleware call. If the slot is held by
@@ -103,6 +104,9 @@ export function createIdempotencyMiddleware<TTx extends Transaction>(
       // first command's result: the new command would be silently dropped.
       if (claim.commandType && claim.commandType !== cmd.type) {
         throw new IdempotencyKeyConflictError(cmd.metadata.idempotencyKey, cmd.type, claim.commandType);
+      }
+      if (claim.requestHash && claim.requestHash !== claimParams.requestHash) {
+        throw new IdempotencyKeyConflictError(cmd.metadata.idempotencyKey, cmd.type, cmd.type, "payload");
       }
       return claim.result;
     }

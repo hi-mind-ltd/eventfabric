@@ -20,7 +20,9 @@ const CORE_MIGRATIONS = [
   "008_tenant_id",
   "009_per_tenant_projection_checkpoints",
   // 010-014 are owned by extension packages (@eventfabric/mediator-postgres,
-  // @eventfabric/sagas-postgres); core resumed at 015 (next free: 017).
+  // @eventfabric/sagas-postgres); core resumed at 015. 017 is reserved for
+  // personal data (GDPR branch); 018 is owned by
+  // @eventfabric/mediator-postgres (next free: 019).
   "015_event_hash_chain",
   "016_projection_dead_letters",
 ];

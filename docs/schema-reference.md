@@ -37,6 +37,7 @@ Run this before any migration. Migration `001_init.sql` includes this statement.
 | File                            | Creates / Modifies                                             |
 | ------------------------------- | -------------------------------------------------------------- |
 | `010_command_idempotency.sql`   | `eventfabric.command_idempotency` table (dedup slot per `(tenant_id, idempotency_key)`) + cleanup index |
+| `018_command_request_hash.sql`  | Adds `request_hash` to `eventfabric.command_idempotency` |
 
 ### Sagas extension (shipped by `@eventfabric/sagas-postgres`)
 
@@ -71,6 +72,7 @@ For the lowest-level manual install (no Node), apply files in numeric order:
 psql "$DATABASE_URL" -f packages/postgres/migrations/001_init.sql
 # ... 002 through 009 from packages/postgres/migrations/ ...
 psql "$DATABASE_URL" -f packages/mediator-postgres/migrations/010_command_idempotency.sql
+psql "$DATABASE_URL" -f packages/mediator-postgres/migrations/018_command_request_hash.sql
 psql "$DATABASE_URL" -f packages/sagas-postgres/migrations/011_saga_instances.sql
 psql "$DATABASE_URL" -f packages/sagas-postgres/migrations/012_saga_pending_commands.sql
 psql "$DATABASE_URL" -f packages/sagas-postgres/migrations/013_saga_scheduled_messages.sql
@@ -408,6 +410,7 @@ with the transaction rollback. Created by
 | `error_message`     | `TEXT`        | NULL     | `NULL`      | Reason text written by the watchdog when flipping `'in_flight'` → `'failed'`. Surfaced for ops triage. |
 | `created_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`     | When the slot was claimed. Used by both `cleanup` (retention) and `resetStaleInFlight` (watchdog window). |
 | `completed_at`      | `TIMESTAMPTZ` | NULL     | `NULL`      | Set by `complete` and by the watchdog when flipping to `'failed'`. |
+| `request_hash`      | `TEXT`        | NULL     | `NULL`      | SHA-256 (hex) of the payload the key was first used with. A later command with the same key and a different hash is rejected with `IdempotencyKeyConflictError`. NULL on rows written before migration 018 (check skipped). |
 
 ### Constraints
 

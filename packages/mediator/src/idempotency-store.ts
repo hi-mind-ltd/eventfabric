@@ -1,4 +1,5 @@
-import type { Transaction } from "@eventfabric/core";
+import { canonicalJson, type Transaction } from "@eventfabric/core";
+import { createHash } from "crypto";
 
 export type ClaimResult =
   | { state: "claimed" }
@@ -12,6 +13,13 @@ export type ClaimResult =
        * command's result. Stores that don't record it skip the check.
        */
       commandType?: string;
+      /**
+       * Hash of the payload the key was first used with (see
+       * `commandRequestHash`). When it differs from the command being sent,
+       * the middleware throws `IdempotencyKeyConflictError`. Stores (or rows)
+       * that don't record it skip the check.
+       */
+      requestHash?: string;
     }
   | { state: "in_flight" };
 
@@ -29,10 +37,21 @@ export type ClaimResult =
 export interface IdempotencyStore<TTx extends Transaction = Transaction> {
   claim(
     tx: TTx,
-    params: { key: string; commandType: string; commandId: string; tenantId?: string }
+    params: { key: string; commandType: string; commandId: string; tenantId?: string; requestHash?: string }
   ): Promise<ClaimResult>;
 
   complete(tx: TTx, params: { key: string; tenantId?: string; result: unknown }): Promise<void>;
 
   release(tx: TTx, params: { key: string; tenantId?: string; error: Error }): Promise<void>;
+}
+
+/**
+ * Fingerprint of a command's payload, stored with its idempotency key so a
+ * key reused with a different payload is detected. SHA-256 over the
+ * canonical JSON of the payload as it would be serialized (key order does
+ * not matter; a Date hashes as its ISO string).
+ */
+export function commandRequestHash(payload: unknown): string {
+  const normalized = payload === undefined ? null : JSON.parse(JSON.stringify(payload));
+  return createHash("sha256").update(canonicalJson(normalized)).digest("hex");
 }

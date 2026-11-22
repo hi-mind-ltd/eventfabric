@@ -112,6 +112,35 @@ describe("CommandBus + PgIdempotencyStore", () => {
     expect(withdraw).not.toHaveBeenCalled();
   });
 
+  it("rejects an idempotency key reused with a different payload, and stores the payload hash", async () => {
+    const bus = new CommandBus<PgTx>({ uow: new PgUnitOfWork(pool), idempotencyStore: new PgIdempotencyStore() });
+    const handle = vi.fn(async () => ({ ok: true }));
+    bus.register({ commandType: "Deposit", handle } as CommandHandler<DepositCommand, { ok: boolean }, PgTx>);
+
+    await bus.send(makeCommand({ idempotencyKey: "k-payload", amount: 100 }));
+    // A genuine retry (same payload) still returns the stored result.
+    expect(await bus.send(makeCommand({ idempotencyKey: "k-payload", amount: 100 }))).toEqual({ ok: true });
+    const err = await bus.send(makeCommand({ idempotencyKey: "k-payload", amount: 5000 })).catch((e) => e);
+
+    expect(err).toBeInstanceOf(IdempotencyKeyConflictError);
+    expect(err).toMatchObject({ reason: "payload" });
+    expect(handle).toHaveBeenCalledTimes(1);
+    const row = await pool.query(`SELECT request_hash FROM eventfabric.command_idempotency WHERE idempotency_key = 'k-payload'`);
+    expect(row.rows[0]!.request_hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("rows written before the payload hash existed skip the payload check", async () => {
+    const bus = new CommandBus<PgTx>({ uow: new PgUnitOfWork(pool), idempotencyStore: new PgIdempotencyStore() });
+    const handle = vi.fn(async () => ({ ok: true }));
+    bus.register({ commandType: "Deposit", handle } as CommandHandler<DepositCommand, { ok: boolean }, PgTx>);
+
+    await bus.send(makeCommand({ idempotencyKey: "k-legacy", amount: 100 }));
+    await pool.query(`UPDATE eventfabric.command_idempotency SET request_hash = NULL WHERE idempotency_key = 'k-legacy'`);
+
+    expect(await bus.send(makeCommand({ idempotencyKey: "k-legacy", amount: 5000 }))).toEqual({ ok: true });
+    expect(handle).toHaveBeenCalledTimes(1);
+  });
+
   it("rolls back the slot when the handler throws so a retry re-runs it", async () => {
     const bus = new CommandBus<PgTx>({
       uow: new PgUnitOfWork(pool),

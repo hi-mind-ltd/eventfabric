@@ -137,6 +137,39 @@ describe("CommandBus", () => {
     expect(withdraw).not.toHaveBeenCalled();
   });
 
+  it("rejects an idempotency key reused with a different payload for the same command type", async () => {
+    const bus = new CommandBus<TxToken>({
+      uow: new CountingUnitOfWork(),
+      idempotencyStore: new InMemoryIdempotencyStore(),
+    });
+    const handle = vi.fn(async (c: DepositCommand) => ({ deposited: c.payload.amount }));
+    bus.register({ commandType: "Deposit", handle } as any);
+
+    await bus.send(makeCommand());
+    const err = await bus
+      .send(makeCommand({ payload: { accountId: "a1", amount: 5000 } }))
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(IdempotencyKeyConflictError);
+    expect(err).toMatchObject({ reason: "payload" });
+    expect(handle).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats the same payload with keys in a different order as a retry", async () => {
+    const bus = new CommandBus<TxToken>({
+      uow: new CountingUnitOfWork(),
+      idempotencyStore: new InMemoryIdempotencyStore(),
+    });
+    const handle = vi.fn(async () => ({ newBalance: 100 }));
+    bus.register({ commandType: "Deposit", handle } as any);
+
+    await bus.send(makeCommand({ payload: { accountId: "a1", amount: 100 } }));
+    const again = await bus.send(makeCommand({ payload: { amount: 100, accountId: "a1" } } as any));
+
+    expect(again).toEqual({ newBalance: 100 });
+    expect(handle).toHaveBeenCalledTimes(1);
+  });
+
   it("releases the slot when the handler throws so a retry re-runs it", async () => {
     const bus = new CommandBus<TxToken>({
       uow: new CountingUnitOfWork(),

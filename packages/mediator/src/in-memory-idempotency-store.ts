@@ -2,8 +2,8 @@ import type { Transaction } from "@eventfabric/core";
 import type { ClaimResult, IdempotencyStore } from "./idempotency-store";
 
 type Slot =
-  | { status: "in_flight"; commandId: string; commandType: string }
-  | { status: "completed"; result: unknown; commandType: string };
+  | { status: "in_flight"; commandId: string; commandType: string; requestHash?: string }
+  | { status: "completed"; result: unknown; commandType: string; requestHash?: string };
 
 /**
  * Process-local idempotency store. Suitable for unit tests and single-process
@@ -22,16 +22,26 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
 
   async claim(
     _tx: Transaction,
-    params: { key: string; commandType: string; commandId: string; tenantId?: string }
+    params: { key: string; commandType: string; commandId: string; tenantId?: string; requestHash?: string }
   ): Promise<ClaimResult> {
     const slotKey = this.slotKey(params.tenantId, params.key);
     const existing = this.slots.get(slotKey);
     if (!existing) {
-      this.slots.set(slotKey, { status: "in_flight", commandId: params.commandId, commandType: params.commandType });
+      this.slots.set(slotKey, {
+        status: "in_flight",
+        commandId: params.commandId,
+        commandType: params.commandType,
+        requestHash: params.requestHash,
+      });
       return { state: "claimed" };
     }
     if (existing.status === "completed") {
-      return { state: "completed", result: existing.result, commandType: existing.commandType };
+      return {
+        state: "completed",
+        result: existing.result,
+        commandType: existing.commandType,
+        ...(existing.requestHash !== undefined ? { requestHash: existing.requestHash } : {}),
+      };
     }
     return { state: "in_flight" };
   }
@@ -41,8 +51,13 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
     params: { key: string; tenantId?: string; result: unknown }
   ): Promise<void> {
     const slotKey = this.slotKey(params.tenantId, params.key);
-    const commandType = this.slots.get(slotKey)?.commandType ?? "";
-    this.slots.set(slotKey, { status: "completed", result: params.result, commandType });
+    const prior = this.slots.get(slotKey);
+    this.slots.set(slotKey, {
+      status: "completed",
+      result: params.result,
+      commandType: prior?.commandType ?? "",
+      requestHash: prior?.requestHash,
+    });
   }
 
   async release(

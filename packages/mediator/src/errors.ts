@@ -34,18 +34,24 @@ export class ConcurrentCommandInFlightError extends Error {
 
 /**
  * Thrown by idempotency middleware when an idempotency key that already
- * completed is reused for a different command type. Returning the stored
- * result would report success for a command that never ran.
+ * completed is reused for a different command: another command type, or
+ * the same type with a different payload. Returning the stored result would
+ * report success for a command that never ran.
  */
 export class IdempotencyKeyConflictError extends Error {
   constructor(
     public readonly idempotencyKey: string,
     public readonly commandType: string,
-    public readonly originalCommandType: string
+    public readonly originalCommandType: string,
+    /** What differed: the command type, or (same type) the payload. */
+    public readonly reason: "command-type" | "payload" = "command-type"
   ) {
     super(
-      `Idempotency key ${idempotencyKey} was already used for a "${originalCommandType}" command; ` +
-      `it cannot be reused for "${commandType}"`
+      reason === "payload"
+        ? `Idempotency key ${idempotencyKey} was already used for a "${commandType}" command with a ` +
+          `different payload; use a new key for a new request`
+        : `Idempotency key ${idempotencyKey} was already used for a "${originalCommandType}" command; ` +
+          `it cannot be reused for "${commandType}"`
     );
     this.name = "IdempotencyKeyConflictError";
   }

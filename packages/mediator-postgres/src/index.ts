@@ -17,5 +17,5 @@ export type { PgIdempotencyStoreOptions } from "./pg-idempotency-store";
 export const commandsMigrations: MigrationSet = {
   source: "@eventfabric/mediator-postgres",
   dir: join(dirname(fileURLToPath(import.meta.url)), "..", "migrations"),
-  migrations: ["010_command_idempotency"],
+  migrations: ["010_command_idempotency", "018_command_request_hash"],
 };

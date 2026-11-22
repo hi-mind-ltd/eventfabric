@@ -8,7 +8,7 @@ for a specific beta.
 | Package | Contains |
 |---|---|
 | `@eventfabric/mediator` | `Command` envelope, `CommandBus`, `CommandHandler`, middleware composition, `IdempotencyStore` interface, `InMemoryIdempotencyStore`, `commandContextToEventMeta`. Backend-agnostic. |
-| `@eventfabric/mediator-postgres` | `PgIdempotencyStore` + watchdog, `commandsMigrations` (migration 010). |
+| `@eventfabric/mediator-postgres` | `PgIdempotencyStore` + watchdog, `commandsMigrations` (migrations 010 and 018). |
 | `@eventfabric/mediator-opentelemetry` | `createCommandBusObserver` middleware (tracing + counters + histograms), `createCommandIdempotencyGauges` (observable gauges for the idempotency table). |
 
 ## When to use a command bus
@@ -132,8 +132,10 @@ The default is `idempotency: "required"` — every command must carry an
 | Claim outcome | What the bus does |
 |---|---|
 | `claimed` (no prior row) | Runs the handler. On success, marks the slot `completed` with the stored result and returns it. On failure, the tx rolls back; the slot vanishes; the next retry of the same key claims afresh. |
-| `completed` (prior row with stored result) | Returns the stored result. Handler is **not** invoked. This is the exactly-once-effect path. |
+| `completed` (prior row with stored result) | Returns the stored result. Handler is **not** invoked. This is the exactly-once-effect path. If the key was first used for a different command type, or the same type with a different payload, throws `IdempotencyKeyConflictError` instead (`reason`: `"command-type"` or `"payload"`). |
 | `in_flight` (another worker holds the slot) | Default: wait-and-retry for up to 5 seconds (`inFlightWaitMs`), polling every 50ms (`pollIntervalMs`). If still in flight, throws `ConcurrentCommandInFlightError`. Alternative strategy: `conflictStrategy: "reject"` — throws immediately. |
+
+A retry must send the same payload as the first attempt. The bus stores a SHA-256 of the payload's canonical JSON with the key (key order doesn't matter), and a different payload under the same key is rejected rather than answered with the first command's result. Generate a new key for each new request, never from something coarser such as an account id.
 
 To opt a specific handler out of idempotency:
 
@@ -388,7 +390,7 @@ The PG package ships one table — see the
 
 | Table | Migration | Purpose |
 |---|---|---|
-| `eventfabric.command_idempotency` | `010_command_idempotency.sql` | Dedup slot per `(tenant_id, idempotency_key)` with status `in_flight` / `completed` / `failed`. |
+| `eventfabric.command_idempotency` | `010_command_idempotency.sql`, `018_command_request_hash.sql` | Dedup slot per `(tenant_id, idempotency_key)` with status `in_flight` / `completed` / `failed`, and a hash of the payload the key was first used with. |
 
 Apply via:
 
