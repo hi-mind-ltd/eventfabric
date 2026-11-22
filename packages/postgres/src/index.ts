@@ -18,6 +18,7 @@ export { PgSnapshotStore } from "./snapshots/pg-snapshot-store";
 
 export { PgProjectionCheckpointStore } from "./projections/pg-projection-checkpoint-store";
 export { PgCatchUpProjector, createCatchUpProjector } from "./projections/pg-catch-up-projector";
+export { PgHighWaterMark, type PgHighWaterMarkOptions } from "./projections/pg-high-water-mark";
 
 export { PgOutboxStore } from "./outbox/pg-outbox-store";
 export { PgAsyncProjectionRunner, createAsyncProjectionRunner } from "./projections/pg-async-projection-runner";

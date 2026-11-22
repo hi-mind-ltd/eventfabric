@@ -97,6 +97,12 @@ export interface EventStore<E extends AnyEvent, TTx extends Transaction = Transa
        * projector always sets this so each projection round is single-tenant.
        */
       tenantId?: string;
+      /**
+       * Optional inclusive upper bound. The catch-up projector passes the
+       * high water mark here so it never reads past a position that an
+       * in-flight transaction might still commit below.
+       */
+      toGlobalPositionInclusive?: bigint;
     }
   ): Promise<EventEnvelope<E>[]>;
 
@@ -116,7 +122,7 @@ export interface EventStore<E extends AnyEvent, TTx extends Transaction = Transa
    */
   discoverActiveTenants(
     tx: TTx,
-    params: { fromGlobalPositionExclusive: bigint; limit?: number }
+    params: { fromGlobalPositionExclusive: bigint; toGlobalPositionInclusive?: bigint; limit?: number }
   ): Promise<string[]>;
 
   dismiss(tx: TTx, eventId: string, info?: { reason?: string; by?: string; at?: string }): Promise<void>;

@@ -214,14 +214,17 @@ describe("late-committing events", () => {
     const fastPos = await appendOne("fast");
     expect(fastPos).toBeGreaterThan(latePos);
 
-    await projector.catchUpProjection(projection as any);
-    expect(handled).toEqual(["fast"]);
+    // While "late" is in flight the high water mark must hold below it, so
+    // the checkpoint cannot jump past it ("fast" waits too).
+    await projector.catchUpProjection(projection as any, { highWaterMarkWaitMs: 200 });
+    expect(handled).toEqual([]);
 
     await slow.commit();
     await projector.catchUpProjection(projection as any);
 
-    // BUG: loadGlobal reads global_position > checkpoint, so "late" is never read.
-    expect(handled).toContain("late");
+    // Previously: loadGlobal read global_position > checkpoint with no upper
+    // bound, so "fast" advanced the checkpoint and "late" was never read.
+    expect(handled).toEqual(["late", "fast"]);
   }, 20000);
 });
 

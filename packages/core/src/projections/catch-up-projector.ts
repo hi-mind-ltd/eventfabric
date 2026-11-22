@@ -2,11 +2,20 @@ import type { AnyEvent, EventEnvelope, Transaction, UnitOfWork, EventStore } fro
 import type { ProjectionCheckpointStore } from "./projection-checkpoint-store";
 import type { CatchUpProjection } from "./catch-up-projection";
 import type { CatchUpProjectorObserver, CatchUpHandlerInfo } from "./catch-up-observer";
+import type { HighWaterMark } from "./high-water-mark";
 
 export type CatchUpOptions = {
   batchSize?: number;
   includeDismissed?: boolean;
   maxBatches?: number;
+  /**
+   * How long to wait, at the start of a catch-up call, for transactions that
+   * are in flight right now to finish, so the call can process everything
+   * committed before it started. Only used when the projector has a
+   * HighWaterMark. Default: 2000. Events not yet safe when the wait ends are
+   * picked up by a later call.
+   */
+  highWaterMarkWaitMs?: number;
   /** Optional observability hooks. See CatchUpProjectorObserver for details. */
   observer?: CatchUpProjectorObserver;
 };
@@ -59,7 +68,15 @@ export class CatchUpProjector<E extends AnyEvent, TTx extends Transaction = Tran
   constructor(
     private readonly uowFactory: TenantScopedUnitOfWorkFactory<TTx>,
     private readonly eventStore: EventStore<E, TTx>,
-    private readonly checkpoints: ProjectionCheckpointStore<TTx>
+    private readonly checkpoints: ProjectionCheckpointStore<TTx>,
+    /**
+     * Bounds every read so the checkpoint never moves past a position that
+     * an in-flight transaction might still commit. Without it, events whose
+     * transaction commits after a higher position was processed are skipped
+     * for good. Optional only for backends that assign positions in commit
+     * order (and for tests); the Postgres factory always supplies one.
+     */
+    private readonly highWaterMark?: HighWaterMark
   ) {}
 
   /** Fire a synchronous lifecycle hook. Never lets observer errors escape. */
@@ -116,13 +133,16 @@ export class CatchUpProjector<E extends AnyEvent, TTx extends Transaction = Tran
     tenantId: string,
     batchSize: number,
     includeDismissed: boolean,
-    observer: CatchUpProjectorObserver | undefined
+    observer: CatchUpProjectorObserver | undefined,
+    upTo: bigint | undefined
   ): Promise<boolean> {
     const uow = this.uowFactory.forTenant(tenantId);
     return uow.withTransaction(async (tx) => {
       const cp = await this.checkpoints.get(tx, projection.name, tenantId);
+      if (upTo !== undefined && cp.lastGlobalPosition >= upTo) return false;
       const envs = await this.eventStore.loadGlobal(tx, {
         fromGlobalPositionExclusive: cp.lastGlobalPosition,
+        toGlobalPositionInclusive: upTo,
         limit: batchSize,
         includeDismissed,
         tenantId
@@ -162,13 +182,14 @@ export class CatchUpProjector<E extends AnyEvent, TTx extends Transaction = Tran
    * tenant that has events older than the lowest checkpoint will still be
    * picked up because its own checkpoint is 0.
    */
-  private async discoverTenants(projection: CatchUpProjection<E, TTx>): Promise<string[]> {
+  private async discoverTenants(_projection: CatchUpProjection<E, TTx>, upTo: bigint | undefined): Promise<string[]> {
     // We need a tx to call discoverActiveTenants; use an arbitrary tenant
     // scope ("default") since discovery itself is cross-tenant.
     const uow = this.uowFactory.forTenant("default");
     return uow.withTransaction(async (tx) => {
       return this.eventStore.discoverActiveTenants(tx, {
-        fromGlobalPositionExclusive: 0n
+        fromGlobalPositionExclusive: 0n,
+        toGlobalPositionInclusive: upTo
       });
     });
   }
@@ -188,7 +209,15 @@ export class CatchUpProjector<E extends AnyEvent, TTx extends Transaction = Tran
     const maxBatches = options.maxBatches;
     const observer = options.observer;
 
-    const tenants = await this.discoverTenants(projection);
+    // Fix the upper bound for the whole call: everything at or below it is
+    // final, so the checkpoint can never jump over a late-committing event.
+    // Anything above it is left for the next call.
+    const upTo = this.highWaterMark
+      ? await this.highWaterMark.safePosition({ waitMs: options.highWaterMarkWaitMs ?? 2000 })
+      : undefined;
+    if (upTo === 0n) return;
+
+    const tenants = await this.discoverTenants(projection, upTo);
     if (tenants.length === 0) return;
 
     // Round-robin across tenants. One batch per tenant per pass; repeat
@@ -207,7 +236,8 @@ export class CatchUpProjector<E extends AnyEvent, TTx extends Transaction = Tran
             tenantId,
             batchSize,
             includeDismissed,
-            observer
+            observer,
+            upTo
           );
           if (!didWork) drained.push(tenantId);
         } catch (err) {
