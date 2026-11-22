@@ -389,6 +389,15 @@ exactly-once with its effects.
   monitoring.
 - Concurrent state advances are released back to `pending` and re-fired
   on the next round.
+- The claim commits on its own, so a timer can be cancelled or
+  re-scheduled between its claim and its delivery. The delivery
+  transaction re-checks and locks the row first (`lockClaimed`), and skips
+  a timer that is no longer claimed. The `skipped` count is returned from
+  `runOnce()`, and `onTimerSkipped` is emitted. A custom `SagaTimerStore`
+  without `lockClaimed` delivers every claimed timer.
+- A reaction can re-schedule the timer being delivered (a recurring
+  timer). The row goes back to `pending` with the new `fireAt`, because
+  `markFired` only changes a row that is still `claimed`.
 
 Configure:
 
@@ -643,7 +652,7 @@ Metrics emitted:
   `dispatched` / `released` / `failed`
 - `eventfabric.saga.command_dispatch_duration_ms` — histogram
 - `eventfabric.saga.timer_fire_total{result}` — counter, results
-  `fired` / `released` / `orphaned`
+  `fired` / `released` / `skipped` / `orphaned`
 - `eventfabric.saga.timer_fire_duration_ms` — histogram
 
 ### Queue gauges

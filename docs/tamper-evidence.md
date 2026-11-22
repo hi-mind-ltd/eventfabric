@@ -69,6 +69,12 @@ factory.registerAggregate(AuditLog, ["AuditRecorded", /* … */], "audit");
 factory.registerAggregate(AuditLog, [...], "audit", { tamperEvident: true });
 ```
 
+Registration decides which new streams are chained. A stream that is already chained
+(its `stream_versions` row has a `head_hash`) stays chained whatever the process
+appending to it has registered: a worker or script that hasn't registered the
+aggregate still extends the chain, as long as its store has the same
+`hashChain.secret`. A store without the secret refuses to append to a chained stream.
+
 That's it. Protected events now carry an `event_hash`; everything else is
 unchanged. **Aggregates you don't enable are byte-for-byte on the original write
 path** (NULL `event_hash`), and a store with no `hashChain.secret` doesn't even
@@ -167,8 +173,9 @@ deletion; less frequent = less background work.
   has events, those pre-existing events keep `NULL` `event_hash`; the chain starts
   at the next appended event (genesis). `verifyStream` verifies from the first
   protected event onward. Events before that point are out of scope.
-- **Payloads must be JSON round-trip stable.** The hash preimage is a canonical
-  JSON serialization (sorted keys). No `NaN`/`Infinity`, no `bigint`, and integers
+- **Payloads must be JSON round-trip stable.** The hash preimage is the canonical
+  JSON serialization (sorted keys) of the payload as stored, after its JSON round
+  trip, so a `Date` is hashed as its ISO string. No `NaN`/`Infinity`, no `bigint`, and integers
   within `Number.MAX_SAFE_INTEGER` (store larger values as strings). Violations
   throw at write time rather than silently producing an unverifiable chain.
 - **Coverage.** The hash covers identity, in-stream order (`aggregate_version` +

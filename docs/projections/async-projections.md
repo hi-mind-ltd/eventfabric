@@ -252,9 +252,11 @@ After processing, each outbox row follows one of three paths:
 |---------|--------|--------|
 | **Success** | `ack(tx, id)` | Deletes the row from the outbox. |
 | **Failure (retryable)** | `releaseWithError(tx, id, error)` | Clears `locked_at` and `locked_by`, stores the error in `last_error`. The row becomes claimable again. |
-| **Not attempted** (runner stopped, or an earlier row in a `perRow` batch failed) | `release(tx, ids)` | Clears the lock and undoes the claim's `attempts` increment, so the row is claimable again without counting towards `maxAttempts`. |
+| **Not attempted** (runner stopped, an earlier row in a `perRow` batch failed, or another row in a `batch`-mode batch failed and rolled the batch back) | `release(tx, ids)` | Clears the lock and undoes the claim's `attempts` increment, so the row is claimable again without counting towards `maxAttempts`. |
 | **Event missing** (no event at the row's `global_position`) | `deadLetter(tx, row, reason)` | Dead-lettered with reason `Event not found for globalPosition=…`, in both transaction modes. |
 | **Failure (exceeded max attempts)** | `deadLetter(tx, row, reason)` | Copies the row to `eventfabric.outbox_dead_letters`, then deletes it from the active outbox. |
+
+The runner passes its `workerId` to each of these, so they only act while it still holds the row's lease. If its handler outlived `leaseMs` and another worker took the row over, `ack` throws `LeaseLostError` and the handler's writes roll back (see [Lease fencing](../outbox-and-dlq.md#lease-fencing)).
 
 The dead-letter check happens at claim time: if `row.attempts > maxAttempts`, the runner dead-letters the message immediately instead of attempting to process it again.
 
