@@ -1021,6 +1021,57 @@ describe("Session", () => {
     expect(state.balance).toBe(125);
   }, 15000);
 
+  it("snapshot from a direct append holds the full state, not just the events of that save", async () => {
+    const store = new PgEventStore<TestEvent>();
+    const snapshotStore = new PgSnapshotStore<AccountState>();
+    const factory = new SessionFactory(pool, store);
+    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account", {
+      snapshotStore, snapshotPolicy: { everyNEvents: 3 }, snapshotSchemaVersion: 1
+    });
+    const accountId = "acc-snap-direct";
+    const s1 = factory.createSession();
+    s1.startStream(accountId, { type: "AccountOpened", version: 1, accountId, customerId: "cust-d", initialBalance: 100, currency: "USD" });
+    await s1.saveChangesAsync();
+    const s2 = factory.createSession();
+    s2.append(accountId, 1, { type: "AccountDeposited", version: 1, accountId, amount: 50, balance: 150 });
+    await s2.saveChangesAsync();
+    const s3 = factory.createSession();
+    s3.append(accountId, 2, { type: "AccountDeposited", version: 1, accountId, amount: 50, balance: 200 });
+    await s3.saveChangesAsync();
+
+    const snap = await pool.query(
+      `SELECT aggregate_version, state FROM eventfabric.snapshots WHERE aggregate_name = 'Account' AND aggregate_id = $1`,
+      [accountId]
+    );
+    expect(snap.rows[0].aggregate_version).toBe(3);
+    expect(snap.rows[0].state).toEqual({ customerId: "cust-d", balance: 200, currency: "USD" });
+  }, 15000);
+
+  it("snapshot of a loaded aggregate includes events appended directly in the same session", async () => {
+    const store = new PgEventStore<TestEvent>();
+    const snapshotStore = new PgSnapshotStore<AccountState>();
+    const factory = new SessionFactory(pool, store);
+    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account", {
+      snapshotStore, snapshotPolicy: { everyNEvents: 2 }, snapshotSchemaVersion: 1
+    });
+    const accountId = "acc-snap-mixed";
+    const s1 = factory.createSession();
+    s1.startStream(accountId, { type: "AccountOpened", version: 1, accountId, customerId: "cust-m", initialBalance: 100, currency: "USD" });
+    await s1.saveChangesAsync();
+
+    const s2 = factory.createSession();
+    await s2.loadAggregateAsync<AccountAggregate>(accountId); // tracked, no events raised
+    s2.append(accountId, 1, { type: "AccountDeposited", version: 1, accountId, amount: 899, balance: 999 });
+    await s2.saveChangesAsync();
+
+    const snap = await pool.query(
+      `SELECT aggregate_version, state FROM eventfabric.snapshots WHERE aggregate_name = 'Account' AND aggregate_id = $1`,
+      [accountId]
+    );
+    expect(snap.rows[0].aggregate_version).toBe(2);
+    expect(snap.rows[0].state.balance).toBe(999);
+  }, 15000);
+
   it("loadAggregateAsync replays full history (ignores snapshot)", async () => {
     const store = new PgEventStore<TestEvent>();
     const snapshotStore = new PgSnapshotStore<AccountState>();

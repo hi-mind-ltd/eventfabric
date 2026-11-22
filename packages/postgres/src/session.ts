@@ -26,7 +26,15 @@ type EventToAggregateMap = {
  */
 type PendingOperation<E extends AnyEvent> =
   | { type: "startStream"; aggregateId: string; events: E[]; aggregateName: string }
-  | { type: "append"; aggregateId: string; expectedVersion: number; events: E[]; aggregateName: string };
+  | {
+      type: "append";
+      aggregateId: string;
+      expectedVersion: number;
+      events: E[];
+      aggregateName: string;
+      /** Events raised on a tracked aggregate (already applied to its state). */
+      fromTracked?: boolean;
+    };
 
 export type SnapshotPolicy = { everyNEvents: number };
 
@@ -582,7 +590,8 @@ export class Session<E extends AnyEvent> {
         aggregateId,
         expectedVersion: aggregate.version,
         events,
-        aggregateName: AggregateClass.aggregateName
+        aggregateName: AggregateClass.aggregateName,
+        fromTracked: true
       });
     }
 
@@ -673,32 +682,40 @@ export class Session<E extends AnyEvent> {
           const shouldSnapshot = newVersion % snapshotPolicy.everyNEvents === 0;
           
           if (shouldSnapshot) {
-            // Get the aggregate to snapshot its current state
-            let aggregate = this.loadedAggregates.get(aggregateId);
+            // The snapshot must hold the state AT newVersion. A tracked
+            // aggregate has it only when every event saved for it here was
+            // raised on it; events appended directly (append/appendUnsafe/
+            // startStream) were never applied to it.
+            const tracked = this.loadedAggregates.get(aggregateId);
+            const opsForAgg = this.pendingOperations.filter(p => p.aggregateId === aggregateId);
+            let aggregate: AggregateRoot<any, E> | undefined =
+              tracked && opsForAgg.every(p => p.type === "append" && p.fromTracked) ? tracked : undefined;
 
-            // If not tracked (e.g., startStream), reconstruct from appended events
+            // Otherwise rebuild it: from the events saved here when they are
+            // the whole stream (it started in this save), else from the
+            // full stream inside this transaction.
             if (!aggregate) {
               const AggregateClass = this.getAggregateClass(aggregateName);
-              const eventsForAgg = (aggregateEvents.get(aggregateId) || []).sort(
+              if (!AggregateClass) continue;
+              let history = (aggregateEvents.get(aggregateId) || []).slice().sort(
                 (a, b) => Number(a.aggregateVersion) - Number(b.aggregateVersion)
               );
-              if (AggregateClass && eventsForAgg.length > 0) {
-                const aggInstance = new AggregateClass(aggregateId);
-                aggInstance.version = 0;
-                aggInstance.loadFromHistory(
-                  eventsForAgg.map((e) => ({
-                    payload: e.payload as any,
-                    aggregateVersion: Number(e.aggregateVersion)
-                  }))
-                );
-                aggregate = aggInstance;
+              if (history.length === 0 || Number(history[0]!.aggregateVersion) !== 1) {
+                history = await this.store.loadStream(tx, { aggregateName, aggregateId });
               }
+              const aggInstance = new AggregateClass(aggregateId);
+              aggInstance.version = 0;
+              aggInstance.loadFromHistory(
+                history.map((e) => ({
+                  payload: e.payload as any,
+                  aggregateVersion: Number(e.aggregateVersion)
+                }))
+              );
+              if (aggInstance.version !== newVersion) continue;
+              aggregate = aggInstance;
             }
 
-            if (!aggregate) {
-              continue;
-            }
-
+            if (!aggregate) continue;
             const agg = aggregate;
 
             await snapshotStore.save(tx, {
