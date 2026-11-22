@@ -78,7 +78,7 @@ Key properties of this query:
 - **Atomic lock + increment**: The `UPDATE` sets `locked_at`, `locked_by`, and increments `attempts` in one statement.
 - **Topic filter**: The optional `$3` parameter filters by topic, allowing workers to specialize.
 - **Lease**: `$4` is the runner's `leaseMs`. A row whose lock is older than the lease is treated as abandoned (its worker crashed or lost its connection after claiming) and can be claimed again. Choose a lease well above the worst-case time to process one batch; otherwise a slow-but-alive worker's rows can be reclaimed and processed twice.
-- **Ordered**: Rows are claimed in insertion order (`ORDER BY id ASC`).
+- **Insertion order, not commit order**: Rows are claimed by `id`. A row whose transaction commits late is claimed after rows inserted later. Nothing is skipped, because every row is delivered until it is acked, but delivery order across streams is not guaranteed.
 
 ### 3. Process + Ack/Release
 
@@ -144,8 +144,8 @@ PostgreSQL's `FOR UPDATE SKIP LOCKED` is the heart of the outbox pattern. It pro
 
 1. **Mutual exclusion**: Each row is locked by at most one worker at a time.
 2. **Non-blocking**: Workers never wait for each other. If a row is locked, it is skipped.
-3. **Fairness**: Rows are processed in order. A locked row is just temporarily invisible, not permanently skipped.
-4. **No coordination**: Workers don't need to know about each other. They all poll the same table.
+3. **Recovery**: A locked row is only temporarily invisible. A lock older than the runner's `leaseMs` is treated as abandoned (crashed worker) and the row is claimed again.
+4. **No coordination**: Workers don't need to know about each other. They all poll the same table. Each row is delivered to exactly one of them, so runners with different handlers must split the outbox with `claimTopic`.
 
 This is why EventFabric doesn't need an external message broker for the outbox pattern -- PostgreSQL provides all the coordination primitives natively.
 
@@ -351,6 +351,7 @@ The outbox tables are created as part of EventFabric's schema migration:
 ```sql
 CREATE TABLE eventfabric.outbox (
   id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',  -- origin tenant (for DLQ inspection)
   global_position BIGINT NOT NULL UNIQUE,
   topic TEXT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -364,6 +365,7 @@ CREATE TABLE eventfabric.outbox (
 
 CREATE TABLE eventfabric.outbox_dead_letters (
   id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
   outbox_id BIGINT,
   global_position BIGINT NOT NULL,
   topic TEXT NULL,
@@ -376,6 +378,7 @@ CREATE TABLE eventfabric.outbox_dead_letters (
 ## Related docs
 
 - [Async Projections](./projections/async-projections.md) -- the `AsyncProjectionRunner` that consumes the outbox
+- [Projection Daemon](./projections/projection-daemon.md) -- projections from the event log, with their own dead-letter table
 - [Catch-Up Projections](./projections/catch-up-projections.md) -- when to use catch-up instead of outbox
 - [Projections Overview](./projections/overview.md) -- the three projection tiers and decision matrix
 - [Observability](./observability.md) -- monitoring runner and DLQ activity with OpenTelemetry

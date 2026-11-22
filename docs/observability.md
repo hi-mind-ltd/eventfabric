@@ -128,6 +128,7 @@ The catch-up projector has its own observer with the same design principles.
 // @eventfabric/core
 
 export type CatchUpProjectorObserver = {
+  onEventDeadLettered?(info: CatchUpEventDeadLetteredInfo): void; // ProjectionDaemon only
   onBatchLoaded?(info: CatchUpBatchLoadedInfo): void;
   onEventHandled?(info: CatchUpEventHandledInfo): void;
   onEventFailed?(info: CatchUpEventFailedInfo): void;
@@ -171,6 +172,12 @@ export type CatchUpProjectorErrorInfo = {
   projection: string;
   error: Error;
 };
+
+export type CatchUpEventDeadLetteredInfo = CatchUpHandlerInfo & {
+  tenantId: string;
+  attempts: number;
+  lastError: string | null;
+};
 ```
 
 ### Hook lifecycle
@@ -182,6 +189,9 @@ export type CatchUpProjectorErrorInfo = {
 | `onEventFailed` | A handler throws | Handler info + duration + error |
 | `onCheckpointAdvanced` | The checkpoint is updated after a batch | Projection name, from/to positions |
 | `onProjectorError` | The projector encounters an error (batch-level) | Projection name, error |
+| `onEventDeadLettered` | `ProjectionDaemon` only: an event exceeded `maxAttempts` and was dead-lettered | Handler info + tenant, attempts, last error |
+
+The [Projection Daemon](./projections/projection-daemon.md) takes the same observer.
 
 ## `fireHook` safety
 

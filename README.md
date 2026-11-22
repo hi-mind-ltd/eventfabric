@@ -117,7 +117,29 @@ app.post("/users/:id/change-email", async (req, res) => {
 });
 ```
 
-### 5. Add an Async Projection
+### 5. Run projections in the background
+
+```typescript
+import { createProjectionDaemon } from "@eventfabric/postgres";
+
+// Checkpoint per projection + tenant: back-fills, rebuilds, retries,
+// dead-letters, and is safe to run on several nodes.
+const daemon = createProjectionDaemon(pool, store, [{
+  name: "user-directory",
+  async handle(tx, env) {
+    if (env.payload.type === "UserRegistered") {
+      await tx.client.query(
+        "INSERT INTO user_directory (id, email) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        [env.payload.userId, env.payload.email]
+      );
+    }
+  }
+}]);
+
+daemon.start(new AbortController().signal);
+```
+
+For per-message outbox delivery with topic routing, use the outbox runner:
 
 ```typescript
 import { createAsyncProjectionRunner } from "@eventfabric/postgres";
@@ -309,10 +331,9 @@ sequenceDiagram
     Runner->>Saga: handle(tx, TransactionStarted)
     rect rgb(232, 244, 233)
     Note over Saga,DB: All under one transaction
-    Saga->>DB: INSERT saga_instances  (state, version=1)
+    Saga->>DB: INSERT saga_instances  (state, version=1, last_event_pos)
     Saga->>DB: INSERT saga_pending_commands  (WithdrawFromAccount)
     Saga->>DB: INSERT saga_scheduled_messages  (withdraw-timeout @ +30s)
-    Saga->>DB: UPDATE projection_checkpoints  (lastEventPos)
     end
 
     loop until end
@@ -387,6 +408,7 @@ event store or the outbox runner; it composes with them.
 
 - [Overview](docs/projections/overview.md) — the three tiers and when to use each
 - [Inline Projections](docs/projections/inline-projections.md) — transactional read models
+- [Projection Daemon](docs/projections/projection-daemon.md) — run projections continuously: high water mark, retries, dead letters, rebuilds, multi-node
 - [Catch-up Projections](docs/projections/catch-up-projections.md) — checkpoint-based background processing
 - [Async Projections](docs/projections/async-projections.md) — outbox pattern, batch vs perRow, DLQ
 - [Single-Event Projections](docs/projections/single-event-projections.md) — `forEventType` helper
@@ -432,7 +454,8 @@ await migrate(pool, { extensions: [commandsMigrations, sagasMigrations] });
 | `eventfabric.stream_versions` | core | Concurrency gatekeeper (one row per stream) |
 | `eventfabric.outbox` | core | Transactional outbox for at-least-once async delivery |
 | `eventfabric.outbox_dead_letters` | core | Dead-letter queue for poison messages |
-| `eventfabric.projection_checkpoints` | core | Per-projection progress tracking |
+| `eventfabric.projection_checkpoints` | core | Progress per (projection, tenant) for catch-up projections and the projection daemon |
+| `eventfabric.projection_dead_letters` | core | Events the projection daemon gave up on after `maxAttempts` |
 | `eventfabric.snapshots` | core | Latest-only aggregate state snapshots |
 | `eventfabric.command_idempotency` | mediator-postgres | Dedup slot per `(tenant_id, idempotency_key)` for `CommandBus.send` |
 | `eventfabric.saga_instances` | sagas-postgres | Per-instance saga state with optimistic `state_version` CAS |

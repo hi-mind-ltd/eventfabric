@@ -8,7 +8,8 @@ Includes:
 - Inline projections (transactional with append)
 - Async projections via outbox + SKIP LOCKED with per-aggregate topic routing
 - DLQ after max attempts + requeue helpers
-- Projection checkpoints
+- Projection checkpoints (per projection and tenant, claimed per batch)
+- Projection daemon (`createProjectionDaemon`): high water mark against late commits, retries, dead letters, rebuilds, multi-node
 - Snapshots (latest-only) with schema versioning/upcasting
 - Automatic database migrations
 - [Multi-tenancy](docs/multi-tenancy.md) — conjoined (shared database) or per-database isolation
@@ -33,6 +34,7 @@ Tables created in the `eventfabric` schema:
 - `eventfabric.events`
 - `eventfabric.stream_versions`
 - `eventfabric.projection_checkpoints`
+- `eventfabric.projection_dead_letters`
 - `eventfabric.outbox`
 - `eventfabric.outbox_dead_letters`
 - `eventfabric.snapshots`

@@ -2,7 +2,9 @@
 
 Async projections consume events through a transactional outbox. Events are enqueued atomically with the write, then claimed by a background runner that delivers them to projection handlers with at-least-once guarantees, per-message retry, dead-letter support, and topic-based routing.
 
-This tier is designed for **external side effects** -- sending emails, calling webhooks, publishing to message brokers -- where you need reliable delivery and graceful failure handling.
+This tier is for **per-message outbox delivery with topic routing**.
+
+> **For projections, prefer the [Projection Daemon](./projection-daemon.md).** It reads the event log with a checkpoint per projection, so it can back-fill new projections, rebuild them, and run projections on separate nodes that each see every event. The outbox runner delivers each row once, to whichever runner claims it, and the row is gone afterwards.
 
 For an overview of all projection tiers, see [Projections Overview](./overview.md).
 
@@ -68,8 +70,8 @@ Enters an infinite poll loop:
 1. Claim a batch of outbox rows (locked with `FOR UPDATE SKIP LOCKED`).
 2. If the batch is empty, sleep for `idleSleepMs` and try again.
 3. Process each row according to the configured `transactionMode`.
-4. On success, acknowledge (delete) the outbox row.
-5. On failure, release the row (unlock + increment attempts) or dead-letter it.
+4. On success, acknowledge (delete) the outbox row, in the same transaction as the handlers.
+5. On failure, release the row (unlock; `attempts` was already incremented when the row was claimed) or dead-letter it.
 6. Repeat until `signal` is aborted.
 
 The loop is abort-aware: pass an `AbortSignal` from an `AbortController` and abort it on `SIGINT`/`SIGTERM` for graceful shutdown.
@@ -134,7 +136,7 @@ All claimed rows are processed in a **single transaction**. If all handlers succ
 - All-or-nothing semantics.
 
 **Risks:**
-- A poison message (one that always fails) temporarily affects the entire batch. On the next poll, the batch will be different (due to `SKIP LOCKED`), so the poison message will eventually isolate itself.
+- A poison message (one that always fails) fails the entire batch on every attempt. The next poll claims the same rows again (`ORDER BY id`), so its siblings keep failing alongside it until every row in the batch reaches `maxAttempts` and is dead-lettered, siblings included. Use `"perRow"` if a single bad message must not take its neighbours with it.
 
 **Best for:** High-throughput idempotent handlers where all processing is database work.
 
@@ -180,7 +182,7 @@ Each row is processed in its **own transaction**. If one handler fails, only tha
 | Sending emails | `"perRow"` |
 | Calling webhooks / external APIs | `"perRow"` |
 | Publishing to a message broker | `"perRow"` |
-| Mixed: some handlers are external, some internal | Run two separate runners |
+| Mixed: some handlers are external, some internal | Two runners **with disjoint `claimTopic`s** (each row goes to only one runner), or the [Projection Daemon](./projection-daemon.md) for the internal ones |
 
 ## Topic filtering
 
@@ -237,10 +239,10 @@ RETURNING o.id, o.global_position, o.topic, o.attempts
 
 Key properties:
 
-- **Non-blocking.** `SKIP LOCKED` skips rows already locked by another worker. Multiple runners can poll concurrently without deadlocks.
+- **Non-blocking.** `SKIP LOCKED` skips rows already locked by another worker. Several replicas of the **same** runner can poll concurrently. Runners with **different** projections must not share rows: each row is delivered to whichever runner claims it, so split them with `claimTopic`.
 - **Atomic lock + increment.** The `UPDATE` sets `locked_at`, `locked_by`, and increments `attempts` in one statement.
 - **Lease.** `$4` is the runner's `leaseMs`. A row whose lock is older than the lease is treated as abandoned (its worker crashed or lost its connection after claiming) and can be claimed again. Choose a lease well above the worst-case time to process one batch; otherwise a slow-but-alive worker's rows can be reclaimed and processed twice.
-- **Ordered.** Rows are claimed in `id` order, preserving insertion order within a topic.
+- **Roughly ordered.** Rows are claimed in `id` order, i.e. the order they were **inserted**, not the order their transactions committed. With several replicas, or after a release or retry, events can also be handled out of order. Do not rely on outbox order across streams.
 
 ## Ack, release, and dead-letter
 
@@ -353,11 +355,12 @@ const runner = createAsyncProjectionRunner(pool, store, [projection1, projection
 });
 ```
 
-The factory wires up `PgUnitOfWork`, `PgOutboxStore`, and `PgProjectionCheckpointStore` for you.
+The factory wires up `PgUnitOfWork` and `PgOutboxStore` for you.
 
 ## Related docs
 
 - [Projections Overview](./overview.md) -- the three projection tiers and decision matrix
+- [Projection Daemon](./projection-daemon.md) -- the recommended way to run asynchronous projections
 - [Inline Projections](./inline-projections.md) -- strong consistency inside the write transaction
 - [Catch-Up Projections](./catch-up-projections.md) -- eventual consistency via checkpoint
 - [Single-Event Projections](./single-event-projections.md) -- narrowing to a single event type

@@ -26,8 +26,8 @@ EventFabric organizes projections into three tiers, each with different consiste
 | Tier | Consistency | Mechanism | Latency impact | Use case |
 |------|------------|-----------|----------------|----------|
 | **Inline** | Strong (same transaction) | Runs inside the write transaction via `InlineProjector` | Adds write latency | Read models that must never be stale (balances, inventory counts) |
-| **Catch-up** | Eventual (checkpoint-based) | Reads forward from `eventfabric.projection_checkpoints` | None on writes; projection lag depends on polling interval | Process managers, internal state machines, audit logs |
-| **Async (outbox)** | Eventual (outbox-based) | Claims rows from `eventfabric.outbox` with `FOR UPDATE SKIP LOCKED` | None on writes; delivery lag depends on polling + processing | External side effects: email, webhooks, third-party API calls |
+| **Catch-up / daemon** | Eventual (checkpoint-based) | Reads the event log from a checkpoint per projection and tenant, up to the high water mark. Run continuously by the `ProjectionDaemon` | None on writes; lag depends on polling interval | Read models, process managers, audit logs, notifications |
+| **Async (outbox)** | Eventual (outbox-based) | Claims rows from `eventfabric.outbox` with `FOR UPDATE SKIP LOCKED` | None on writes; delivery lag depends on polling + processing | Per-message delivery with topic routing |
 
 ### Inline projections
 
@@ -39,11 +39,13 @@ See [Inline Projections](./inline-projections.md) for the full API.
 
 Catch-up projections read events forward from the global event log, starting from their last checkpoint. They run outside the write transaction and are eventually consistent. Each projection tracks its own checkpoint in `eventfabric.projection_checkpoints`, so projections compose independently -- adding a new one doesn't affect existing ones.
 
+In production, run them with the [Projection Daemon](./projection-daemon.md). It polls continuously, retries failing events, dead-letters the ones that keep failing, supports rebuilds, and is safe to run on several nodes.
+
 See [Catch-Up Projections](./catch-up-projections.md) for the full API.
 
 ### Async (outbox) projections
 
-Async projections consume events from a transactional outbox. Events are enqueued atomically with the write, then claimed by a background runner. This tier adds topic filtering, per-message retry, dead-letter queuing, and backoff -- everything needed for reliable delivery of external side effects.
+Async projections consume events from a transactional outbox. Events are enqueued atomically with the write, then claimed by a background runner, with topic filtering, per-message retry, dead-letter queuing and backoff. Each outbox row is delivered once, to whichever runner claims it, so this tier cannot back-fill or rebuild a projection. Prefer the [Projection Daemon](./projection-daemon.md) unless you specifically need outbox delivery.
 
 See [Async Projections](./async-projections.md) for the full API.
 
@@ -63,15 +65,15 @@ Use this matrix to pick the right tier for your projection:
 
 **Rules of thumb:**
 
-1. Start with **catch-up** for internal projections. It is the simplest model and has no outbox overhead.
+1. Start with **catch-up projections run by the [Projection Daemon](./projection-daemon.md)**. They back-fill, rebuild, retry, dead-letter and scale out, with no outbox overhead.
 2. Use **inline** only when stale reads are unacceptable and you can tolerate the write-latency cost.
-3. Use **async/outbox** when you need to deliver events to external systems with at-least-once guarantees.
+3. Use **async/outbox** only when you specifically need per-message outbox delivery with topic routing.
 
 ## How projections compose
 
 Projections in EventFabric are independent. Each projection:
 
-- Has its own **name** (used as the checkpoint key).
+- Has its own **name** (used as the checkpoint key for catch-up projections).
 - Tracks its own **checkpoint** (the last processed `globalPosition`).
 - Decides independently which events it cares about (via event-type checks or topic filters).
 
@@ -92,13 +94,14 @@ await projector.catchUpAll([
 ], { batchSize: 100 });
 ```
 
-Similarly, async projections compose through topic filtering -- different projections can subscribe to different topics on the same outbox runner, or run on separate runners entirely.
+Async (outbox) projections compose through topic filtering: different projections can subscribe to different topics on the same outbox runner. Separate outbox runners must split the outbox with `claimTopic`, because each row is delivered to only one runner.
 
 For narrowing a projection to a single event type, see [Single-Event Projections](./single-event-projections.md).
 
 ## Further reading
 
 - [Inline Projections](./inline-projections.md) -- strong consistency inside the write transaction
+- [Projection Daemon](./projection-daemon.md) -- running projections continuously: retries, dead letters, rebuilds, scale-out
 - [Catch-Up Projections](./catch-up-projections.md) -- eventual consistency via checkpoint tracking
 - [Async Projections](./async-projections.md) -- eventual consistency via transactional outbox
 - [Single-Event Projections](./single-event-projections.md) -- narrowing to a single event type
