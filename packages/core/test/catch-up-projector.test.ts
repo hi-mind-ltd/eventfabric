@@ -508,5 +508,52 @@ describe("CatchUpProjector", () => {
       expect(checkpoints.checkpoints.has("p|b")).toBe(false);
     });
   });
+  describe("checkpoint claims", () => {
+    const ev = (pos: number): EventEnvelope<E> => ({
+      globalPosition: BigInt(pos),
+      payload: { type: "TestEvent", version: 1, value: `event${pos}` },
+      tenantId: "default",
+      aggregateName: "A",
+      aggregateId: String(pos),
+      aggregateVersion: 1,
+      occurredAt: new Date().toISOString(),
+      dismissed: false
+    });
+
+    it("uses claim() when available and skips a tenant another instance holds", async () => {
+      eventStore.events = [ev(1)];
+      const claimStore = Object.assign(new MockCheckpointStore(), {
+        claims: 0,
+        async claim(): Promise<ProjectionCheckpoint | null> {
+          this.claims++;
+          return null; // busy
+        }
+      });
+      projector = new CatchUpProjector(uow, eventStore, claimStore);
+      const handled: bigint[] = [];
+
+      await projector.catchUpProjection({ name: "p", async handle(_tx, env) { handled.push(env.globalPosition); } });
+
+      expect(claimStore.claims).toBe(1);
+      expect(handled).toEqual([]);
+      expect(eventStore.loadGlobalCalls).toHaveLength(0);
+    });
+
+    it("processes from the claimed checkpoint", async () => {
+      eventStore.events = [ev(1), ev(2), ev(3)];
+      const claimStore = Object.assign(new MockCheckpointStore(), {
+        async claim(tx: MockTx, name: string, tenantId: string) {
+          return this.get(tx, name, tenantId);
+        }
+      });
+      await claimStore.set({ tenantId: "default" }, "p", "default", 1n);
+      projector = new CatchUpProjector(uow, eventStore, claimStore);
+      const handled: bigint[] = [];
+
+      await projector.catchUpProjection({ name: "p", async handle(_tx, env) { handled.push(env.globalPosition); } });
+
+      expect(handled).toEqual([2n, 3n]);
+    });
+  });
 });
 

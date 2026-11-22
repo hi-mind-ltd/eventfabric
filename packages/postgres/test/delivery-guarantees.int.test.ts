@@ -434,3 +434,31 @@ describe("multiple runners on one outbox", () => {
     );
   }, 30000);
 });
+
+// ---------------------------------------------------------------------------
+// 5. Concurrent catch-up projector instances
+// ---------------------------------------------------------------------------
+
+describe("concurrent catch-up projectors", () => {
+  it("handles every event exactly once when several instances run the same projection", async () => {
+    const N = 40;
+    for (let i = 0; i < N; i++) await appendOne(`e${i}`, null);
+
+    const counts = new Map<string, number>();
+    const projection = recordingProjection("shared", [], async (env) => {
+      counts.set(env.payload.id, (counts.get(env.payload.id) ?? 0) + 1);
+      await delay(2); // widen the window in which instances could overlap
+    });
+
+    // Three instances (think: three nodes), racing on the same projection.
+    const projectors = [0, 1, 2].map(() => createCatchUpProjector<E>(pool, store));
+    const deadline = Date.now() + 20000;
+    while (counts.size < N && Date.now() < deadline) {
+      await Promise.all(projectors.map((p) => p.catchUpProjection(projection as any, { batchSize: 5 })));
+    }
+
+    expect(counts.size).toBe(N);
+    const duplicates = [...counts].filter(([, c]) => c > 1);
+    expect(duplicates).toEqual([]);
+  }, 30000);
+});

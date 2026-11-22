@@ -138,7 +138,13 @@ export class CatchUpProjector<E extends AnyEvent, TTx extends Transaction = Tran
   ): Promise<boolean> {
     const uow = this.uowFactory.forTenant(tenantId);
     return uow.withTransaction(async (tx) => {
-      const cp = await this.checkpoints.get(tx, projection.name, tenantId);
+      // Claim (lock) the checkpoint when the store supports it, so concurrent
+      // projector instances never process the same batch. A null claim means
+      // another instance is working on this tenant right now: skip it.
+      const cp = this.checkpoints.claim
+        ? await this.checkpoints.claim(tx, projection.name, tenantId)
+        : await this.checkpoints.get(tx, projection.name, tenantId);
+      if (!cp) return false;
       if (upTo !== undefined && cp.lastGlobalPosition >= upTo) return false;
       const envs = await this.eventStore.loadGlobal(tx, {
         fromGlobalPositionExclusive: cp.lastGlobalPosition,

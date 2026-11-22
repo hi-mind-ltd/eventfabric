@@ -249,5 +249,82 @@ describe("PgProjectionCheckpointStore", () => {
       new Date(before.updatedAt).getTime()
     );
   });
+  describe("claim", () => {
+    /** Open a transaction that stays open until release() is called. */
+    async function openTx() {
+      const client = await pool.connect();
+      await client.query("BEGIN");
+      return {
+        tx: { client, tenantId: "default" } as any,
+        release: async (how: "COMMIT" | "ROLLBACK" = "COMMIT") => {
+          await client.query(how);
+          client.release();
+        }
+      };
+    }
+
+    it("creates and returns a missing checkpoint at position 0", async () => {
+      const store = new PgProjectionCheckpointStore();
+      const cp = await new PgUnitOfWork(pool).withTransaction((tx) => store.claim(tx, "p", "default"));
+      expect(cp).not.toBeNull();
+      expect(cp!.lastGlobalPosition).toBe(0n);
+    });
+
+    it("returns the existing checkpoint", async () => {
+      const store = new PgProjectionCheckpointStore();
+      const uow = new PgUnitOfWork(pool);
+      await uow.withTransaction((tx) => store.set(tx, "p", "default", 42n));
+      const cp = await uow.withTransaction((tx) => store.claim(tx, "p", "default"));
+      expect(cp!.lastGlobalPosition).toBe(42n);
+    });
+
+    it("returns null without waiting while another transaction holds the checkpoint", async () => {
+      const store = new PgProjectionCheckpointStore();
+      const uow = new PgUnitOfWork(pool);
+      await uow.withTransaction((tx) => store.set(tx, "p", "default", 7n));
+
+      const a = await openTx();
+      expect((await store.claim(a.tx, "p", "default"))!.lastGlobalPosition).toBe(7n);
+
+      const started = Date.now();
+      const b = await uow.withTransaction((tx) => store.claim(tx, "p", "default"));
+      expect(b).toBeNull();
+      expect(Date.now() - started).toBeLessThan(1000);
+
+      // After the holder commits a new position, the next claim sees it.
+      await store.set(a.tx, "p", "default", 9n);
+      await a.release();
+      const c = await uow.withTransaction((tx) => store.claim(tx, "p", "default"));
+      expect(c!.lastGlobalPosition).toBe(9n);
+    });
+
+    it("returns null when another transaction is creating the same checkpoint", async () => {
+      const store = new PgProjectionCheckpointStore();
+      const a = await openTx();
+      expect(await store.claim(a.tx, "fresh", "default")).not.toBeNull();
+
+      const b = new PgUnitOfWork(pool).withTransaction((tx) => store.claim(tx, "fresh", "default"));
+      // b's INSERT waits for a's uncommitted row; once a commits, b sees a conflict.
+      setTimeout(() => void a.release(), 100);
+      expect(await b).toBeNull();
+    });
+
+    it("locks per (projection, tenant)", async () => {
+      const store = new PgProjectionCheckpointStore();
+      const uow = new PgUnitOfWork(pool);
+      await uow.withTransaction(async (tx) => {
+        await store.set(tx, "p", "t1", 1n);
+        await store.set(tx, "p", "t2", 2n);
+        await store.set(tx, "q", "t1", 3n);
+      });
+
+      const a = await openTx();
+      await store.claim(a.tx, "p", "t1");
+      expect(await uow.withTransaction((tx) => store.claim(tx, "p", "t2"))).not.toBeNull();
+      expect(await uow.withTransaction((tx) => store.claim(tx, "q", "t1"))).not.toBeNull();
+      expect(await uow.withTransaction((tx) => store.claim(tx, "p", "t1"))).toBeNull();
+      await a.release();
+    });
+  });
 });
 
