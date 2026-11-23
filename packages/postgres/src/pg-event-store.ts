@@ -82,14 +82,14 @@ export type LoadGlobalParams = {
   limit: number;
   includeDismissed?: boolean;
   /**
-   * Optional tenant filter. When set, only events from this tenant are
-   * returned. When omitted, events are returned across all tenants — caller
-   * must handle the cross-tenant case responsibly (e.g. for ops tooling).
+   * Tenant whose events are returned. Defaults to the transaction's tenant.
    * The catch-up projector always sets this.
    */
   tenantId?: string;
   /** Optional inclusive upper bound (the catch-up projector passes the high water mark). */
   toGlobalPositionInclusive?: bigint;
+  /** Return every tenant's events. Explicit, and not combinable with `tenantId`. */
+  allTenants?: boolean;
 };
 
 export type PgEventStoreOptions<E extends AnyEvent> = {
@@ -544,6 +544,12 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
   }
 
   async loadGlobal(tx: PgTx, p: LoadGlobalParams): Promise<EventEnvelope<E>[]> {
+    if (p.allTenants && p.tenantId !== undefined) {
+      throw new Error("loadGlobal: pass either tenantId or allTenants, not both");
+    }
+    // Without an explicit tenant the transaction's tenant applies, so a read
+    // is cross-tenant only when the caller asks for it.
+    const tenantFilter = p.allTenants ? null : p.tenantId ?? tx.tenantId;
     // Tenant filter lives in the SQL (not post-filtered in JS) so the
     // catch-up projector can read a batch of one tenant's events without
     // pulling other tenants' rows over the wire. Index
@@ -560,7 +566,7 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
       [
         p.fromGlobalPositionExclusive.toString(),
         p.toGlobalPositionInclusive?.toString() ?? null,
-        p.tenantId ?? null,
+        tenantFilter,
         p.limit
       ]
     );

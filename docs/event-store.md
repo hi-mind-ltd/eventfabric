@@ -184,8 +184,8 @@ The upcaster (if configured) runs on every returned envelope.
 
 ## loadGlobal()
 
-Loads events across all streams in global position order. Used by catch-up
-projections.
+Loads the tenant's events across all streams in global position order. Used by
+catch-up projections.
 
 ```typescript
 const envelopes = await store.loadGlobal(tx, {
@@ -200,8 +200,12 @@ const envelopes = await store.loadGlobal(tx, {
 | `fromGlobalPositionExclusive`    | `bigint`  | Events with `global_position > this` are returned.      |
 | `limit`                          | `number`  | Maximum number of events to return in one batch.        |
 | `includeDismissed`               | `boolean` | If `true`, dismissed events are included.               |
+| `tenantId`                       | `string`  | Tenant to read. Defaults to the transaction's tenant.   |
+| `allTenants`                     | `boolean` | Read every tenant's events. Can't be combined with `tenantId`. |
+| `toGlobalPositionInclusive`      | `bigint`  | Optional upper bound.                                   |
 
-Results are ordered by `global_position ASC`.
+Results are ordered by `global_position ASC`. A cross-tenant read has to be
+asked for with `allTenants: true`; keep it out of request-handling code.
 
 ## loadByGlobalPositions()
 

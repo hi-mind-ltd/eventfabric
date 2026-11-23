@@ -50,7 +50,7 @@ must not be reachable with request input:
 
 | API | Scope |
 |---|---|
-| `PgEventStore.loadGlobal` without `tenantId` | Every tenant's events. Pass `tenantId` to restrict it. |
+| `PgEventStore.loadGlobal` with `allTenants: true` | Every tenant's events. Without it, the transaction's tenant (or `tenantId`) applies. |
 | `PgEventStore.loadByGlobalPositions` | Whatever positions you pass, any tenant (the outbox runner relies on this). |
 | `PgEventStore.discoverActiveTenants` | Lists tenant ids. |
 | Outbox claim / ack / stats | The outbox is one queue shared by all tenants. |
