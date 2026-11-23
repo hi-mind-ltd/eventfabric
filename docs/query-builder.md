@@ -279,6 +279,22 @@ const results = await query<AccountState>(pool, "eventfabric.snapshots", { jsonb
   .toList();
 ```
 
+`eventfabric.snapshots` holds every tenant's snapshots. The builder adds no
+tenant filter unless you ask for one, so in a multi-tenant application always
+pass `tenantId`:
+
+```typescript
+const results = await query<AccountState>(pool, "eventfabric.snapshots", { jsonb: "state", tenantId })
+  .where("balance", ">=", 1000)
+  .toList();
+```
+
+`tenantId` adds `tenant_id = $n` in front of your conditions, which are
+grouped so an `orWhere` can't widen it. It works in flat mode too (use
+`tenantColumn` if your column has another name), throws if the value is
+missing or empty, and can't be combined with raw `.sql`, where you write the
+tenant condition yourself.
+
 In JSONB mode:
 
 - **`SELECT`** selects the JSONB column (`state`), and the builder unwraps it so you get `T` directly.

@@ -35,6 +35,17 @@ async function migrate() {
       id TEXT PRIMARY KEY,
       state JSONB NOT NULL
     );
+    CREATE TABLE tenant_read (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      org TEXT NOT NULL,
+      balance INT NOT NULL,
+      state JSONB NOT NULL
+    );
+    INSERT INTO tenant_read (id, tenant_id, org, balance, state) VALUES
+      ('t1', 'acme',    'acme',    10, '{"balance": 10}'),
+      ('t2', 'acme',    'acme',    20, '{"balance": 20}'),
+      ('t3', 'contoso', 'contoso', 30, '{"balance": 30}');
   `);
 }
 
@@ -320,6 +331,46 @@ describe("PgQueryBuilder", () => {
         .sql`SELECT * FROM account_read ORDER BY id`
         .toList();
       expect(rows).toHaveLength(5);
+    });
+  });
+
+  describe("tenantId option", () => {
+    type TenantRow = { id: string; tenant_id: string; org: string; balance: number };
+
+    it("returns only the tenant's rows, with or without other conditions", async () => {
+      const all = await query<TenantRow>(pool, "tenant_read", { tenantId: "acme" }).toList();
+      expect(all.map((r) => r.id).sort()).toEqual(["t1", "t2"]);
+      expect(await query<TenantRow>(pool, "tenant_read", { tenantId: "acme" }).count()).toBe(2);
+
+      const filtered = await query<TenantRow>(pool, "tenant_read", { tenantId: "acme" })
+        .where("balance", ">=", 20).orderBy("balance", "desc").limit(5).toList();
+      expect(filtered.map((r) => r.id)).toEqual(["t2"]);
+      expect(await query<TenantRow>(pool, "tenant_read", { tenantId: "nobody" }).first()).toBeNull();
+    });
+
+    it("an orWhere can't reach another tenant's rows", async () => {
+      const rows = await query<TenantRow>(pool, "tenant_read", { tenantId: "acme" })
+        .where("balance", "=", 10).orWhere("balance", ">", 0).toList();
+      expect(rows.map((r) => r.id).sort()).toEqual(["t1", "t2"]);
+      expect(
+        await query<TenantRow>(pool, "tenant_read", { tenantId: "acme" })
+          .where("balance", "=", 10).orWhere("balance", ">", 0).count()
+      ).toBe(2);
+    });
+
+    it("works in JSONB mode and with a custom column", async () => {
+      const rows = await query<{ balance: number }>(pool, "tenant_read", { jsonb: "state", tenantId: "contoso" })
+        .where("balance", ">", 0).orderBy("balance").toList();
+      expect(rows).toEqual([{ balance: 30 }]);
+      const byOrg = await query<TenantRow>(pool, "tenant_read", { tenantId: "contoso", tenantColumn: "org" }).toList();
+      expect(byOrg.map((r) => r.id)).toEqual(["t3"]);
+    });
+
+    it("rejects a missing tenant, a bad column, and raw SQL", () => {
+      expect(() => query<TenantRow>(pool, "tenant_read", { tenantId: undefined })).toThrow(/tenantId/);
+      expect(() => query<TenantRow>(pool, "tenant_read", { tenantId: "" })).toThrow(/tenantId/);
+      expect(() => query<TenantRow>(pool, "tenant_read", { tenantId: "acme", tenantColumn: "x; --" })).toThrow(/column/);
+      expect(() => query<TenantRow>(pool, undefined, { tenantId: "acme" }).sql`SELECT 1`).toThrow(/raw SQL/);
     });
   });
 

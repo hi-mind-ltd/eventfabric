@@ -11,6 +11,16 @@ export type PgQueryOptions = {
   /** JSONB column name (e.g. "state"). When set, fluent .where() targets
    *  JSONB path operators instead of flat columns. */
   jsonb?: string;
+  /**
+   * Restrict every query from this builder to one tenant: adds
+   * `tenant_id = $n` in front of the other conditions (which are grouped, so
+   * an `orWhere` can't widen it). Set this whenever the table is shared by
+   * tenants, e.g. `eventfabric.snapshots`. Raw `.sql` mode is not filtered
+   * and throws when this is set.
+   */
+  tenantId?: string;
+  /** Column `tenantId` is compared with. Default `tenant_id`. */
+  tenantColumn?: string;
 };
 
 type WhereClause = {
@@ -63,7 +73,15 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
     private readonly pool: Pool,
     private readonly table: string | null = null,
     private readonly opts: PgQueryOptions = {}
-  ) {}
+  ) {
+    if ("tenantId" in opts) {
+      // An undefined tenant (a missing claim) must not turn the filter off.
+      if (typeof opts.tenantId !== "string" || opts.tenantId === "") {
+        throw new Error("Query builder tenantId must be a non-empty string");
+      }
+      assertColumn(opts.tenantColumn ?? "tenant_id");
+    }
+  }
 
   // --- Core QueryBuilder interface ---
 
@@ -162,6 +180,9 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
    *   .toList();
    */
   sql(strings: TemplateStringsArray, ...values: unknown[]): this {
+    if (this.opts.tenantId !== undefined) {
+      throw new Error("The tenantId option can't filter raw SQL. Put the tenant condition in the query.");
+    }
     if (this.clauses.length > 0 || this.orders.length > 0) {
       throw new Error("Cannot use .sql() after fluent builder methods (.where, .orderBy, etc.)");
     }
@@ -250,7 +271,15 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
   }
 
   private appendWhere(parts: string[], values: unknown[]): void {
-    if (this.clauses.length === 0) return;
+    let tenantCondition: string | null = null;
+    if (this.opts.tenantId !== undefined) {
+      values.push(this.opts.tenantId);
+      tenantCondition = `${this.opts.tenantColumn ?? "tenant_id"} = $${values.length}`;
+    }
+    if (this.clauses.length === 0) {
+      if (tenantCondition) parts.push(`WHERE ${tenantCondition}`);
+      return;
+    }
 
     const conditions: string[] = [];
     for (const clause of this.clauses) {
@@ -279,7 +308,11 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
       }
     }
 
-    parts.push(`WHERE ${conditions.join(" ")}`);
+    parts.push(
+      tenantCondition
+        ? `WHERE ${tenantCondition} AND (${conditions.join(" ")})`
+        : `WHERE ${conditions.join(" ")}`
+    );
   }
 
   private appendOrderBy(parts: string[], values: unknown[]): void {
