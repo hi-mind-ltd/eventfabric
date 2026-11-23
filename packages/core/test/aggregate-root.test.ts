@@ -161,3 +161,42 @@ describe("AggregateRoot", () => {
     });
   });
 });
+
+describe("AggregateRoot.raise applies the stored (JSON) shape", () => {
+  type Stamped = { type: "Stamped"; version: 1; at: Date | string; note?: string; big?: unknown };
+  class Stamp extends AggregateRoot<{ atType: string; at: unknown; hasNote: boolean }, Stamped> {
+    protected handlers = {
+      Stamped: (s: { atType: string; at: unknown; hasNote: boolean }, e: Stamped) => {
+        s.atType = typeof e.at;
+        s.at = e.at;
+        s.hasNote = "note" in e;
+      },
+    };
+    constructor() {
+      super("s-1", { atType: "", at: null, hasNote: false });
+    }
+    stamp(e: Omit<Stamped, "type" | "version">) {
+      this.raise({ type: "Stamped", version: 1, ...e });
+    }
+  }
+
+  it("live state matches the state rebuilt from the stored events", () => {
+    const live = new Stamp();
+    live.stamp({ at: new Date("2026-01-02T03:04:05.000Z"), note: undefined });
+    const pending = live.pullPendingEvents();
+
+    // What a reload sees: the events after their JSON round trip.
+    const replayed = new Stamp();
+    replayed.loadFromHistory(pending.map((p, i) => ({ payload: JSON.parse(JSON.stringify(p)), aggregateVersion: i + 1 })));
+
+    expect(live.state).toEqual({ atType: "string", at: "2026-01-02T03:04:05.000Z", hasNote: false });
+    expect(live.state).toEqual(replayed.state);
+    expect(pending[0]!.at).toBe("2026-01-02T03:04:05.000Z");
+  });
+
+  it("rejects a bigint at raise time with a clear message", () => {
+    const agg = new Stamp();
+    expect(() => agg.stamp({ at: "x", big: 10n })).toThrow(/Event 'Stamped' can't be stored as JSON/);
+    expect(agg.pullPendingEvents()).toHaveLength(0);
+  });
+});

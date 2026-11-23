@@ -91,12 +91,19 @@ protected raise(...events: E[]): void
 Call `raise()` from command methods to record that something happened. The
 method:
 
-1. Validates the event structure in non-production environments (`type` must be
+1. Converts the event to the shape it will have once stored: a JSON round
+   trip, so a `Date` becomes its ISO string and `undefined` fields are
+   dropped. The handler therefore sees exactly what it will see when the
+   aggregate is reloaded. A value JSON can't hold (a `bigint`) throws here.
+2. Validates the event structure in non-production environments (`type` must be
    a string, `version` must be a positive integer).
-2. Calls the matching handler to apply the event to `this.state`.
-3. Pushes the event onto the internal pending list.
+3. Calls the matching handler to apply the event to `this.state`.
+4. Pushes the event onto the internal pending list.
 
 If no handler exists for the event type, `raise()` throws immediately.
+
+Write handlers against the JSON shape: if an event carries a date, type the
+field as `string` (ISO) rather than `Date`.
 
 ```typescript
 deposit(amount: number) {
