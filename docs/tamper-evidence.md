@@ -125,10 +125,10 @@ const broken = results.filter((r) => !r.ok);
 
 ## The per-tenant anchor
 
-The anchor adds cross-stream coverage. `PgChainAnchorSealer.seal()` reads a
-**consistent MVCC snapshot** of the tenant's chained stream heads from
-`stream_versions` and folds them into a running HMAC anchor chain — no
-`global_position`/gap reasoning, so it never false-alarms and never stalls. Each
+The anchor adds cross-stream coverage. `PgChainAnchorSealer.seal()` reads the
+tenant's chained stream heads from `stream_versions` in a single statement, so
+they come from one **consistent MVCC snapshot**, and folds them into a running
+HMAC anchor chain — no `global_position`/gap reasoning, so it never false-alarms and never stalls. Each
 anchor stores only the *delta* (streams whose head advanced since the last
 anchor).
 

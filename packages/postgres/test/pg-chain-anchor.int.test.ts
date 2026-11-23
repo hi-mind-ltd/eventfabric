@@ -59,6 +59,21 @@ describe("PgChainAnchorSealer", () => {
     expect(v.streamsChecked).toBe(2);
   });
 
+  it("seals more advanced streams than fit in 65,535 bind parameters", async () => {
+    // seal() reads only stream_versions, so seed chained heads directly.
+    await pool.query(
+      `INSERT INTO eventfabric.stream_versions (tenant_id, aggregate_name, aggregate_id, current_version, head_hash)
+       SELECT 'default', 'Audit', 'bulk-' || g, 1, decode(md5(g::text) || md5(g::text), 'hex')
+       FROM generate_series(1, 12000) AS g`
+    );
+
+    const uow = new PgUnitOfWork(pool);
+    const res = await uow.withTransaction((tx) => sealer().seal(tx));
+    expect(res).toMatchObject({ sealed: true, memberCount: 12000, anchorSeq: 1 });
+    const n = await pool.query(`SELECT count(*)::int AS n FROM eventfabric.event_chain_anchor_members`);
+    expect(n.rows[0].n).toBe(12000);
+  });
+
   it("only anchors chained streams (NULL head_hash excluded)", async () => {
     const s = store();
     await append(s, "a1", 0, [ev(1)]);
