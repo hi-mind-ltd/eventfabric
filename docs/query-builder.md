@@ -250,6 +250,15 @@ const result = await query<User>(pool)
 
 SQL injection is **structurally impossible** because the template literal syntax guarantees that user-provided values never touch the SQL string.
 
+The fluent builder is protected the same way, including the parts TypeScript only checks at compile time (a `?sort=` query parameter cast to `keyof T` is still a runtime string):
+
+- **Values, `limit` and `offset`** are sent as `$N` parameters. `limit` and `offset` must be non-negative integers.
+- **JSONB keys** (in JSONB mode) are sent as parameters too (`state->>$1`), so any key string is safe.
+- **Column names** (flat mode) must be plain identifiers (`^[A-Za-z_][A-Za-z0-9_]*$`); anything else throws.
+- **Operators** must be one of `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `ILIKE`, `IN`, `NOT IN`, `IS`, `IS NOT`, and the **sort direction** `asc` or `desc`; anything else throws.
+
+The `table` and `jsonb` options are application configuration and are not validated: never build them from request input.
+
 ## JSONB mode
 
 For snapshot queries, enable JSONB mode by passing `{ jsonb: "state" }`:

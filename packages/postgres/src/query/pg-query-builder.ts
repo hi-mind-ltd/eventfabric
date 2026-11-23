@@ -20,6 +20,25 @@ type WhereClause = {
   value: unknown;
 };
 
+const OPERATORS: ReadonlySet<string> = new Set([
+  "=", "!=", ">", ">=", "<", "<=", "LIKE", "ILIKE", "IN", "NOT IN", "IS", "IS NOT",
+]);
+
+/** Unquoted SQL identifier. Anything else is rejected rather than escaped. */
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function assertColumn(key: string): void {
+  if (typeof key !== "string" || !IDENTIFIER.test(key)) {
+    throw new Error(`Invalid column name for query builder: ${JSON.stringify(key)}`);
+  }
+}
+
+function assertCount(name: string, n: number): void {
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new Error(`${name} must be a non-negative integer, got ${String(n)}`);
+  }
+}
+
 type OrderClause = {
   key: string;
   dir: SortDirection;
@@ -54,6 +73,7 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
     value: ValueFor<T[K], Op>
   ): this {
     this.assertNotRaw();
+    this.assertClause(key, op);
     this.clauses.push({ connector: "AND", key, op, value });
     return this;
   }
@@ -64,24 +84,31 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
     value: ValueFor<T[K], Op>
   ): this {
     this.assertNotRaw();
+    this.assertClause(key, op);
     this.clauses.push({ connector: "OR", key, op, value });
     return this;
   }
 
   orderBy(key: keyof T & string, direction: SortDirection = "asc"): this {
     this.assertNotRaw();
+    if (!this.opts.jsonb) assertColumn(key);
+    if (direction !== "asc" && direction !== "desc") {
+      throw new Error(`Invalid sort direction: ${JSON.stringify(direction)}`);
+    }
     this.orders.push({ key, dir: direction });
     return this;
   }
 
   limit(n: number): this {
     this.assertNotRaw();
+    assertCount("limit", n);
     this.limitVal = n;
     return this;
   }
 
   offset(n: number): this {
     this.assertNotRaw();
+    assertCount("offset", n);
     this.offsetVal = n;
     return this;
   }
@@ -161,6 +188,19 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
     }
   }
 
+  /**
+   * Keys and operators are typed at compile time, but at runtime they often
+   * come from request input (`?sort=`, filter forms), so they are checked here.
+   * JSONB keys are sent as parameters; flat column names must be plain
+   * identifiers.
+   */
+  private assertClause(key: string, op: string): void {
+    if (!OPERATORS.has(op)) {
+      throw new Error(`Invalid query operator: ${JSON.stringify(op)}`);
+    }
+    if (!this.opts.jsonb) assertColumn(key);
+  }
+
   /** In JSONB mode, each row is `{ state: {...} }` — unwrap to just the JSONB content. */
   private unwrapRows(rows: any[]): T[] {
     if (!this.opts.jsonb) return rows as T[];
@@ -168,9 +208,10 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
     return rows.map((r) => r[col] as T);
   }
 
-  private columnRef(key: string): string {
+  private columnRef(key: string, values: unknown[], arrow: "->>" | "->" = "->>"): string {
     if (this.opts.jsonb) {
-      return `${this.opts.jsonb}->>'${key}'`;
+      values.push(key);
+      return `${this.opts.jsonb}${arrow}$${values.length}::text`;
     }
     return key;
   }
@@ -189,9 +230,15 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
     const parts: string[] = [`SELECT ${selectExpr} FROM ${this.table}`];
     const values: unknown[] = [];
     this.appendWhere(parts, values);
-    this.appendOrderBy(parts);
-    if (this.limitVal !== null) parts.push(`LIMIT ${this.limitVal}`);
-    if (this.offsetVal !== null) parts.push(`OFFSET ${this.offsetVal}`);
+    this.appendOrderBy(parts, values);
+    if (this.limitVal !== null) {
+      values.push(this.limitVal);
+      parts.push(`LIMIT $${values.length}`);
+    }
+    if (this.offsetVal !== null) {
+      values.push(this.offsetVal);
+      parts.push(`OFFSET $${values.length}`);
+    }
     return { text: parts.join(" "), values };
   }
 
@@ -207,7 +254,7 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
 
     const conditions: string[] = [];
     for (const clause of this.clauses) {
-      const col = this.columnRef(clause.key);
+      const col = this.columnRef(clause.key, values);
       const castCol = this.castForValue(col, clause.value);
 
       let condition: string;
@@ -235,16 +282,14 @@ export class PgQueryBuilder<T extends AnyRecord> implements QueryBuilder<T> {
     parts.push(`WHERE ${conditions.join(" ")}`);
   }
 
-  private appendOrderBy(parts: string[]): void {
+  private appendOrderBy(parts: string[], values: unknown[]): void {
     if (this.orders.length === 0) return;
     const orderParts = this.orders.map((o) => {
       // In JSONB mode, use -> (returns JSONB) instead of ->> (returns text)
       // for ORDER BY. JSONB preserves native numeric/boolean sort order,
       // while ->> casts everything to text (lexicographic, breaks numbers).
-      const col = this.opts.jsonb
-        ? `${this.opts.jsonb}->'${o.key}'`
-        : o.key;
-      return `${col} ${o.dir.toUpperCase()}`;
+      const col = this.columnRef(o.key, values, "->");
+      return `${col} ${o.dir === "desc" ? "DESC" : "ASC"}`;
     });
     parts.push(`ORDER BY ${orderParts.join(", ")}`);
   }

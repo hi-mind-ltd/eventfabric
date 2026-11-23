@@ -413,5 +413,51 @@ describe("PgQueryBuilder", () => {
       // Parameterized: the entire string is compared as a literal id value.
       expect(rows).toHaveLength(0);
     });
+
+    // Keys, operators, sort direction and limit are typed at compile time but
+    // often come from request input at runtime (`?sort=`, filter forms).
+    const loose = <T extends Record<string, unknown>>(qb: unknown) => qb as {
+      where(k: string, op: string, v: unknown): T;
+      orderBy(k: string, dir?: string): T;
+      limit(n: unknown): T;
+      offset(n: unknown): T;
+    };
+
+    it("fluent builder: rejects a column name that is not a plain identifier", () => {
+      const qb = loose(query<AccountRow>(pool, "account_read"));
+      expect(() => qb.where("currency = 'USD' OR 1=1 --", "=", "x")).toThrow(/Invalid column name/);
+      expect(() => qb.orderBy("balance; DROP TABLE account_read")).toThrow(/Invalid column name/);
+    });
+
+    it("fluent builder: rejects an unknown operator", () => {
+      const qb = loose(query<AccountRow>(pool, "account_read"));
+      expect(() => qb.where("currency", "= 'x' OR 1=1 OR currency =", "x")).toThrow(/Invalid query operator/);
+    });
+
+    it("fluent builder: rejects an unknown sort direction", () => {
+      const qb = loose(query<AccountRow>(pool, "account_read"));
+      expect(() => qb.orderBy("balance", "desc, (SELECT pg_sleep(1))")).toThrow(/Invalid sort direction/);
+    });
+
+    it("fluent builder: rejects a limit or offset that is not a non-negative integer", () => {
+      const qb = loose(query<AccountRow>(pool, "account_read"));
+      expect(() => qb.limit("1; DROP TABLE account_read")).toThrow(/limit/);
+      expect(() => qb.limit(-1)).toThrow(/limit/);
+      expect(() => qb.offset(1.5)).toThrow(/offset/);
+    });
+
+    it("JSONB mode: a key containing quotes is a parameter, not SQL", async () => {
+      const qb = loose<{ toList(): Promise<SnapshotRow[]> }>(
+        query<SnapshotRow>(pool, "snapshot_jsonb", { jsonb: "state" })
+      );
+      const rows = await qb.where("currency' IS NOT NULL OR 'a", "=", "USD").toList();
+      expect(rows).toHaveLength(0);
+
+      const sorted = await loose<{ toList(): Promise<SnapshotRow[]> }>(
+        query<SnapshotRow>(pool, "snapshot_jsonb", { jsonb: "state" })
+      ).orderBy("balance' DESC, (SELECT 1) --").toList();
+      expect(sorted).toHaveLength(3);
+      expect(await query<AccountRow>(pool, "account_read").count()).toBe(5);
+    });
   });
 });

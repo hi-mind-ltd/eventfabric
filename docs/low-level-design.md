@@ -394,8 +394,8 @@ class Session<E extends AnyEvent> {
     SELECT * FROM account_read
     WHERE balance > $1 AND currency = $2 OR active = $3
     ORDER BY balance DESC
-    LIMIT 10 OFFSET 20
-    values: [100, "USD", false]
+    LIMIT $4 OFFSET $5
+    values: [100, "USD", false, 10, 20]
       │
       ▼
   pool.query(text, values) → rows as T[]
@@ -405,8 +405,8 @@ class Session<E extends AnyEvent> {
 
 ```
   query<T>(pool, "eventfabric.snapshots", { jsonb: "state" })
-    .where("balance", ">", 100)         → WHERE (state->>'balance')::numeric > $1
-    .orderBy("balance", "desc")         → ORDER BY state->'balance' DESC
+    .where("balance", ">", 100)         → WHERE (state->>$1::text)::numeric > $2   ($1 = 'balance')
+    .orderBy("balance", "desc")         → ORDER BY state->$3::text DESC           ($3 = 'balance')
                                                     ↑ single arrow preserves numeric sort
     .toList()
       │
