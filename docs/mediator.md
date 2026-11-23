@@ -8,7 +8,7 @@ for a specific beta.
 | Package | Contains |
 |---|---|
 | `@eventfabric/mediator` | `Command` envelope, `CommandBus`, `CommandHandler`, middleware composition, `IdempotencyStore` interface, `InMemoryIdempotencyStore`, `commandContextToEventMeta`. Backend-agnostic. |
-| `@eventfabric/mediator-postgres` | `PgIdempotencyStore` + watchdog, `commandsMigrations` (migrations 010 and 018). |
+| `@eventfabric/mediator-postgres` | `PgIdempotencyStore` + watchdog, `commandsMigrations` (migrations 010, 018 and 020). |
 | `@eventfabric/mediator-opentelemetry` | `createCommandBusObserver` middleware (tracing + counters + histograms), `createCommandIdempotencyGauges` (observable gauges for the idempotency table). |
 
 ## When to use a command bus
@@ -140,7 +140,7 @@ The default is `idempotency: "required"` — every command must carry an
 | Claim outcome | What the bus does |
 |---|---|
 | `claimed` (no prior row) | Runs the handler. On success, marks the slot `completed` with the stored result and returns it. On failure, the tx rolls back; the slot vanishes; the next retry of the same key claims afresh. |
-| `completed` (prior row with stored result) | Returns the stored result. Handler is **not** invoked. This is the exactly-once-effect path. If the key was first used for a different command type, or the same type with a different payload, throws `IdempotencyKeyConflictError` instead (`reason`: `"command-type"` or `"payload"`). |
+| `completed` (prior row with stored result) | Returns the stored result. Handler is **not** invoked. This is the exactly-once-effect path. If the key was first used for a different command type, or the same type with a different payload, throws `IdempotencyKeyConflictError` instead (`reason`: `"command-type"` or `"payload"`). The same applies when the key was first used by a different `metadata.principalId` (`reason: "principal"`): a stored result is returned only to the principal that first sent the command. |
 | `in_flight` (another worker holds the slot) | Default: wait-and-retry for up to 5 seconds (`inFlightWaitMs`), polling every 50ms (`pollIntervalMs`). If still in flight, throws `ConcurrentCommandInFlightError`. Alternative strategy: `conflictStrategy: "reject"` — throws immediately. |
 
 A retry must send the same payload as the first attempt. The bus stores a SHA-256 of the payload's canonical JSON with the key (key order doesn't matter), and a different payload under the same key is rejected rather than answered with the first command's result. Generate a new key for each new request, never from something coarser such as an account id.
@@ -328,6 +328,11 @@ the rest of the framework:
 const bus = new CommandBus<PgTx>({
   uow: new PgUnitOfWork(pool),       // tenant-scoped factory
   idempotencyStore: new PgIdempotencyStore(),
+  // Required once commands carry another tenant: who vouches for it?
+  tenantValidator: (cmd) => {
+    const caller = requestContext.getStore();   // e.g. AsyncLocalStorage set by your auth middleware
+    if (cmd.metadata.tenantId !== caller?.tenantId) throw new UnauthorizedError("wrong tenant");
+  },
 });
 bus.register(depositHandler);
 
@@ -350,6 +355,24 @@ The handler's `ctx.tx` already has the right tenant context — anything
 the handler does (load aggregates, save sessions, append events) commits
 under that tenant's scope.
 
+### Who vouches for the tenant
+
+The bus runs a command under whatever tenant its metadata names, so that field
+decides whose data the handler touches. A command that would switch the
+transaction away from the unit of work's own tenant is therefore rejected with
+`UnvalidatedTenantError` unless the bus was built with one of:
+
+- **`tenantValidator`**: a function that throws when `cmd.metadata.tenantId`
+  isn't the authenticated caller's tenant. Use this when any command can be
+  shaped by a request.
+- **`trustTenantMetadata: true`**: a statement that every sender is trusted,
+  for example a bus that only receives commands from the saga dispatcher, or
+  whose callers always take the tenant from a verified token.
+
+Commands without a tenant, or naming the unit of work's own tenant (a
+single-tenant application), are not affected. Add `requireTenantId: true` to
+reject commands that carry no tenant at all.
+
 ### What happens when the UoW is not tenant-aware
 
 If you configure a plain `UnitOfWork` (no `forTenant` method — e.g., a
@@ -368,6 +391,13 @@ saga's `tenantId` onto each dispatched command (overridable by the
 saga author). The bus then auto-narrows as above. Cross-tenant flows
 need no special handling — one dispatcher process can serve all
 tenants, and each command lands under the right tenant's transaction.
+
+In a multi-tenant application the bus the dispatcher sends to needs
+`trustTenantMetadata: true` or a `tenantValidator` that lets saga commands
+through, or their commands fail with `UnvalidatedTenantError` and are retried
+until they dead-letter. If the same bus also serves requests, give the
+dispatcher its own bus with the same handlers and `trustTenantMetadata: true`,
+and keep the validator on the request-facing one.
 
 ## Operational concerns
 
@@ -402,7 +432,7 @@ The PG package ships one table — see the
 
 | Table | Migration | Purpose |
 |---|---|---|
-| `eventfabric.command_idempotency` | `010_command_idempotency.sql`, `018_command_request_hash.sql` | Dedup slot per `(tenant_id, idempotency_key)` with status `in_flight` / `completed` / `failed`, and a hash of the payload the key was first used with. |
+| `eventfabric.command_idempotency` | `010_command_idempotency.sql`, `018_command_request_hash.sql`, `020_command_principal.sql` | Dedup slot per `(tenant_id, idempotency_key)` with status `in_flight` / `completed` / `failed`, and a hash of the payload the key was first used with. |
 
 Apply via:
 

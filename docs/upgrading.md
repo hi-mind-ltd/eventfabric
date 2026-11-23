@@ -7,25 +7,28 @@ nothing from you. This page lists what does, then what's new, then the rest.
 
 ### 1. Run the migrations
 
-Two new migrations. `migrate()` applies both:
+Three new migrations. `migrate()` applies them all:
 
 | Migration | Package | What it does | Needed for |
 |---|---|---|---|
 | `018_command_request_hash` | `@eventfabric/mediator-postgres` | Adds `request_hash` to `eventfabric.command_idempotency` | Detecting an idempotency key reused with a different payload |
+| `020_command_principal` | `@eventfabric/mediator-postgres` | Adds `principal_id` to `eventfabric.command_idempotency` | Sending any command (`PgIdempotencyStore.claim` writes the column) |
 | `019_outbox_dead_letter_reason` | `@eventfabric/postgres` | Adds `reason` to `eventfabric.outbox_dead_letters` | Dead-lettering (`PgOutboxStore.deadLetter` writes the column) |
 
 ```ts
 await migrate(pool, { extensions: [commandsMigrations, sagasMigrations] });
 ```
 
-**Run `migrate()` before the new version processes the outbox.** Without 019,
-dead-lettering a message fails.
+**Run `migrate()` before the new version handles commands or processes the
+outbox.** Without 020 every command sent through `PgIdempotencyStore` fails;
+without 019, dead-lettering a message fails.
 
 `migrate()` is now safe to call from every instance at startup at the same
 time: a Postgres advisory lock makes them take turns. It holds one pool
 connection while it runs.
 
 Rows written before 018 have no `request_hash`, so their keys skip the payload
+check; rows written before 020 have no `principal_id` and skip the principal
 check. Rows written before 019 have `reason = NULL`.
 
 ### 2. Changes that may affect your code
@@ -33,6 +36,9 @@ check. Rows written before 019 have `reason = NULL`.
 | Change | Who is affected | What to do |
 |---|---|---|
 | **Reusing an idempotency key for a different command** now throws `IdempotencyKeyConflictError` (`reason: "command-type"` or `"payload"`). It used to return the first command's result and drop the new command. | Clients that reuse keys across different commands or payloads | Use a new key per distinct command. A retry must send the same type and payload. Key order in the payload doesn't matter. |
+| **A command that switches tenant needs someone to vouch for it.** When `metadata.tenantId` differs from the unit of work's own tenant and the bus has no `tenantValidator`, `send()` throws `UnvalidatedTenantError`. Before, the bus followed the metadata unchecked. | Multi-tenant applications using `CommandBus`, including the bus a saga dispatcher sends to. Single-tenant applications are not affected. | Pass `tenantValidator`, or `trustTenantMetadata: true` where every sender is trusted. See [Mediator](./mediator.md#who-vouches-for-the-tenant). |
+| **An idempotency key is tied to the principal that first used it.** The same key from a different `metadata.principalId` (or none) throws `IdempotencyKeyConflictError` (`reason: "principal"`). Before, it returned the first caller's stored result. | Flows where different principals retry the same key | Have each caller use its own keys, or send such commands without a `principalId`. |
+| **`loadGlobal` without `tenantId` returns the transaction's tenant only.** It used to return every tenant's events. | Ops tooling or migrations that read across tenants | Pass `allTenants: true`. |
 | **The query builder rejects input it can't use safely.** Column names must be plain identifiers (`^[A-Za-z_][A-Za-z0-9_]*$`), operators and sort direction must come from the documented set, and `limit` / `offset` must be non-negative integers. Anything else throws. | Code that passes request input (`?sort=`, filters) to `.where()` / `.orderBy()` | Validate or map user input before passing it. JSONB keys are parameters and accept any string. See [Query Builder](./query-builder.md#sql-injection-protection). |
 | **`raise()` applies the event as it will be stored (JSON).** A `Date` in an event becomes its ISO string, `undefined` fields are dropped, and a `bigint` throws at `raise()`. | Aggregate handlers that read a `Date` object from a live event | Read the ISO string (handlers already got a string on reload). Store `bigint` values as strings. See [Aggregates](./aggregates.md#raise). |
 | **A failed save leaves the aggregate unchanged.** `Repository.save()` and `saveChangesAsync()` update the aggregate only after the commit. Before, a failed `Repository.save()` emptied the pending events, and a retry returned `null` without writing. | Code that retries `save()` on the same aggregate, or reads `agg.version` after a failed save | Nothing, unless you relied on the old behaviour. A retry now writes the events. |
@@ -55,7 +61,7 @@ optional unless marked.
 |---|---|---|
 | `OutboxStore` | Optional `workerId` parameter on `ack`, `release`, `releaseWithError`, `deadLetter` | No lease fencing: a slow handler can commit twice |
 | `SagaTimerStore` | `lockClaimed(tx, params)` | Every claimed timer is delivered, even one cancelled after the claim |
-| `IdempotencyStore` | `afterCommit(tx)`, `afterRollback(tx)`. `ClaimResult` "completed" may carry `commandType` and `requestHash`; `claim` receives `requestHash` | A store that keeps slots outside the database can be answered from a result that was rolled back. Without `commandType` / `requestHash`, key reuse isn't detected |
+| `IdempotencyStore` | `afterCommit(tx)`, `afterRollback(tx)`. `ClaimResult` "completed" may carry `commandType`, `requestHash` and `principalId`; `claim` receives `requestHash` and `principalId` | A store that keeps slots outside the database can be answered from a result that was rolled back. Without `commandType` / `requestHash`, key reuse isn't detected |
 | `DlqService` | `DlqItem.reason` | Field is undefined |
 
 A custom repository should use `peekPendingEvents()` and `markCommitted()`
@@ -74,7 +80,11 @@ instead of `pullPendingEvents()`, so a failed save can be retried.
   `result="skipped"` on `eventfabric.saga.timer_fire_total`.
 - **Core:** `shouldSnapshot(policy, fromVersion, toVersion)`,
   `AggregateRoot.peekPendingEvents()` / `markCommitted()`, `LeaseLostError`.
-- **Postgres:** `PgPartitionManager.enablePartitioningOn(client)`.
+- **Postgres:** `PgPartitionManager.enablePartitioningOn(client)`. Query
+  builder `tenantId` / `tenantColumn` options (see
+  [Query Builder](./query-builder.md#jsonb-mode)).
+- **Mediator:** `tenantValidator` is now paired with `trustTenantMetadata`;
+  `UnvalidatedTenantError`.
 
 ### 5. Fixed, no action needed
 

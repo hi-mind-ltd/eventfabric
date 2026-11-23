@@ -2,8 +2,8 @@ import type { Transaction } from "@eventfabric/core";
 import type { ClaimResult, IdempotencyStore } from "./idempotency-store";
 
 type Slot =
-  | { status: "in_flight"; commandId: string; commandType: string; requestHash?: string }
-  | { status: "completed"; result: unknown; commandType: string; requestHash?: string };
+  | { status: "in_flight"; commandId: string; commandType: string; requestHash?: string; principalId?: string }
+  | { status: "completed"; result: unknown; commandType: string; requestHash?: string; principalId?: string };
 
 /**
  * Process-local idempotency store. Suitable for unit tests and single-process
@@ -34,7 +34,7 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
 
   async claim(
     _tx: Transaction,
-    params: { key: string; commandType: string; commandId: string; tenantId?: string; requestHash?: string }
+    params: { key: string; commandType: string; commandId: string; tenantId?: string; requestHash?: string; principalId?: string }
   ): Promise<ClaimResult> {
     const slotKey = this.slotKey(params.tenantId, params.key);
     const existing = this.slots.get(slotKey);
@@ -44,6 +44,7 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
         commandId: params.commandId,
         commandType: params.commandType,
         requestHash: params.requestHash,
+        principalId: params.principalId,
       });
       this.touch(_tx, slotKey);
       return { state: "claimed" };
@@ -54,6 +55,7 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
         result: existing.result,
         commandType: existing.commandType,
         ...(existing.requestHash !== undefined ? { requestHash: existing.requestHash } : {}),
+        ...(existing.principalId !== undefined ? { principalId: existing.principalId } : {}),
       };
     }
     return { state: "in_flight" };
@@ -70,6 +72,7 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
       result: params.result,
       commandType: prior?.commandType ?? "",
       requestHash: prior?.requestHash,
+      principalId: prior?.principalId,
     });
     this.touch(_tx, slotKey);
   }

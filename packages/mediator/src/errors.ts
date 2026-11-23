@@ -43,11 +43,14 @@ export class IdempotencyKeyConflictError extends Error {
     public readonly idempotencyKey: string,
     public readonly commandType: string,
     public readonly originalCommandType: string,
-    /** What differed: the command type, or (same type) the payload. */
-    public readonly reason: "command-type" | "payload" = "command-type"
+    /** What differed: the command type, the payload, or the principal sending it. */
+    public readonly reason: "command-type" | "payload" | "principal" = "command-type"
   ) {
     super(
-      reason === "payload"
+      reason === "principal"
+        ? `Idempotency key ${idempotencyKey} was already used by a different principal; ` +
+          `a stored result is only returned to the principal that first sent the command`
+        : reason === "payload"
         ? `Idempotency key ${idempotencyKey} was already used for a "${commandType}" command with a ` +
           `different payload; use a new key for a new request`
         : `Idempotency key ${idempotencyKey} was already used for a "${originalCommandType}" command; ` +
@@ -79,5 +82,24 @@ export class MissingTenantIdError extends Error {
       `Command "${commandType}" arrived without metadata.tenantId; bus is configured with requireTenantId=true`
     );
     this.name = "MissingTenantIdError";
+  }
+}
+
+/**
+ * Thrown by the bus when a command's `metadata.tenantId` would switch the
+ * transaction to another tenant and the bus was given neither a
+ * `tenantValidator` nor `trustTenantMetadata: true`. The bus routes by that
+ * field, so somebody has to vouch for it: a validator that compares it with
+ * the authenticated caller, or an explicit statement that every sender is
+ * trusted.
+ */
+export class UnvalidatedTenantError extends Error {
+  constructor(public readonly commandType: string, public readonly tenantId: string) {
+    super(
+      `Command "${commandType}" targets tenant "${tenantId}", but the bus has no tenantValidator. ` +
+        `Pass tenantValidator to check the tenant against the authenticated caller, or ` +
+        `trustTenantMetadata: true if every sender of commands is trusted.`
+    );
+    this.name = "UnvalidatedTenantError";
   }
 }

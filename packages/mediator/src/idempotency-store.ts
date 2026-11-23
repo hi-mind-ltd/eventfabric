@@ -20,6 +20,14 @@ export type ClaimResult =
        * that don't record it skip the check.
        */
       requestHash?: string;
+      /**
+       * The principal (`metadata.principalId`) that first used the key. When
+       * the command being sent comes from a different principal, the
+       * middleware throws `IdempotencyKeyConflictError` instead of handing
+       * one caller another caller's result. Stores (or rows) that don't
+       * record it, and first uses without a principal, skip the check.
+       */
+      principalId?: string;
     }
   | { state: "in_flight" };
 
@@ -37,7 +45,7 @@ export type ClaimResult =
 export interface IdempotencyStore<TTx extends Transaction = Transaction> {
   claim(
     tx: TTx,
-    params: { key: string; commandType: string; commandId: string; tenantId?: string; requestHash?: string }
+    params: { key: string; commandType: string; commandId: string; tenantId?: string; requestHash?: string; principalId?: string }
   ): Promise<ClaimResult>;
 
   complete(tx: TTx, params: { key: string; tenantId?: string; result: unknown }): Promise<void>;
