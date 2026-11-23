@@ -1,5 +1,40 @@
 # @eventfabric/mediator
 
+## 0.4.1
+
+### Patch Changes
+
+- 6d1ca13: Fix data-loss and false-alarm bugs found in review.
+
+  - **Outbox:** `ack`, `release`, `releaseWithError` and `deadLetter` take an optional `workerId` and only act while that worker still holds the lease. The async runner passes it, so a handler that outlived `leaseMs` can no longer commit twice (a late ack throws `LeaseLostError` and rolls back) or free another worker's lock. In batch mode a failure is charged only to the row that failed, so one poison row no longer sends its whole batch to the dead-letter queue.
+  - **Saga timers:** new optional `SagaTimerStore.lockClaimed`. The scheduler re-checks each claimed timer at delivery and skips one that was cancelled or re-scheduled after the claim (round result `skipped`, observer hook `onTimerSkipped`, and `result="skipped"` on `eventfabric.saga.timer_fire_total`). `PgSagaTimerStore.markFired` only changes a claimed row, so a timer that re-schedules its own id keeps running.
+  - **Session:** a snapshot written by `saveChangesAsync` now holds the state at the saved version. Before, a direct `append` snapshotted only the events of that save.
+  - **Hash chain:** a process that has not registered a tamper-evident aggregate now extends its chained streams instead of breaking them (or refuses, without `hashChain.secret`). Payloads containing a `Date` no longer fail verification.
+  - **Idempotency:** reusing an idempotency key for a different command type, or for the same type with a different payload, throws `IdempotencyKeyConflictError` instead of returning the other command's result. `@eventfabric/mediator-postgres` adds migration `018_command_request_hash` (a `request_hash` column), applied by `migrate(pool, { extensions: [commandsMigrations] })`.
+
+- 9ce0828: Fix lower-priority bugs found in review.
+
+  - **Snapshots (core, postgres):** a save that writes several events and jumps past a multiple of `everyNEvents` now snapshots (it used to snapshot only when the new version was an exact multiple). New `shouldSnapshot(policy, fromVersion, toVersion)` helper.
+  - **Dead-letter reason (postgres):** the reason passed to `deadLetter()` is now stored (migration `019_outbox_dead_letter_reason` adds `outbox_dead_letters.reason`) and returned as `DlqItem.reason`. Run `migrate()` when upgrading.
+  - **Partitioning (postgres):** `enablePartitioning()` places the first boundary above both `MAX(global_position)` and the sequence's current value, so appends don't fail with "no partition" when the sequence is ahead (rolled-back appends, deleted events).
+  - **`loadByGlobalPositions` (postgres):** positions are sent as one array parameter, so very large batches don't exceed Postgres's 65,535-parameter limit.
+  - **Anchor sealer (postgres):** members are inserted with array parameters, so a seal covering more than ~10,900 advanced streams no longer fails every time.
+  - **In-memory idempotency store (mediator):** slots claimed or completed in a transaction that rolls back (including a failed commit) are removed, so a retry runs the handler instead of returning an uncommitted result. New optional `IdempotencyStore.afterCommit` / `afterRollback`, called by the bus.
+
+- 9ce0828: Tighten tenant and caller checks.
+
+  - **Command bus (mediator):** a command whose `metadata.tenantId` would switch the transaction to another tenant is rejected with `UnvalidatedTenantError` unless the bus has a `tenantValidator` or the new `trustTenantMetadata: true`. The bus used to follow the metadata unchecked. Single-tenant setups are not affected. A multi-tenant bus that a saga dispatcher sends to needs one of the two.
+  - **Idempotency (mediator, mediator-postgres):** the principal that first used a key is stored (migration `020_command_principal` adds `command_idempotency.principal_id`). The same key from a different principal throws `IdempotencyKeyConflictError` with `reason: "principal"` instead of returning the first caller's result. Run `migrate()` before the new version handles commands.
+  - **`loadGlobal` (core, postgres):** without `tenantId` it returns the transaction's tenant only. Cross-tenant reads need `allTenants: true`.
+
+- Updated dependencies [9ce0828]
+- Updated dependencies [6d1ca13]
+- Updated dependencies [9ce0828]
+- Updated dependencies [9ce0828]
+- Updated dependencies [9ce0828]
+- Updated dependencies [9ce0828]
+  - @eventfabric/core@0.4.1
+
 ## 0.4.0
 
 ### Patch Changes
