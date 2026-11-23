@@ -5,7 +5,7 @@ export { PgEventStore, ConcurrencyError, RowShapeError } from "./pg-event-store"
 export type { PgEventStoreOptions } from "./pg-event-store";
 // Re-exported from core for convenience (the tamper-evidence contract + result
 // type live in @eventfabric/core; PgEventStore implements TamperEvidentEventStore).
-export type { ChainVerificationResult, TamperEvidentEventStore } from "@eventfabric/core";
+export type { ChainVerificationResult, TamperEvidentEventStore, VerifyStreamOptions } from "@eventfabric/core";
 export { PgChainAnchorSealer, PgChainAnchorRunner } from "./chain-anchor-sealer";
 export type {
   PgChainAnchorSealerOptions,

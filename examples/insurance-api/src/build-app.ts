@@ -84,7 +84,12 @@ export function buildInsuranceApp(opts: InsuranceAppOptions): InsuranceApp {
   const tenantResolver = new ConjoinedTenantResolver(pool);
   // Tamper-evidence: ClaimAggregate declares `static tamperEvident = true`, so the
   // store it's registered against must carry the HMAC secret.
-  const chainSecret = opts.chainSecret ?? "dev-insecure-secret-change-me";
+  // The fallback is for local runs only: a chain keyed by a published string
+  // can be forged by anyone, so production must supply its own secret.
+  if (!opts.chainSecret && process.env.NODE_ENV === "production") {
+    throw new Error("EF_CHAIN_SECRET must be set in production");
+  }
+  const chainSecret = opts.chainSecret || "dev-insecure-secret-change-me";
   const store = new PgEventStore<InsuranceEvent>({
     upcaster: policyEventUpcaster,
     hashChain: { secret: chainSecret }

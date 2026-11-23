@@ -77,10 +77,91 @@ describe("PgEventStore hash chaining", () => {
     const sv = await pool.query(`SELECT head_hash FROM eventfabric.stream_versions WHERE aggregate_name='User'`);
     expect(sv.rows[0].head_hash).toBeNull();
 
-    // Nothing protected -> verify is vacuously ok.
+    // Nothing protected: not verified, unless the caller accepts unprotected events.
     const result = await uow.withTransaction((tx) => store.verifyStream(tx, { aggregateName: "User", aggregateId: "u1" }));
-    expect(result.ok).toBe(true);
-    expect(result.eventsChecked).toBe(0);
+    expect(result).toMatchObject({ ok: false, eventsChecked: 0, unprotectedEvents: 1, firstBrokenAt: 1 });
+    const allowed = await uow.withTransaction((tx) =>
+      store.verifyStream(tx, { aggregateName: "User", aggregateId: "u1", allowUnprotectedPrefix: true })
+    );
+    expect(allowed).toMatchObject({ ok: true, eventsChecked: 0, unprotectedEvents: 1 });
+  });
+
+  it("detects a chain whose hashes were all removed", async () => {
+    const store = chainedStore();
+    const uow = new PgUnitOfWork(pool);
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "s1", expectedAggregateVersion: 0, events: [ev(1), ev(2)] })
+    );
+    // An attacker with database access strips the chain, then edits an event.
+    await pool.query(`UPDATE eventfabric.events SET event_hash = NULL, payload = jsonb_set(payload, '{n}', '99') WHERE aggregate_id = 's1'`);
+    await pool.query(`UPDATE eventfabric.stream_versions SET head_hash = NULL WHERE aggregate_id = 's1'`);
+
+    const stripped = await uow.withTransaction((tx) => store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "s1" }));
+    expect(stripped).toMatchObject({ ok: false, unprotectedEvents: 2, firstBrokenAt: 1 });
+    expect(stripped.reason).toMatch(/no|none/);
+
+    // The next append starts a fresh chain; the stripped events still fail verification.
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "s1", expectedAggregateVersion: 2, events: [ev(3)] })
+    );
+    const restarted = await uow.withTransaction((tx) => store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "s1" }));
+    expect(restarted).toMatchObject({ ok: false, unprotectedEvents: 2, eventsChecked: 1, firstBrokenAt: 1 });
+
+    const results = await uow.withTransaction((tx) => store.verifyAggregate(tx, { aggregateName: "Audit" }));
+    expect(results.map((r) => r.ok)).toEqual([false]);
+  });
+
+  it("verifies a stream chained mid-life only with allowUnprotectedPrefix", async () => {
+    const uow = new PgUnitOfWork(pool);
+    // Written before tamper-evidence was enabled for "Audit".
+    const before = new PgEventStore<E>({ hashChain: { secret: SECRET } });
+    await uow.withTransaction((tx) =>
+      before.append(tx, { aggregateName: "Audit", aggregateId: "m1", expectedAggregateVersion: 0, events: [ev(1)] })
+    );
+    const store = chainedStore();
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "m1", expectedAggregateVersion: 1, events: [ev(2), ev(3)] })
+    );
+
+    const strict = await uow.withTransaction((tx) => store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "m1" }));
+    expect(strict).toMatchObject({ ok: false, unprotectedEvents: 1, eventsChecked: 2 });
+    const allowed = await uow.withTransaction((tx) =>
+      store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "m1", allowUnprotectedPrefix: true })
+    );
+    expect(allowed).toMatchObject({ ok: true, unprotectedEvents: 1, eventsChecked: 2 });
+
+    // A real break still fails with allowUnprotectedPrefix.
+    await pool.query(`UPDATE eventfabric.events SET payload = jsonb_set(payload, '{n}', '99') WHERE aggregate_id = 'm1' AND aggregate_version = 3`);
+    const broken = await uow.withTransaction((tx) =>
+      store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "m1", allowUnprotectedPrefix: true })
+    );
+    expect(broken).toMatchObject({ ok: false, firstBrokenAt: 3 });
+  });
+
+  it("detects a stream whose events and head were all removed", async () => {
+    const store = chainedStore();
+    const uow = new PgUnitOfWork(pool);
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "e1", expectedAggregateVersion: 0, events: [ev(1)] })
+    );
+    await pool.query(`DELETE FROM eventfabric.outbox`);
+    await pool.query(`DELETE FROM eventfabric.events WHERE aggregate_id = 'e1'`);
+    await pool.query(`UPDATE eventfabric.stream_versions SET head_hash = NULL WHERE aggregate_id = 'e1'`);
+
+    const result = await uow.withTransaction((tx) =>
+      store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "e1", allowUnprotectedPrefix: true })
+    );
+    expect(result).toMatchObject({ ok: false, firstBrokenAt: 1 });
+    expect(result.reason).toMatch(/no events/);
+  });
+
+  it("rejects a missing or empty secret instead of running unprotected", () => {
+    expect(() => new PgEventStore<E>({ hashChain: { secret: "", enabledAggregates: ["Audit"] } })).toThrow(/empty/);
+    expect(() => new PgEventStore<E>({ hashChain: { secret: Buffer.alloc(0) } })).toThrow(/empty/);
+    // process.env.EF_CHAIN_SECRET! when the variable is unset
+    expect(
+      () => new PgEventStore<E>({ hashChain: { secret: undefined as unknown as string, enabledAggregates: ["Audit"] } })
+    ).toThrow(/missing/);
   });
 
   it("detects a payload mutation", async () => {

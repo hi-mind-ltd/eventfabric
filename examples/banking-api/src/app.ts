@@ -39,7 +39,11 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 // Tamper-evidence: the account ledger is hash-chained (see /accounts/:id/verify
 // and the anchor below). The HMAC secret comes from the environment — never
 // commit it; without it, existing chains can't be verified. The dev fallback
-// is for local runs only.
+// is for local runs only: in production a missing secret stops startup, since
+// a chain keyed by a published string can be forged by anyone.
+if (!process.env.EF_CHAIN_SECRET && process.env.NODE_ENV === "production") {
+  throw new Error("EF_CHAIN_SECRET must be set in production");
+}
 const CHAIN_SECRET = process.env.EF_CHAIN_SECRET ?? "dev-insecure-secret-change-me";
 
 // The upcaster is applied to every loaded event payload. Historical

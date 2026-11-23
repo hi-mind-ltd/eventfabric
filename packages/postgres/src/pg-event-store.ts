@@ -5,6 +5,7 @@ import type {
   EventUpcaster,
   ChainVerificationResult,
   TamperEvidentEventStore,
+  VerifyStreamOptions,
 } from "@eventfabric/core";
 import { computeEventHash, streamGenesis, hashesEqual, toSecret } from "@eventfabric/core";
 import type { PgTx } from "./unitofwork/pg-transaction";
@@ -608,13 +609,16 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
    * the chain). Detects payload/metadata mutation, event removal (version gap
    * or NULL hash inside the chain), and tail removal (head mismatch).
    *
-   * Streams that began chaining mid-life (tamper-evidence enabled after some
-   * events already existed) are verified from their first protected event
-   * onward; earlier NULL-hash events are out of scope.
+   * A stream verifies only when every event is covered. Events without a hash
+   * fail it (`unprotectedEvents` says how many): a stream whose hashes were
+   * all set to NULL is otherwise indistinguishable from one that was never
+   * chained, and its next append would start a fresh, valid-looking chain.
+   * For a stream that existed before tamper-evidence was enabled, pass
+   * `allowUnprotectedPrefix: true` to verify from the first protected event.
    */
   async verifyStream(
     tx: PgTx,
-    params: { aggregateName: string; aggregateId: string }
+    params: { aggregateName: string; aggregateId: string } & VerifyStreamOptions
   ): Promise<ChainVerificationResult> {
     if (this.hashSecret === undefined) {
       throw new Error("verifyStream requires the store to be constructed with hashChain.secret");
@@ -636,20 +640,40 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
     const rows = res.rows;
 
     const headRes = await tx.client.query(
-      `SELECT head_hash FROM ${this.streamVersionsTable}
+      `SELECT current_version, head_hash FROM ${this.streamVersionsTable}
        WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
       [tenantId, aggregateName, aggregateId]
     );
     const storedHead: Buffer | null = headRes.rows[0]?.head_hash ?? null;
+    const storedVersion = headRes.rows[0] ? Number(headRes.rows[0].current_version) : 0;
 
     const chainStart = rows.findIndex((r: any) => r.event_hash !== null);
+    // Events with no hash: all of them when nothing is chained, else the prefix.
+    const unprotected = chainStart === -1 ? rows.length : chainStart;
+    const unprotectedFailure = (): ChainVerificationResult => ({
+      ...base, ok: false, unprotectedEvents: unprotected,
+      firstBrokenAt: Number(rows[0].aggregate_version),
+      reason: chainStart === -1
+        ? `none of the stream's ${unprotected} event(s) has an event_hash (hashes removed, or the stream was never chained)`
+        : `${unprotected} event(s) before version ${Number(rows[chainStart].aggregate_version)} have no event_hash ` +
+          `(hashes removed and the chain restarted, or tamper-evidence was enabled mid-stream)`,
+    });
+
     if (chainStart === -1) {
       // No protected events. Consistent only if there is no stored head either.
       if (storedHead) {
         return { ...base, ok: false, firstBrokenAt: rows.length ? Number(rows[rows.length - 1].aggregate_version) : 0,
           reason: "stream_versions.head_hash is set but the stream has no protected events" };
       }
-      return base;
+      if (rows.length === 0) {
+        if (storedVersion > 0) {
+          return { ...base, ok: false, firstBrokenAt: 1,
+            reason: `stream_versions is at version ${storedVersion} but the stream has no events (events removed)` };
+        }
+        return base;
+      }
+      if (!params.allowUnprotectedPrefix) return unprotectedFailure();
+      return { ...base, unprotectedEvents: unprotected };
     }
 
     let prev = streamGenesis(secret, tenantId, aggregateName, aggregateId);
@@ -691,7 +715,10 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
       return { ...base, ok: false, eventsChecked: checked, firstBrokenAt: expectedVersion - 1,
         reason: "head_hash mismatch (tail event(s) removed or head tampered)" };
     }
-    return { ...base, eventsChecked: checked };
+    if (unprotected > 0 && !params.allowUnprotectedPrefix) {
+      return { ...unprotectedFailure(), eventsChecked: checked };
+    }
+    return { ...base, eventsChecked: checked, unprotectedEvents: unprotected };
   }
 
   /**
@@ -700,7 +727,7 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
    */
   async verifyAggregate(
     tx: PgTx,
-    params: { aggregateName: string }
+    params: { aggregateName: string } & VerifyStreamOptions
   ): Promise<ChainVerificationResult[]> {
     const res = await tx.client.query(
       `SELECT aggregate_id FROM ${this.streamVersionsTable}
@@ -710,7 +737,11 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
     );
     const out: ChainVerificationResult[] = [];
     for (const row of res.rows) {
-      out.push(await this.verifyStream(tx, { aggregateName: params.aggregateName, aggregateId: row.aggregate_id }));
+      out.push(await this.verifyStream(tx, {
+        aggregateName: params.aggregateName,
+        aggregateId: row.aggregate_id,
+        allowUnprotectedPrefix: params.allowUnprotectedPrefix,
+      }));
     }
     return out;
   }

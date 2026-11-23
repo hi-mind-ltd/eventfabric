@@ -29,6 +29,24 @@ function makeEvent(overrides: Partial<ChainableEvent> = {}): ChainableEvent {
   };
 }
 
+describe("toSecret", () => {
+  it("accepts a string or a Buffer", () => {
+    expect(toSecret("abc").equals(Buffer.from("abc"))).toBe(true);
+    const buf = Buffer.from([1, 2, 3]);
+    expect(toSecret(buf)).toBe(buf);
+  });
+
+  it("rejects an empty secret", () => {
+    expect(() => toSecret("")).toThrow(/empty/);
+    expect(() => toSecret(Buffer.alloc(0))).toThrow(/empty/);
+  });
+
+  it("rejects a missing secret (an unset environment variable)", () => {
+    expect(() => toSecret(undefined as unknown as string)).toThrow("missing (got undefined)");
+    expect(() => toSecret(null as unknown as string)).toThrow("missing (got null)");
+  });
+});
+
 describe("canonicalJson", () => {
   it("is independent of object key insertion order", () => {
     expect(canonicalJson({ b: 1, a: 2 })).toBe(canonicalJson({ a: 2, b: 1 }));

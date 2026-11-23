@@ -14,9 +14,25 @@ import { createHmac, timingSafeEqual } from "crypto";
 
 const HASH_ALGO = "sha256";
 
-/** Normalize a configured secret to a Buffer. */
+/**
+ * Normalize a configured secret to a Buffer. Throws when the secret is missing
+ * or empty: an empty key gives a chain anyone can forge, and a missing one
+ * (an unset environment variable) must not quietly turn the feature off.
+ * Use at least 32 random bytes.
+ */
 export function toSecret(secret: string | Buffer): Buffer {
-  return typeof secret === "string" ? Buffer.from(secret, "utf8") : secret;
+  const key: unknown = secret;
+  if (typeof key !== "string" && !Buffer.isBuffer(key)) {
+    throw new Error(
+      `Hash-chain secret is missing (got ${key === null ? "null" : typeof key}). ` +
+        `Check the environment variable it is read from.`
+    );
+  }
+  const buf = typeof key === "string" ? Buffer.from(key, "utf8") : key;
+  if (buf.length === 0) {
+    throw new Error("Hash-chain secret is empty. Use at least 32 random bytes.");
+  }
+  return buf;
 }
 
 /**

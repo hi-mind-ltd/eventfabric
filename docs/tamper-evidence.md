@@ -85,6 +85,10 @@ need migration 015.
 - Keep it in env/KMS, **never in the database or source**. Losing it means you can
   no longer verify existing chains (but events remain readable). Leaking it lets an
   attacker forge chains.
+- Use at least 32 random bytes (`openssl rand -base64 32`). A short or guessable
+  secret can be found by anyone who can read the events and their hashes.
+- A missing or empty secret throws when the store or sealer is constructed, so an
+  unset environment variable stops startup instead of leaving streams unprotected.
 - The same secret must be used by the write path, `verifyStream`, the anchor
   sealer, and `verifyAnchors`.
 - Rotation isn't automatic: a rotated secret won't verify chains written under the
@@ -100,7 +104,7 @@ need migration 015.
 const result = await uow.withTransaction((tx) =>
   store.verifyStream(tx, { aggregateName: "audit", aggregateId: "audit-42" })
 );
-// { ok, tenantId, aggregateName, aggregateId, eventsChecked, firstBrokenAt, reason? }
+// { ok, tenantId, aggregateName, aggregateId, eventsChecked, firstBrokenAt, reason?, unprotectedEvents? }
 
 if (!result.ok) {
   console.error(`audit-42 broken at v${result.firstBrokenAt}: ${result.reason}`);
@@ -113,6 +117,24 @@ is over the bytes as stored), checks each link, and checks the final hash equals
 `stream_versions.head_hash`. `firstBrokenAt` is the `aggregate_version` where it
 diverged; `reason` describes the failure (`"event_hash mismatch"`,
 `"version gap"`, `"head_hash mismatch"`, …).
+
+A stream verifies only when **every** event has a hash. `unprotectedEvents`
+counts the events without one, and any such event makes `ok` false. This is
+what catches someone setting every `event_hash` and the `head_hash` to `NULL`:
+the stream then looks like one that was never chained, and its next append
+would start a new, valid chain.
+
+If a stream existed before you enabled tamper-evidence, its early events have
+no hash for a legitimate reason. Verify it with `allowUnprotectedPrefix`:
+
+```typescript
+store.verifyStream(tx, { aggregateName: "audit", aggregateId: "audit-42", allowUnprotectedPrefix: true });
+```
+
+That accepts unhashed events at the start of the stream, which also means it
+can't tell a stripped prefix from an old one. Record `unprotectedEvents` for
+such streams when you enable the feature and alert if it ever grows.
+`verifyAggregate` takes the same option.
 
 Verify every stream of an aggregate for the current tenant:
 
@@ -171,8 +193,9 @@ deletion; less frequent = less background work.
   event remains in the chain. (A hard delete, by contrast, *is* detected.)
 - **Enabling mid-stream.** If you turn chaining on for an aggregate that already
   has events, those pre-existing events keep `NULL` `event_hash`; the chain starts
-  at the next appended event (genesis). `verifyStream` verifies from the first
-  protected event onward. Events before that point are out of scope.
+  at the next appended event (genesis). `verifyStream` reports such a stream as
+  not ok unless you pass `allowUnprotectedPrefix: true`, which verifies from the
+  first protected event onward.
 - **Payloads must be JSON round-trip stable.** The hash preimage is the canonical
   JSON serialization (sorted keys) of the payload as stored, after its JSON round
   trip, so a `Date` is hashed as its ISO string. No `NaN`/`Infinity`, no `bigint`, and integers
