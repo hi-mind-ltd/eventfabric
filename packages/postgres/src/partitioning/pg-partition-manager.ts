@@ -75,10 +75,15 @@ export class PgPartitionManager {
 
       const seqName = await this.getSequenceName(client);
       const maxPos = await this.getMaxPosition(client);
+      // The sequence can be well past MAX(global_position): rolled-back
+      // appends consume values, and the newest events may have been deleted.
+      // Base the boundary on whichever is higher so the next position lands
+      // in an existing partition.
+      const seq = await client.query(`SELECT last_value, is_called FROM ${seqName}`);
+      const issued = seq.rows[0].is_called ? BigInt(seq.rows[0].last_value) : BigInt(seq.rows[0].last_value) - 1n;
+      const base = issued > maxPos ? issued : maxPos;
 
-      const boundary = maxPos === 0n
-        ? partitionSize
-        : ((maxPos / partitionSize) + 1n) * partitionSize;
+      const boundary = ((base / partitionSize) + 1n) * partitionSize;
 
       const firstPartName = `${this.table}_p0`;
       const nextPartName = `${this.table}_p1`;

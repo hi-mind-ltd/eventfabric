@@ -143,7 +143,9 @@ steps atomically:
 1. Renames `eventfabric.events` → `eventfabric.events_p0`
 2. Creates a new `eventfabric.events` as `PARTITION BY RANGE (global_position)`
 3. Attaches the old table as the first partition (`events_p0`)
-4. Creates the next empty partition (`events_p1`) for new writes
+4. Creates the next empty partition (`events_p1`) for new writes. Its start is the
+   next multiple of `partitionSize` above both `MAX(global_position)` and the
+   sequence's current value (rolled-back appends use up sequence values).
 5. Re-creates indexes on the parent (automatically propagated to all partitions)
 6. Reassigns the `BIGSERIAL` sequence to the new parent table
 
