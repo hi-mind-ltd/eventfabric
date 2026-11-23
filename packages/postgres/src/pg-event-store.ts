@@ -576,15 +576,15 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
 
   async loadByGlobalPositions(tx: PgTx, positions: bigint[]): Promise<EventEnvelope<E>[]> {
     if (positions.length === 0) return [];
-    const params = positions.map(p => p.toString());
-    const placeholders = params.map((_, i) => `$${i+1}`).join(",");
+    // One array parameter: a placeholder per position would hit Postgres's
+    // 65,535-parameter limit on large batches.
     const res = await tx.client.query(
       `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
               dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
        FROM ${this.eventsTable}
-       WHERE global_position IN (${placeholders})
+       WHERE global_position = ANY($1::bigint[])
        ORDER BY global_position ASC`,
-      params
+      [positions.map((p) => p.toString())]
     );
     return res.rows.map((r) => this.mapRow(r));
   }

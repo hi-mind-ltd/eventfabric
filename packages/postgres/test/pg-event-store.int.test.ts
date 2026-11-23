@@ -454,6 +454,28 @@ describe("PgEventStore", () => {
       expect(events[0]!.globalPosition).toBe(globalPos);
     });
 
+    it("accepts more positions than Postgres's 65,535 bind-parameter limit", async () => {
+      const uow = new PgUnitOfWork(pool);
+      const store = new PgEventStore<E>();
+
+      let globalPos: bigint | undefined;
+      await uow.withTransaction(async (tx) => {
+        const result = await store.append(tx, {
+          aggregateName: "User",
+          aggregateId: "u-many",
+          expectedAggregateVersion: 0,
+          events: [{ type: "A", version: 1, n: 1 }]
+        });
+        globalPos = result.appended[0]!.globalPosition;
+      });
+
+      const positions = Array.from({ length: 70_000 }, (_, i) => 1_000_000n + BigInt(i));
+      positions.push(globalPos!);
+      const events = await uow.withTransaction((tx) => store.loadByGlobalPositions(tx, positions));
+
+      expect(events.map((e) => e.globalPosition)).toEqual([globalPos]);
+    });
+
     it("includes dismissed events (no filtering)", async () => {
       const uow = new PgUnitOfWork(pool);
       const store = new PgEventStore<E>();
