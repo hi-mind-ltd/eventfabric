@@ -78,4 +78,20 @@ export abstract class AggregateRoot<S, E extends AnyEvent> {
     this.pending = [];
     return out;
   }
+
+  /** The events raised since the last save, oldest first. Does not clear them. */
+  public peekPendingEvents(): readonly E[] {
+    return [...this.pending];
+  }
+
+  /**
+   * Records a committed save: drops the first `count` pending events (the
+   * ones that were written) and sets the version. Call it only after the
+   * transaction commits, so a failed save leaves the aggregate as it was and
+   * can be retried.
+   */
+  public markCommitted(count: number, version: number): void {
+    this.pending.splice(0, count);
+    this.version = version;
+  }
 }

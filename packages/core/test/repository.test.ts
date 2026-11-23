@@ -101,4 +101,49 @@ describe("Repository", () => {
     expect(c2.state.n).toBe(2);
     expect(c2.version).toBe(1);
   });
+
+  it("a failed save keeps the pending events, so a retry writes them", async () => {
+    const store = new MemStore();
+    const realAppend = store.append.bind(store);
+    let failNext = true;
+    store.append = async (tx, p) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("connection reset");
+      }
+      return realAppend(tx, p);
+    };
+    const repo = new Repository<Counter, S, E, MemTx>(
+      "Counter", new MemUow(), store, (id, snap) => new Counter(id, snap), { snapshotPolicy: { everyNEvents: 0 } }
+    );
+
+    const c = await repo.load("retry");
+    c.inc(5);
+    await expect(repo.save(c)).rejects.toThrow("connection reset");
+    expect(c.peekPendingEvents()).toHaveLength(1);
+    expect(c.version).toBe(0);
+
+    const res = await repo.save(c);
+    expect(res?.appended).toHaveLength(1);
+    expect(c.version).toBe(1);
+    expect(c.peekPendingEvents()).toHaveLength(0);
+    expect((await repo.load("retry")).state.n).toBe(5);
+  });
+
+  it("a save that fails after the append (inline projector) leaves the aggregate's version and events alone", async () => {
+    const repo = new Repository<Counter, S, E, MemTx>(
+      "Counter", new MemUow(), new MemStore(), (id, snap) => new Counter(id, snap), {
+        snapshotPolicy: { everyNEvents: 0 },
+        inlineProjector: { run: async () => { throw new Error("projection failed"); } } as never,
+      }
+    );
+
+    const c = await repo.load("proj");
+    c.inc(1);
+    c.inc(2);
+    await expect(repo.save(c)).rejects.toThrow("projection failed");
+    // The transaction rolled back, so the aggregate must not claim version 2.
+    expect(c.version).toBe(0);
+    expect(c.peekPendingEvents().map((e) => e.by)).toEqual([1, 2]);
+  });
 });

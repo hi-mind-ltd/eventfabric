@@ -55,10 +55,14 @@ export class Repository<
       forceSnapshot?: boolean;
     }
   ): Promise<{ appended: EventEnvelope<E>[] } | null> {
-    return this.uow.withTransaction(async (tx) => {
-      const events = agg.pullPendingEvents();
-      if (events.length === 0) return null;
+    // Leave the aggregate untouched until the commit: if anything below fails
+    // (concurrency conflict, projector, snapshot, commit), the transaction
+    // rolls back and the aggregate still holds its pending events and old
+    // version, so the caller can retry or discard it knowingly.
+    const events = agg.peekPendingEvents();
+    if (events.length === 0) return null;
 
+    const { appended, nextVersion } = await this.uow.withTransaction(async (tx) => {
       const asyncCfg = this.opts.asyncProcessor ?? { enabled: false as const };
       const enqueueOutbox = params?.enqueueOutbox ?? asyncCfg.enabled;
       const outboxTopic = params?.outboxTopic ?? (asyncCfg.enabled ? (asyncCfg.topic ?? null) : null);
@@ -67,13 +71,13 @@ export class Repository<
         aggregateName: this.aggregateName,
         aggregateId: agg.id,
         expectedAggregateVersion: agg.version,
-        events,
+        events: [...events],
         meta: params?.meta,
         enqueueOutbox,
         outboxTopic,
       });
 
-      agg.version = res.nextAggregateVersion;
+      const nextVersion = res.nextAggregateVersion;
 
       if (this.opts.inlineProjector) {
         await this.opts.inlineProjector.run(tx, res.appended);
@@ -83,20 +87,23 @@ export class Repository<
       const shouldSnapshot =
         !!this.opts.snapshotStore &&
         (params?.forceSnapshot ||
-          (policy.everyNEvents > 0 && agg.version % policy.everyNEvents === 0));
+          (policy.everyNEvents > 0 && nextVersion % policy.everyNEvents === 0));
 
       if (shouldSnapshot && this.opts.snapshotStore) {
         await this.opts.snapshotStore.save(tx, {
           aggregateName: this.aggregateName,
           aggregateId: agg.id,
-          aggregateVersion: agg.version,
+          aggregateVersion: nextVersion,
           createdAt: new Date().toISOString(),
           snapshotSchemaVersion: this.opts.snapshotSchemaVersion ?? 1,
           state: agg.state,
         });
       }
 
-      return { appended: res.appended };
+      return { appended: res.appended, nextVersion };
     });
+
+    agg.markCommitted(events.length, nextVersion);
+    return { appended };
   }
 }

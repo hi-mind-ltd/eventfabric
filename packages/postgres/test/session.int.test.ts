@@ -973,6 +973,55 @@ describe("Session", () => {
     expect(row2.rows[0].balance).toBe(150);
   }, 15000);
 
+  it("a failed saveChangesAsync leaves tracked aggregate versions alone; a retry commits once", async () => {
+    const store = new PgEventStore<TestEvent>();
+    const factory = new SessionFactory(pool, store);
+    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account");
+
+    let failProjection = false;
+    factory.registerInlineProjector(
+      new InlineProjector<TestEvent, PgTx>([
+        {
+          name: "flaky",
+          async handle() {
+            if (failProjection) throw new Error("projection failed");
+          },
+        },
+      ])
+    );
+
+    const accountId = "acc-failed-save";
+    const s1 = factory.createSession();
+    s1.startStream(accountId, {
+      type: "AccountOpened",
+      version: 1,
+      accountId,
+      customerId: "c",
+      initialBalance: 100,
+      currency: "USD",
+    } as AccountOpenedV1);
+    await s1.saveChangesAsync();
+
+    const session = factory.createSession();
+    const account = await session.loadAggregateAsync<AccountAggregate>(accountId);
+    expect(account.version).toBe(1);
+    account.deposit(50);
+
+    failProjection = true;
+    await expect(session.saveChangesAsync()).rejects.toThrow("projection failed");
+    // Rolled back: the aggregate must still be at version 1.
+    expect(account.version).toBe(1);
+
+    failProjection = false;
+    await session.saveChangesAsync();
+    expect(account.version).toBe(2);
+
+    // Written once: a fresh load sees version 2 and one deposit.
+    const reloaded = await factory.createSession().loadAggregateAsync<AccountAggregate>(accountId);
+    expect(reloaded.version).toBe(2);
+    expect(reloaded.state.balance).toBe(150);
+  }, 15000);
+
   it("creates snapshots automatically based on snapshot policy", async () => {
     const store = new PgEventStore<TestEvent>();
     const snapshotStore = new PgSnapshotStore<AccountState>();

@@ -601,6 +601,7 @@ export class Session<E extends AnyEvent> {
 
     const meta = opts?.meta;
     const uow = new PgUnitOfWork(this.pool, this.tenantId);
+    const trackedVersions = new Map<string, number>();
     await uow.withTransaction(async (tx: PgTx) => {
       const allAppendedEvents: EventEnvelope<E>[] = [];
       const aggregateVersions: Map<string, number> = new Map();
@@ -654,10 +655,10 @@ export class Session<E extends AnyEvent> {
           arr.push(...result.appended);
           aggregateEvents.set(op.aggregateId, arr);
           
-          // Update tracked aggregate version after successful append
-          const trackedAggregate = this.loadedAggregates.get(op.aggregateId);
-          if (trackedAggregate) {
-            trackedAggregate.version = result.nextAggregateVersion;
+          // Tracked aggregates get their new version only after the commit
+          // (below): a rollback must leave them at the version they had.
+          if (this.loadedAggregates.has(op.aggregateId)) {
+            trackedVersions.set(op.aggregateId, result.nextAggregateVersion);
           }
         }
       }
@@ -731,7 +732,11 @@ export class Session<E extends AnyEvent> {
       }
     });
 
-    // Clear pending operations after successful commit
+    // Committed: advance tracked aggregates and clear pending operations.
+    for (const [aggregateId, version] of trackedVersions) {
+      const tracked = this.loadedAggregates.get(aggregateId);
+      if (tracked) tracked.version = version;
+    }
     this.pendingOperations = [];
   }
 }

@@ -144,6 +144,22 @@ After `pullPendingEvents()` the aggregate's `state` still reflects the raised
 events, but the pending list is empty. Calling `pullPendingEvents()` a second
 time returns `[]`.
 
+## peekPendingEvents() and markCommitted()
+
+```typescript
+public peekPendingEvents(): readonly E[]
+public markCommitted(count: number, version: number): void
+```
+
+`Repository.save()` uses these instead of `pullPendingEvents()`. It reads the
+pending events with `peekPendingEvents()`, writes them, and only after the
+transaction commits calls `markCommitted()`, which drops the written events and
+sets `version`. If the save fails at any point (concurrency conflict, inline
+projection, snapshot, commit), the aggregate keeps its pending events and its
+old version, so you can retry `save()` or discard the aggregate.
+`saveChangesAsync()` likewise advances tracked aggregates' versions only after
+the commit. Use the same pair in a custom repository.
+
 ## Full example -- AccountAggregate
 
 Below is the complete `AccountAggregate` from the banking-api example.
