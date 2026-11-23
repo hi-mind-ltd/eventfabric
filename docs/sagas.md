@@ -376,6 +376,16 @@ new SagaCommandDispatcher(uow, queue, bus, {
 });
 ```
 
+### When a round fails
+
+If a whole round of the dispatcher or the scheduler throws (for example,
+the database is unreachable), the loop does not exit. It reports the error
+through `observer.onLoopError({ component, error, consecutiveErrors,
+retryInMs })`, waits with exponential backoff, and tries again. The backoff
+resets after the next successful round. Configure it with `errorBackoff`
+(default `{ minMs: 250, maxMs: 15_000, factor: 2, jitter: 0.2 }`).
+`stop()` cuts the current sleep or backoff short.
+
 ### `SagaTimerScheduler`
 
 Polls due timers and delivers each to its saga's `reactToTimer`. The
@@ -654,6 +664,9 @@ Metrics emitted:
 - `eventfabric.saga.timer_fire_total{result}` — counter, results
   `fired` / `released` / `skipped` / `orphaned`
 - `eventfabric.saga.timer_fire_duration_ms` — histogram
+- `eventfabric.saga.loop_error_total{component}` — counter, components
+  `timer-scheduler` / `command-dispatcher`; rounds that threw and were
+  retried (see [When a round fails](#when-a-round-fails))
 
 ### Queue gauges
 

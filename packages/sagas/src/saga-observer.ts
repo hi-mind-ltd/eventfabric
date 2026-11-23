@@ -92,6 +92,16 @@ export type SagaTimerOrphanedInfo = {
   timerId: string;
 };
 
+export type SagaLoopErrorInfo = {
+  /** Which background loop failed. */
+  component: "timer-scheduler" | "command-dispatcher";
+  error: Error;
+  /** Failed rounds in a row, including this one. Resets after a successful round. */
+  consecutiveErrors: number;
+  /** How long the loop backs off before the next round. */
+  retryInMs: number;
+};
+
 export type SagaObserver = {
   /** Fired when the runner inserts a fresh saga instance. */
   onInstanceStarted?(info: SagaInstanceStartedInfo): void;
@@ -117,6 +127,13 @@ export type SagaObserver = {
   onTimerSkipped?(info: SagaTimerSkippedInfo): void;
   /** Fired when the scheduler marks a timer fired because no saga handler is registered for its name. */
   onTimerOrphaned?(info: SagaTimerOrphanedInfo): void;
+
+  /**
+   * Fired when a round of the timer scheduler or command dispatcher throws
+   * (typically the database is unreachable). The loop keeps running: it
+   * backs off and tries again.
+   */
+  onLoopError?(info: SagaLoopErrorInfo): void;
 
   /**
    * Wraps a saga reaction (event or timer). Must invoke `react` exactly

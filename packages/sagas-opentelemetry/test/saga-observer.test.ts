@@ -257,6 +257,25 @@ describe("createSagaObserver — metrics", () => {
     );
     expect(results.sort()).toEqual(["fired", "orphaned", "released", "skipped"]);
   });
+
+  it("counts loop errors by component", async () => {
+    const observer = createSagaObserver({
+      tracer: tracerProvider.getTracer("test"),
+      meter: meterProvider.getMeter("test"),
+    });
+
+    const err = new Error("connection refused");
+    observer.onLoopError!({ component: "timer-scheduler", error: err, consecutiveErrors: 1, retryInMs: 250 });
+    observer.onLoopError!({ component: "timer-scheduler", error: err, consecutiveErrors: 2, retryInMs: 500 });
+    observer.onLoopError!({ component: "command-dispatcher", error: err, consecutiveErrors: 1, retryInMs: 250 });
+
+    const metrics = await collectMetrics();
+    const loop = metrics.find((m) => m.descriptor.name === "eventfabric.saga.loop_error_total")!;
+    const byComponent = Object.fromEntries(
+      loop.dataPoints.map((dp) => [dp.attributes["eventfabric.component"], dp.value])
+    );
+    expect(byComponent).toEqual({ "timer-scheduler": 2, "command-dispatcher": 1 });
+  });
 });
 
 describe("createSagaQueueGauges", () => {

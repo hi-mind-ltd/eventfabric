@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { Transaction, UnitOfWork } from "@eventfabric/core";
 import {
   InMemorySagaCommandQueue,
@@ -341,4 +341,58 @@ describe("SagaTimerScheduler", () => {
     expect(uow.opens[0]).toBe("default");
     expect(uow.opens.slice(1).sort()).toEqual(["acme", "contoso"]);
   });
+it("keeps running after a round throws: reports onLoopError, backs off, then fires", async () => {
+    const { stateStore, timerStore, handlers } = buildHandlers();
+    await seedInstance(stateStore, "i-1");
+    await timerStore.schedule(tx, {
+      tenantId: "default",
+      sagaName: "Counter",
+      instanceId: "i-1",
+      id: "tick",
+      fireAt: new Date(Date.now() - 1000),
+      message: { type: "$timer", id: "tick", payload: null },
+    });
+
+    let failures = 2;
+    const flaky: UnitOfWork<Transaction> = {
+      async withTransaction<T>(fn: (t: Transaction) => Promise<T>): Promise<T> {
+        if (failures > 0) {
+          failures--;
+          throw new Error("connection refused");
+        }
+        return fn(tx);
+      },
+    };
+    const errors: Array<{ component: string; consecutiveErrors: number }> = [];
+    const scheduler = new SagaTimerScheduler(flaky, timerStore, handlers, {
+      idleSleepMs: 5,
+      errorBackoff: { minMs: 1, maxMs: 1, factor: 1, jitter: 0 },
+      observer: { onLoopError: (i) => errors.push({ component: i.component, consecutiveErrors: i.consecutiveErrors }) },
+    });
+
+    const started = scheduler.start();
+    await vi.waitFor(async () => {
+      const inst = await stateStore.load(tx, { sagaName: "Counter", instanceId: "i-1", tenantId: "default" });
+      expect(inst!.state.fired).toBe(1);
+    }, { timeout: 2000 });
+    await scheduler.stop();
+    await started;
+
+    expect(errors).toEqual([
+      { component: "timer-scheduler", consecutiveErrors: 1 },
+      { component: "timer-scheduler", consecutiveErrors: 2 },
+    ]);
+  });
+
+  it("stop() interrupts the idle sleep", async () => {
+    const { timerStore, handlers } = buildHandlers();
+    const scheduler = new SagaTimerScheduler(new NoOpUow(), timerStore, handlers, { idleSleepMs: 60_000 });
+    const started = scheduler.start();
+    await new Promise((r) => setTimeout(r, 20));
+    const t0 = Date.now();
+    await scheduler.stop();
+    await started;
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
 });
+

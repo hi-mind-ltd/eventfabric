@@ -55,6 +55,10 @@ export function createSagaObserver(opts: SagaOtelOptions): SagaObserver {
     }
   );
 
+  const loopErrorCounter = meter?.createCounter(`${prefix}.loop_error_total`, {
+    description: "Rounds of the timer scheduler or command dispatcher that threw and were retried after a backoff",
+  });
+
   const timerFireCounter = meter?.createCounter(`${prefix}.timer_fire_total`, {
     description: "Total saga timers processed by the scheduler, labelled by result",
   });
@@ -163,6 +167,13 @@ export function createSagaObserver(opts: SagaOtelOptions): SagaObserver {
       timerFireCounter?.add(1, {
         ...timerAttrs(info),
         "eventfabric.result": "orphaned",
+      });
+    },
+
+    onLoopError(info) {
+      loopErrorCounter?.add(1, {
+        "eventfabric.component": info.component,
+        "eventfabric.error_name": info.error.name,
       });
     },
 
