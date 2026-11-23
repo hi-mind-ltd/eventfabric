@@ -178,7 +178,7 @@ export class AsyncProjectionRunner<E extends AnyEvent, TTx extends Transaction =
           error: toError(err)
         });
         attempt++;
-        await sleep(computeBackoffMs(attempt, backoff), signal);
+        await sleep(computeBackoffMs(attempt - 1, backoff), signal); // first retry waits minMs
       }
     }
   }

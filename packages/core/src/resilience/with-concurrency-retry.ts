@@ -42,7 +42,7 @@ export async function withConcurrencyRetry<T>(
     } catch (err) {
       attempt++;
       if (attempt >= maxAttempts || !isConcurrency(err)) throw err;
-      if (opts.backoff) await sleep(computeBackoffMs(attempt, opts.backoff));
+      if (opts.backoff) await sleep(computeBackoffMs(attempt - 1, opts.backoff)); // first retry waits minMs
     }
   }
 }

@@ -627,9 +627,9 @@ describe("AsyncProjectionRunner", () => {
       await new Promise(resolve => setTimeout(resolve, 50));
       
       // Verify backoff was calculated correctly
-      // attempt 1 should use: minMs * factor^1 = 10 * 2 = 20ms
-      const expectedBackoff = computeBackoffMs(1, backoff);
-      expect(expectedBackoff).toBe(20);
+      // The first retry uses attempt 0: minMs * factor^0 = 10ms
+      const expectedBackoff = computeBackoffMs(0, backoff);
+      expect(expectedBackoff).toBe(10);
       
       // Abort the runner immediately
       ac.abort();
