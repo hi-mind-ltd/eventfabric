@@ -111,4 +111,27 @@ describe("createCatchUpObserver", () => {
       all.find((m) => m.descriptor.name === "eventfabric.catch_up.checkpoints_advanced")
     ).toBeDefined();
   });
+
+  it("keeps positions off metric attributes (unbounded cardinality)", async () => {
+    const observer = createCatchUpObserver({
+      tracer: tracerProvider.getTracer("test"),
+      meter: meterProvider.getMeter("test")
+    });
+
+    for (const pos of [1n, 2n, 3n]) {
+      observer.onEventHandled!({ projection: "cp-card", eventType: "Tick", globalPosition: pos, durationMs: 1 });
+      observer.onBatchLoaded!({ projection: "cp-card", fromPosition: pos, count: 1 });
+      observer.onCheckpointAdvanced!({ projection: "cp-card", fromPosition: pos, toPosition: pos + 1n });
+    }
+
+    await metricReader.forceFlush();
+    const all = metricExporter.getMetrics().flatMap((m) => m.scopeMetrics.flatMap((s) => s.metrics));
+    for (const name of ["events_handled", "batches_loaded", "checkpoints_advanced"]) {
+      const metric = all.filter((m) => m.descriptor.name === `eventfabric.catch_up.${name}`).at(-1);
+      const points = metric!.dataPoints.filter((dp) => dp.attributes["eventfabric.projection"] === "cp-card");
+      expect(points, name).toHaveLength(1);
+      expect(points[0]!.value, name).toBe(3);
+      for (const key of Object.keys(points[0]!.attributes)) expect(key).not.toMatch(/position/);
+    }
+  });
 });

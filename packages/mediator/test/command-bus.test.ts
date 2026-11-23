@@ -7,6 +7,7 @@ import {
   IdempotencyKeyConflictError,
   InMemoryIdempotencyStore,
   MissingTenantIdError,
+  UnvalidatedTenantError,
   NoHandlerRegisteredError,
 } from "../src";
 
@@ -153,6 +154,29 @@ describe("CommandBus", () => {
     expect(err).toBeInstanceOf(IdempotencyKeyConflictError);
     expect(err).toMatchObject({ reason: "payload" });
     expect(handle).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stored result only to the principal that first sent the command", async () => {
+    const bus = new CommandBus<TxToken>({ uow: new CountingUnitOfWork(), idempotencyStore: new InMemoryIdempotencyStore() });
+    const handle = vi.fn(async () => ({ secret: "alice's result" }));
+    bus.register({ commandType: "Deposit", handle } as any);
+    const as = (principalId: string | undefined, key: string) =>
+      makeCommand({ metadataOverrides: { idempotencyKey: key, principalId } } as any);
+
+    await bus.send(as("alice", "k-p"));
+    // Alice's retry is answered from the stored result.
+    expect(await bus.send(as("alice", "k-p"))).toEqual({ secret: "alice's result" });
+
+    for (const other of ["bob", undefined]) {
+      const err = await bus.send(as(other, "k-p")).catch((e) => e);
+      expect(err).toBeInstanceOf(IdempotencyKeyConflictError);
+      expect(err).toMatchObject({ reason: "principal" });
+    }
+    expect(handle).toHaveBeenCalledTimes(1);
+
+    // A key first used without a principal has nobody to compare with.
+    await bus.send(as(undefined, "k-anon"));
+    expect(await bus.send(as("bob", "k-anon"))).toEqual({ secret: "alice's result" });
   });
 
   it("treats the same payload with keys in a different order as a retry", async () => {
@@ -371,6 +395,7 @@ describe("CommandBus — tenant auto-narrowing", () => {
     const bus = new CommandBus<TenantTx>({
       uow,
       idempotencyStore: new InMemoryIdempotencyStore(),
+      trustTenantMetadata: true,
     });
     let seenTenant: string | undefined;
     bus.register({
@@ -391,6 +416,7 @@ describe("CommandBus — tenant auto-narrowing", () => {
     const bus = new CommandBus<TenantTx>({
       uow,
       idempotencyStore: new InMemoryIdempotencyStore(),
+      trustTenantMetadata: true,
     });
     let seenTenant: string | undefined;
     bus.register({
@@ -407,11 +433,49 @@ describe("CommandBus — tenant auto-narrowing", () => {
     expect(uow.opens).toHaveLength(0);
   });
 
+  it("rejects a command that switches tenant when nobody vouches for the tenant", async () => {
+    const uow = new TenantAwareUow("default");
+    const bus = new CommandBus<TenantTx>({ uow, idempotencyStore: new InMemoryIdempotencyStore() });
+    const handle = vi.fn(async () => ({ ok: true }));
+    bus.register({ commandType: "Deposit", handle } as any);
+
+    const err = await bus.send(makeCommand({ metadataOverrides: { tenantId: "acme" } } as any)).catch((e) => e);
+    expect(err).toBeInstanceOf(UnvalidatedTenantError);
+    expect(err.tenantId).toBe("acme");
+    expect(handle).not.toHaveBeenCalled();
+    expect(uow.opens).toHaveLength(0);
+
+    // No tenant, or the unit of work's own tenant: nothing is switched.
+    await bus.send(makeCommand({ metadataOverrides: { idempotencyKey: "k-none" } } as any));
+    await bus.send(makeCommand({ metadataOverrides: { tenantId: "default", idempotencyKey: "k-own" } } as any));
+    expect(handle).toHaveBeenCalledTimes(2);
+  });
+
+  it("a tenantValidator is enough to allow a tenant switch, and can refuse it", async () => {
+    const uow = new TenantAwareUow("default");
+    const bus = new CommandBus<TenantTx>({
+      uow,
+      idempotencyStore: new InMemoryIdempotencyStore(),
+      tenantValidator: (cmd) => {
+        if (cmd.metadata.tenantId !== "acme") throw new Error("not your tenant");
+      },
+    });
+    let seen: string | undefined;
+    bus.register({ commandType: "Deposit", handle: async (_c: unknown, ctx: any) => { seen = ctx.tx.tenantId; return {}; } } as any);
+
+    await bus.send(makeCommand({ metadataOverrides: { tenantId: "acme" } } as any));
+    expect(seen).toBe("acme");
+    await expect(
+      bus.send(makeCommand({ metadataOverrides: { tenantId: "contoso", idempotencyKey: "k-x" } } as any))
+    ).rejects.toThrow("not your tenant");
+  });
+
   it("each send narrows to its own command tenantId (one bus, many tenants)", async () => {
     const uow = new TenantAwareUow("default");
     const bus = new CommandBus<TenantTx>({
       uow,
       idempotencyStore: new InMemoryIdempotencyStore(),
+      trustTenantMetadata: true,
     });
     const seen: string[] = [];
     bus.register({
@@ -602,4 +666,47 @@ describe("CommandBus.in-flight wait (outside tx)", () => {
     release("go");
     await first;
   });
+it("in-memory store: a commit that fails doesn't leave a completed slot behind", async () => {
+    // The handler and complete() succeed, then the commit itself fails.
+    let failCommit = true;
+    const uow: UnitOfWork<TxToken> = {
+      async withTransaction<T>(fn: (tx: TxToken) => Promise<T>): Promise<T> {
+        const r = await fn({ id: Math.random() });
+        if (failCommit) {
+          failCommit = false;
+          throw new Error("commit failed");
+        }
+        return r;
+      },
+    };
+    const bus = new CommandBus<TxToken>({ uow, idempotencyStore: new InMemoryIdempotencyStore() });
+    const handle = vi.fn(async () => ({ newBalance: 100 }));
+    bus.register({ commandType: "Deposit", handle } as CommandHandler<DepositCommand, { newBalance: number }, TxToken>);
+
+    await expect(bus.send(makeCommand())).rejects.toThrow("commit failed");
+    // The retry must run the handler again, not return the uncommitted result.
+    await expect(bus.send(makeCommand())).resolves.toEqual({ newBalance: 100 });
+    expect(handle).toHaveBeenCalledTimes(2);
+  });
+
+  it("in-memory store: a slot claimed in a rolled-back transaction is freed", async () => {
+    // An outer middleware fails after the idempotency middleware returned.
+    const bus = new CommandBus<TxToken>({ uow: new CountingUnitOfWork(), idempotencyStore: new InMemoryIdempotencyStore() });
+    const handle = vi.fn(async () => ({ newBalance: 100 }));
+    bus.register({ commandType: "Deposit", handle } as CommandHandler<DepositCommand, { newBalance: number }, TxToken>);
+    let failAfter = true;
+    bus.use(async (_cmd, _ctx, next) => {
+      const r = await next();
+      if (failAfter) {
+        failAfter = false;
+        throw new Error("audit write failed");
+      }
+      return r;
+    });
+
+    await expect(bus.send(makeCommand())).rejects.toThrow("audit write failed");
+    await expect(bus.send(makeCommand())).resolves.toEqual({ newBalance: 100 });
+    expect(handle).toHaveBeenCalledTimes(2);
+  });
 });
+

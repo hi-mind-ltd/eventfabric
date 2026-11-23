@@ -443,9 +443,26 @@ describe("multi-tenancy: EventEnvelope tenantId", () => {
     );
     expect(wrongTenantEvents).toHaveLength(0);
 
-    // loadGlobal is cross-tenant — should find the event with tenantId on the envelope
-    const allEvents = await uow.withTransaction(tx =>
+    // loadGlobal without a tenant uses the transaction's tenant, like loadStream
+    const defaultScoped = await uow.withTransaction(tx =>
       store.loadGlobal(tx, { fromGlobalPositionExclusive: 0n, limit: 100 })
+    );
+    expect(defaultScoped.find(e => e.aggregateId === "acc-env")).toBeUndefined();
+    expect(defaultScoped.every(e => e.tenantId === "default")).toBe(true);
+
+    const ownTenant = await uow.forTenant("tenant-xyz").withTransaction(tx =>
+      store.loadGlobal(tx, { fromGlobalPositionExclusive: 0n, limit: 100 })
+    );
+    expect(ownTenant.length).toBeGreaterThan(0);
+    expect(ownTenant.every(e => e.tenantId === "tenant-xyz")).toBe(true);
+
+    await expect(uow.withTransaction(tx =>
+      store.loadGlobal(tx, { fromGlobalPositionExclusive: 0n, limit: 100, tenantId: "tenant-xyz", allTenants: true })
+    )).rejects.toThrow(/either tenantId or allTenants/);
+
+    // Cross-tenant reads are explicit — the envelope carries the tenant
+    const allEvents = await uow.withTransaction(tx =>
+      store.loadGlobal(tx, { fromGlobalPositionExclusive: 0n, limit: 100, allTenants: true })
     );
 
     const env = allEvents.find(e => e.aggregateId === "acc-env");

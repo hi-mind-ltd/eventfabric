@@ -341,7 +341,7 @@ export function createCatchUpObserver(opts: CatchUpOtelOptions): CatchUpProjecto
 |-------------|------|------------|-------------|
 | `eventfabric.async_runner.batch_claimed` | Counter | `eventfabric.runner`, `eventfabric.worker_id`, `eventfabric.topic` | Total batches claimed |
 | `eventfabric.async_runner.events_claimed` | Counter | `eventfabric.runner`, `eventfabric.worker_id`, `eventfabric.topic` | Total events across claimed batches |
-| `eventfabric.async_runner.events_handled` | Counter | `eventfabric.runner`, `eventfabric.worker_id`, `eventfabric.projection`, `eventfabric.event_type`, `eventfabric.global_position`, `eventfabric.attempts` | Events successfully handled |
+| `eventfabric.async_runner.events_handled` | Counter | `eventfabric.runner`, `eventfabric.worker_id`, `eventfabric.projection`, `eventfabric.event_type`, `eventfabric.attempts` | Events successfully handled |
 | `eventfabric.async_runner.events_failed` | Counter | (same as handled) + `eventfabric.error_name` | Handler failures |
 | `eventfabric.async_runner.messages_acked` | Counter | `eventfabric.runner`, `eventfabric.worker_id` | Messages acknowledged (deleted from outbox) |
 | `eventfabric.async_runner.messages_released` | Counter | `eventfabric.runner`, `eventfabric.worker_id`, `eventfabric.error_name` | Messages released for retry |
@@ -353,13 +353,15 @@ export function createCatchUpObserver(opts: CatchUpOtelOptions): CatchUpProjecto
 
 | Metric name | Type | Attributes | Description |
 |-------------|------|------------|-------------|
-| `eventfabric.catch_up.batches_loaded` | Counter | `eventfabric.runner`, `eventfabric.projection`, `eventfabric.from_position` | Total batches loaded from event store |
+| `eventfabric.catch_up.batches_loaded` | Counter | `eventfabric.runner`, `eventfabric.projection` | Total batches loaded from event store |
 | `eventfabric.catch_up.events_loaded` | Counter | (same as batches_loaded) | Total events across loaded batches |
-| `eventfabric.catch_up.events_handled` | Counter | `eventfabric.runner`, `eventfabric.projection`, `eventfabric.event_type`, `eventfabric.global_position` | Events successfully handled |
+| `eventfabric.catch_up.events_handled` | Counter | `eventfabric.runner`, `eventfabric.projection`, `eventfabric.event_type` | Events successfully handled |
 | `eventfabric.catch_up.events_failed` | Counter | (same as handled) + `eventfabric.error_name` | Handler failures |
-| `eventfabric.catch_up.checkpoints_advanced` | Counter | `eventfabric.runner`, `eventfabric.projection`, `eventfabric.from_position`, `eventfabric.to_position` | Checkpoint advances |
+| `eventfabric.catch_up.checkpoints_advanced` | Counter | `eventfabric.runner`, `eventfabric.projection` | Checkpoint advances |
 | `eventfabric.catch_up.projector_errors` | Counter | `eventfabric.runner`, `eventfabric.projection`, `eventfabric.error_name` | Projector-level errors |
 | `eventfabric.catch_up.handler_duration_ms` | Histogram (ms) | (same as handled) | Wall-clock duration per handler invocation |
+
+Metric attributes are kept low-cardinality, because every distinct attribute combination is a separate time series. Per-event values such as `eventfabric.global_position` are on spans only.
 
 ### Span attributes
 

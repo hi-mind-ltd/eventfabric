@@ -91,12 +91,16 @@ export interface EventStore<E extends AnyEvent, TTx extends Transaction = Transa
       limit: number;
       includeDismissed?: boolean;
       /**
-       * Optional tenant filter. When set, only events with this tenant_id are
-       * returned. When omitted, events are returned across all tenants — used
-       * by cross-tenant tooling (ops dashboards, migrations). The catch-up
-       * projector always sets this so each projection round is single-tenant.
+       * Tenant whose events are returned. When omitted, the transaction's
+       * tenant is used, so a read is never cross-tenant by accident. The
+       * catch-up projector always sets this so each round is single-tenant.
        */
       tenantId?: string;
+      /**
+       * Return every tenant's events (ops dashboards, migrations). Must be
+       * asked for explicitly, and can't be combined with `tenantId`.
+       */
+      allTenants?: boolean;
       /**
        * Optional inclusive upper bound. The catch-up projector passes the
        * high water mark here so it never reads past a position that an

@@ -295,4 +295,62 @@ describe("SagaCommandDispatcher", () => {
     await dispatcher.runOnce();
     expect(seenTenantId).toBe("acme");
   });
+it("keeps running after a round throws: reports onLoopError, backs off, then dispatches", async () => {
+    const queue = new InMemorySagaCommandQueue();
+    const handle = vi.fn(async (c: DoThing) => ({ note: c.payload.note }));
+    const bus = buildBus(handle);
+    await queue.enqueue({} as Transaction, { tenantId: "default", sagaName: "S", instanceId: "i-1", command: cmd("a") });
+
+    // The database is down for the first two rounds.
+    let failures = 2;
+    const flaky: UnitOfWork<Transaction> = {
+      async withTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T> {
+        if (failures > 0) {
+          failures--;
+          throw new Error("connection refused");
+        }
+        return fn({});
+      },
+    };
+    const errors: Array<{ component: string; consecutiveErrors: number; message: string }> = [];
+    const dispatcher = new SagaCommandDispatcher(flaky, queue, bus, {
+      idleSleepMs: 5,
+      errorBackoff: { minMs: 1, maxMs: 1, factor: 1, jitter: 0 },
+      observer: {
+        onLoopError: (i) => errors.push({ component: i.component, consecutiveErrors: i.consecutiveErrors, message: i.error.message }),
+      },
+    });
+
+    const started = dispatcher.start();
+    await vi.waitFor(() => expect(handle).toHaveBeenCalledTimes(1), { timeout: 2000 });
+    await dispatcher.stop();
+    await started;
+
+    expect(errors).toEqual([
+      { component: "command-dispatcher", consecutiveErrors: 1, message: "connection refused" },
+      { component: "command-dispatcher", consecutiveErrors: 2, message: "connection refused" },
+    ]);
+  });
+
+  it("stop() interrupts an error backoff instead of waiting it out", async () => {
+    const queue = new InMemorySagaCommandQueue();
+    const down: UnitOfWork<Transaction> = {
+      async withTransaction<T>(): Promise<T> {
+        throw new Error("connection refused");
+      },
+    };
+    let errors = 0;
+    const dispatcher = new SagaCommandDispatcher(down, queue, buildBus(async () => null), {
+      errorBackoff: { minMs: 60_000, maxMs: 60_000, factor: 1, jitter: 0 },
+      observer: { onLoopError: () => errors++ },
+    });
+
+    const started = dispatcher.start();
+    await vi.waitFor(() => expect(errors).toBe(1));
+    const t0 = Date.now();
+    await dispatcher.stop();
+    await started;
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
 });
+

@@ -250,6 +250,15 @@ const result = await query<User>(pool)
 
 SQL injection is **structurally impossible** because the template literal syntax guarantees that user-provided values never touch the SQL string.
 
+The fluent builder is protected the same way, including the parts TypeScript only checks at compile time (a `?sort=` query parameter cast to `keyof T` is still a runtime string):
+
+- **Values, `limit` and `offset`** are sent as `$N` parameters. `limit` and `offset` must be non-negative integers.
+- **JSONB keys** (in JSONB mode) are sent as parameters too (`state->>$1`), so any key string is safe.
+- **Column names** (flat mode) must be plain identifiers (`^[A-Za-z_][A-Za-z0-9_]*$`); anything else throws.
+- **Operators** must be one of `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `ILIKE`, `IN`, `NOT IN`, `IS`, `IS NOT`, and the **sort direction** `asc` or `desc`; anything else throws.
+
+The `table` and `jsonb` options are application configuration and are not validated: never build them from request input.
+
 ## JSONB mode
 
 For snapshot queries, enable JSONB mode by passing `{ jsonb: "state" }`:
@@ -269,6 +278,22 @@ const results = await query<AccountState>(pool, "eventfabric.snapshots", { jsonb
   .limit(10)
   .toList();
 ```
+
+`eventfabric.snapshots` holds every tenant's snapshots. The builder adds no
+tenant filter unless you ask for one, so in a multi-tenant application always
+pass `tenantId`:
+
+```typescript
+const results = await query<AccountState>(pool, "eventfabric.snapshots", { jsonb: "state", tenantId })
+  .where("balance", ">=", 1000)
+  .toList();
+```
+
+`tenantId` adds `tenant_id = $n` in front of your conditions, which are
+grouped so an `orWhere` can't widen it. It works in flat mode too (use
+`tenantColumn` if your column has another name), throws if the value is
+missing or empty, and can't be combined with raw `.sql`, where you write the
+tenant condition yourself.
 
 In JSONB mode:
 

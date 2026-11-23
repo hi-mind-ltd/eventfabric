@@ -8,6 +8,8 @@ import { PgSnapshotStore } from "../src/snapshots/pg-snapshot-store";
 import { PgProjectionCheckpointStore } from "../src/projections/pg-projection-checkpoint-store";
 import { PgPartitionManager } from "../src/partitioning/pg-partition-manager";
 import { endPool } from "./helpers/end-pool";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 type E = { type: "Tick"; version: 1; n: number };
 
@@ -39,6 +41,7 @@ describe("migrate() — fresh database", () => {
       "009_per_tenant_projection_checkpoints",
       "015_event_hash_chain",
       "016_projection_dead_letters",
+      "019_outbox_dead_letter_reason",
     ]);
     expect(result.partitioned).toBe(false);
   });
@@ -154,6 +157,7 @@ describe("migrate() — partitioning from scratch", () => {
       "009_per_tenant_projection_checkpoints",
       "015_event_hash_chain",
       "016_projection_dead_letters",
+      "019_outbox_dead_letter_reason",
       "007_partitioning",
     ]);
     expect(result.partitioned).toBe(true);
@@ -441,5 +445,89 @@ describe("migrate() — data integrity across all tables", () => {
 
     // New global_position must be higher than all seeded events
     expect(appended[0]!.globalPosition).toBeGreaterThan(BigInt(TOTAL_EVENTS));
+  });
+});
+
+describe("migrate() — concurrent callers", () => {
+  let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
+  let pools: Pool[];
+
+  beforeAll(async () => {
+    container = await new PostgreSqlContainer("postgres:16-alpine").start();
+    // Separate pools stand in for separate app instances starting together.
+    pools = [0, 1, 2, 3].map(() => new Pool({ connectionString: container.getConnectionUri() }));
+  }, 120000);
+
+  afterAll(async () => {
+    for (const p of pools ?? []) await endPool(p);
+    if (container) await container.stop();
+  });
+
+  it("serializes instances: each migration and the partitioning run exactly once", async () => {
+    const results = await Promise.all(
+      pools.map((p) => migrate(p, { partitioning: { enabled: true, partitionSize: 1000n } }))
+    );
+
+    const all = results.flatMap((r) => r.applied);
+    expect(all).toHaveLength(new Set(all).size);
+    expect(new Set(all)).toEqual(
+      new Set([
+        "001_init",
+        "002_projection_checkpoints",
+        "003_outbox_and_dlq",
+        "004_snapshots",
+        "005_stream_versions",
+        "006_performance",
+        "008_tenant_id",
+        "009_per_tenant_projection_checkpoints",
+        "015_event_hash_chain",
+        "016_projection_dead_letters",
+        "019_outbox_dead_letter_reason",
+        "007_partitioning",
+      ])
+    );
+    expect(results.every((r) => r.partitioned)).toBe(true);
+
+    const parts = await new PgPartitionManager().listPartitions(pools[0]!);
+    expect(parts.map((p) => p.name).sort()).toEqual(["events_p0", "events_p1"]);
+  });
+
+  it("works on a pool with a single connection", async () => {
+    const one = new Pool({ connectionString: container.getConnectionUri(), max: 1 });
+    try {
+      const r = await migrate(one);
+      expect(r.applied).toEqual([]);
+    } finally {
+      await endPool(one);
+    }
+  });
+});
+
+describe("PgPartitionManager.enablePartitioning — concurrent callers", () => {
+  let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
+  let pools: Pool[];
+
+  beforeAll(async () => {
+    container = await new PostgreSqlContainer("postgres:16-alpine").start();
+    pools = [0, 1, 2].map(() => new Pool({ connectionString: container.getConnectionUri() }));
+    await migrate(pools[0]!, { partitioning: undefined });
+    await pools[0]!.query(
+      `INSERT INTO eventfabric.schema_migrations (name) VALUES ('007_partitioning') ON CONFLICT DO NOTHING`
+    );
+    await pools[0]!.query(readFileSync(join(__dirname, "..", "migrations", "007_partitioning.sql"), "utf-8"));
+  }, 120000);
+
+  afterAll(async () => {
+    for (const p of pools ?? []) await endPool(p);
+    if (container) await container.stop();
+  });
+
+  it("partitions once; later callers see the partitioned table and back off", async () => {
+    const manager = new PgPartitionManager();
+    await Promise.all(pools.map((p) => manager.enablePartitioning(p, { partitionSize: 1000n })));
+
+    expect(await manager.isPartitioned(pools[0]!)).toBe(true);
+    const parts = await manager.listPartitions(pools[0]!);
+    expect(parts.map((p) => p.name).sort()).toEqual(["events_p0", "events_p1"]);
   });
 });

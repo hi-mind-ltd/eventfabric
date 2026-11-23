@@ -247,3 +247,52 @@ describe("PgPartitionManager with pre-existing data", () => {
     expect(postEvents[0]!.globalPosition).toBeGreaterThan(15n);
   });
 });
+
+describe("PgPartitionManager when the sequence is ahead of MAX(global_position)", () => {
+  let pool3: Pool;
+  let container3: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
+
+  beforeAll(async () => {
+    container3 = await new PostgreSqlContainer("postgres:16-alpine").start();
+    pool3 = new Pool({ connectionString: container3.getConnectionUri() });
+    await migrate(pool3);
+  }, 120000);
+
+  afterAll(async () => {
+    if (pool3) await endPool(pool3);
+    if (container3) await container3.stop();
+  });
+
+  it("places the boundary past the sequence, so the next append has a partition", async () => {
+    const store = new PgEventStore<E>();
+    const uow3 = new PgUnitOfWork(pool3);
+    await uow3.withTransaction((tx) =>
+      store.append(tx, {
+        aggregateName: "Seq",
+        aggregateId: "s-1",
+        expectedAggregateVersion: 0,
+        events: [{ type: "Tick", version: 1, n: 1 }]
+      })
+    );
+    // Rolled-back appends consumed positions up to 500 without leaving rows.
+    await pool3.query(
+      `SELECT setval(pg_get_serial_sequence('eventfabric.events', 'global_position'), 500)`
+    );
+
+    const manager = new PgPartitionManager();
+    await manager.enablePartitioning(pool3, { partitionSize: 100n });
+
+    const parts = await manager.listPartitions(pool3);
+    expect(parts.find((p) => p.name === "events_p1")).toMatchObject({ from: 600n, to: 700n });
+
+    const res = await uow3.withTransaction((tx) =>
+      store.append(tx, {
+        aggregateName: "Seq",
+        aggregateId: "s-2",
+        expectedAggregateVersion: 0,
+        events: [{ type: "Tick", version: 1, n: 2 }]
+      })
+    );
+    expect(res.appended[0]!.globalPosition).toBe(501n);
+  });
+});

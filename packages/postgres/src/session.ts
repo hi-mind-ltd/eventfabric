@@ -1,6 +1,7 @@
 import type { AnyEvent, EventEnvelope } from "@eventfabric/core";
 import type { AggregateRoot } from "@eventfabric/core";
 import type { InlineProjector } from "@eventfabric/core";
+import { shouldSnapshot as shouldSnapshotAt } from "@eventfabric/core";
 import type { PgTx } from "./unitofwork/pg-transaction";
 import { PgEventStore } from "./pg-event-store";
 import { PgUnitOfWork } from "./unitofwork/pg-unit-of-work";
@@ -601,6 +602,7 @@ export class Session<E extends AnyEvent> {
 
     const meta = opts?.meta;
     const uow = new PgUnitOfWork(this.pool, this.tenantId);
+    const trackedVersions = new Map<string, number>();
     await uow.withTransaction(async (tx: PgTx) => {
       const allAppendedEvents: EventEnvelope<E>[] = [];
       const aggregateVersions: Map<string, number> = new Map();
@@ -654,10 +656,10 @@ export class Session<E extends AnyEvent> {
           arr.push(...result.appended);
           aggregateEvents.set(op.aggregateId, arr);
           
-          // Update tracked aggregate version after successful append
-          const trackedAggregate = this.loadedAggregates.get(op.aggregateId);
-          if (trackedAggregate) {
-            trackedAggregate.version = result.nextAggregateVersion;
+          // Tracked aggregates get their new version only after the commit
+          // (below): a rollback must leave them at the version they had.
+          if (this.loadedAggregates.has(op.aggregateId)) {
+            trackedVersions.set(op.aggregateId, result.nextAggregateVersion);
           }
         }
       }
@@ -679,7 +681,12 @@ export class Session<E extends AnyEvent> {
         const snapshotSchemaVersion = this.config.snapshotSchemaVersionRegistry.get(aggregateName) ?? 1;
 
         if (snapshotStore && snapshotPolicy && snapshotPolicy.everyNEvents > 0) {
-          const shouldSnapshot = newVersion % snapshotPolicy.everyNEvents === 0;
+          // The version before this save: one below the lowest version written.
+          const written = aggregateEvents.get(aggregateId) ?? [];
+          const fromVersion = written.length
+            ? Math.min(...written.map((e) => Number(e.aggregateVersion))) - 1
+            : newVersion;
+          const shouldSnapshot = shouldSnapshotAt(snapshotPolicy, fromVersion, newVersion);
           
           if (shouldSnapshot) {
             // The snapshot must hold the state AT newVersion. A tracked
@@ -731,7 +738,11 @@ export class Session<E extends AnyEvent> {
       }
     });
 
-    // Clear pending operations after successful commit
+    // Committed: advance tracked aggregates and clear pending operations.
+    for (const [aggregateId, version] of trackedVersions) {
+      const tracked = this.loadedAggregates.get(aggregateId);
+      if (tracked) tracked.version = version;
+    }
     this.pendingOperations = [];
   }
 }

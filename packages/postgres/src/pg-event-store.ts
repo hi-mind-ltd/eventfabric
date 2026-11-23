@@ -5,6 +5,7 @@ import type {
   EventUpcaster,
   ChainVerificationResult,
   TamperEvidentEventStore,
+  VerifyStreamOptions,
 } from "@eventfabric/core";
 import { computeEventHash, streamGenesis, hashesEqual, toSecret } from "@eventfabric/core";
 import type { PgTx } from "./unitofwork/pg-transaction";
@@ -81,14 +82,14 @@ export type LoadGlobalParams = {
   limit: number;
   includeDismissed?: boolean;
   /**
-   * Optional tenant filter. When set, only events from this tenant are
-   * returned. When omitted, events are returned across all tenants — caller
-   * must handle the cross-tenant case responsibly (e.g. for ops tooling).
+   * Tenant whose events are returned. Defaults to the transaction's tenant.
    * The catch-up projector always sets this.
    */
   tenantId?: string;
   /** Optional inclusive upper bound (the catch-up projector passes the high water mark). */
   toGlobalPositionInclusive?: bigint;
+  /** Return every tenant's events. Explicit, and not combinable with `tenantId`. */
+  allTenants?: boolean;
 };
 
 export type PgEventStoreOptions<E extends AnyEvent> = {
@@ -124,6 +125,16 @@ export type PgEventStoreOptions<E extends AnyEvent> = {
     enabledAggregates?: Iterable<string>;
   };
 };
+
+/**
+ * The timestamp string a v2 hash covers, from the stored value rendered with
+ * microseconds. Writes use millisecond precision, so a stored value with
+ * whole milliseconds maps back to its `Date.toISOString()` form; anything
+ * else was changed after the write and is returned as is, so it can't match.
+ */
+function hashedTimestamp(microsUtc: string): string {
+  return microsUtc.endsWith("000Z") ? `${microsUtc.slice(0, -4)}Z` : microsUtc;
+}
 
 export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore<E, PgTx> {
   private readonly eventsTable: string;
@@ -189,6 +200,7 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
     base: number,
     eventIds: string[],
     events: E[],
+    occurredAt: string,
     meta?: { correlationId?: string; causationId?: string }
   ): { hashes: Buffer[]; head: Buffer } {
     const secret = this.hashSecret!;
@@ -211,6 +223,8 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
         payload: JSON.parse(JSON.stringify(evt)),
         correlationId: meta?.correlationId ?? null,
         causationId: meta?.causationId ?? null,
+        // Format v2: the timestamp is part of the hash.
+        occurredAt,
       });
       hashes.push(h);
       p = h;
@@ -269,15 +283,21 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
     // know the stream's previous head (genesis for a new stream, head_hash for
     // an existing one).
     let eventHashes: (Buffer | null)[] = params.events.map(() => null);
+    // A chained event's timestamp is covered by its hash, so it is chosen here
+    // (millisecond precision, the form verification compares) instead of by
+    // the database's now(). Unchained events keep now().
+    const occurredAt = new Date().toISOString();
+    let chainedWrite = false;
 
     if (expectedAggregateVersion === 0) {
       // New stream — INSERT into stream_versions. PK violation = stream already exists.
       let head: Buffer | null = null;
       if (chained) {
         const genesis = streamGenesis(this.hashSecret!, tenantId, aggregateName, aggregateId);
-        const r = this.chainBatch(genesis, tenantId, aggregateName, aggregateId, base, eventIds, params.events, params.meta);
+        const r = this.chainBatch(genesis, tenantId, aggregateName, aggregateId, base, eventIds, params.events, occurredAt, params.meta);
         eventHashes = r.hashes;
         head = r.head;
+        chainedWrite = true;
       }
       try {
         if (this.hashFeatureOn) {
@@ -360,8 +380,9 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
         // start the chain from genesis so events from here forward are protected.
         const prev: Buffer =
           (row.head_hash as Buffer | null) ?? streamGenesis(this.hashSecret!, tenantId, aggregateName, aggregateId);
-        const r = this.chainBatch(prev, tenantId, aggregateName, aggregateId, base, eventIds, params.events, params.meta);
+        const r = this.chainBatch(prev, tenantId, aggregateName, aggregateId, base, eventIds, params.events, occurredAt, params.meta);
         eventHashes = r.hashes;
+        chainedWrite = true;
         await tx.client.query(
           `UPDATE ${this.streamVersionsTable}
            SET current_version = $4, head_hash = $5, updated_at = now()
@@ -373,7 +394,7 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
 
     // Build and insert events
     const values: any[] = [];
-    const perRow = this.hashFeatureOn ? 11 : 10;
+    const perRow = this.hashFeatureOn ? 12 : 10;
     const rowsSql = params.events.map((evt, i) => {
       const idx = i * perRow;
       values.push(
@@ -389,8 +410,8 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
         params.meta?.causationId ?? null
       );
       if (this.hashFeatureOn) {
-        values.push(eventHashes[i]);
-        return `($${idx+1}::uuid,$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7},$${idx+8}::jsonb,now(),$${idx+9},$${idx+10},$${idx+11})`;
+        values.push(eventHashes[i], chainedWrite ? occurredAt : null);
+        return `($${idx+1}::uuid,$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7},$${idx+8}::jsonb,COALESCE($${idx+12}::timestamptz, now()),$${idx+9},$${idx+10},$${idx+11})`;
       }
       return `($${idx+1}::uuid,$${idx+2},$${idx+3},$${idx+4},$${idx+5},$${idx+6},$${idx+7},$${idx+8}::jsonb,now(),$${idx+9},$${idx+10})`;
     }).join(",");
@@ -523,6 +544,12 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
   }
 
   async loadGlobal(tx: PgTx, p: LoadGlobalParams): Promise<EventEnvelope<E>[]> {
+    if (p.allTenants && p.tenantId !== undefined) {
+      throw new Error("loadGlobal: pass either tenantId or allTenants, not both");
+    }
+    // Without an explicit tenant the transaction's tenant applies, so a read
+    // is cross-tenant only when the caller asks for it.
+    const tenantFilter = p.allTenants ? null : p.tenantId ?? tx.tenantId;
     // Tenant filter lives in the SQL (not post-filtered in JS) so the
     // catch-up projector can read a batch of one tenant's events without
     // pulling other tenants' rows over the wire. Index
@@ -539,7 +566,7 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
       [
         p.fromGlobalPositionExclusive.toString(),
         p.toGlobalPositionInclusive?.toString() ?? null,
-        p.tenantId ?? null,
+        tenantFilter,
         p.limit
       ]
     );
@@ -576,29 +603,59 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
 
   async loadByGlobalPositions(tx: PgTx, positions: bigint[]): Promise<EventEnvelope<E>[]> {
     if (positions.length === 0) return [];
-    const params = positions.map(p => p.toString());
-    const placeholders = params.map((_, i) => `$${i+1}`).join(",");
+    // One array parameter: a placeholder per position would hit Postgres's
+    // 65,535-parameter limit on large batches.
     const res = await tx.client.query(
       `SELECT global_position, event_id, tenant_id, aggregate_name, aggregate_id, aggregate_version, type, version, payload, occurred_at,
               dismissed_at, dismissed_reason, dismissed_by, correlation_id, causation_id
        FROM ${this.eventsTable}
-       WHERE global_position IN (${placeholders})
+       WHERE global_position = ANY($1::bigint[])
        ORDER BY global_position ASC`,
-      params
+      [positions.map((p) => p.toString())]
     );
     return res.rows.map((r) => this.mapRow(r));
   }
 
   async dismiss(tx: PgTx, eventId: string, info?: { reason?: string; by?: string; at?: string }): Promise<void> {
     const at = info?.at ?? new Date().toISOString();
-    await tx.client.query(
+    const args = [tx.tenantId, eventId, at, info?.reason ?? null, info?.by ?? null];
+    if (!this.hashFeatureOn) {
+      // No reference to event_hash: a store without the feature may not have
+      // migration 015. (verifyStream still reports a dismissal made this way.)
+      await tx.client.query(
+        `UPDATE ${this.eventsTable}
+         SET dismissed_at = $3::timestamptz,
+             dismissed_reason = $4,
+             dismissed_by = $5
+         WHERE tenant_id = $1 AND event_id = $2::uuid`,
+        args
+      );
+      return;
+    }
+    // A hash-chained event can't be dismissed: dismissal hides it from replay,
+    // and the dismissed_* columns are outside the hash, so a hidden event
+    // would be indistinguishable from one hidden by someone editing the table.
+    const res = await tx.client.query(
       `UPDATE ${this.eventsTable}
        SET dismissed_at = $3::timestamptz,
            dismissed_reason = $4,
            dismissed_by = $5
-       WHERE tenant_id = $1 AND event_id = $2::uuid`,
-      [tx.tenantId, eventId, at, info?.reason ?? null, info?.by ?? null]
+       WHERE tenant_id = $1 AND event_id = $2::uuid AND event_hash IS NULL`,
+      args
     );
+    if (res.rowCount === 0) {
+      const chained = await tx.client.query(
+        `SELECT 1 FROM ${this.eventsTable}
+         WHERE tenant_id = $1 AND event_id = $2::uuid AND event_hash IS NOT NULL`,
+        [tx.tenantId, eventId]
+      );
+      if (chained.rowCount) {
+        throw new Error(
+          `Event ${eventId} is in a tamper-evident stream and can't be dismissed. ` +
+          `Append a correcting event instead.`
+        );
+      }
+    }
   }
 
   /**
@@ -608,13 +665,16 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
    * the chain). Detects payload/metadata mutation, event removal (version gap
    * or NULL hash inside the chain), and tail removal (head mismatch).
    *
-   * Streams that began chaining mid-life (tamper-evidence enabled after some
-   * events already existed) are verified from their first protected event
-   * onward; earlier NULL-hash events are out of scope.
+   * A stream verifies only when every event is covered. Events without a hash
+   * fail it (`unprotectedEvents` says how many): a stream whose hashes were
+   * all set to NULL is otherwise indistinguishable from one that was never
+   * chained, and its next append would start a fresh, valid-looking chain.
+   * For a stream that existed before tamper-evidence was enabled, pass
+   * `allowUnprotectedPrefix: true` to verify from the first protected event.
    */
   async verifyStream(
     tx: PgTx,
-    params: { aggregateName: string; aggregateId: string }
+    params: { aggregateName: string; aggregateId: string } & VerifyStreamOptions
   ): Promise<ChainVerificationResult> {
     if (this.hashSecret === undefined) {
       throw new Error("verifyStream requires the store to be constructed with hashChain.secret");
@@ -627,7 +687,9 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
     };
 
     const res = await tx.client.query(
-      `SELECT aggregate_version, event_id, type, version, payload, correlation_id, causation_id, event_hash
+      `SELECT aggregate_version, event_id, type, version, payload, correlation_id, causation_id, event_hash,
+              dismissed_at,
+              to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS occurred_at_us
        FROM ${this.eventsTable}
        WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3
        ORDER BY aggregate_version ASC`,
@@ -636,24 +698,45 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
     const rows = res.rows;
 
     const headRes = await tx.client.query(
-      `SELECT head_hash FROM ${this.streamVersionsTable}
+      `SELECT current_version, head_hash FROM ${this.streamVersionsTable}
        WHERE tenant_id = $1 AND aggregate_name = $2 AND aggregate_id = $3`,
       [tenantId, aggregateName, aggregateId]
     );
     const storedHead: Buffer | null = headRes.rows[0]?.head_hash ?? null;
+    const storedVersion = headRes.rows[0] ? Number(headRes.rows[0].current_version) : 0;
 
     const chainStart = rows.findIndex((r: any) => r.event_hash !== null);
+    // Events with no hash: all of them when nothing is chained, else the prefix.
+    const unprotected = chainStart === -1 ? rows.length : chainStart;
+    const unprotectedFailure = (): ChainVerificationResult => ({
+      ...base, ok: false, unprotectedEvents: unprotected,
+      firstBrokenAt: Number(rows[0].aggregate_version),
+      reason: chainStart === -1
+        ? `none of the stream's ${unprotected} event(s) has an event_hash (hashes removed, or the stream was never chained)`
+        : `${unprotected} event(s) before version ${Number(rows[chainStart].aggregate_version)} have no event_hash ` +
+          `(hashes removed and the chain restarted, or tamper-evidence was enabled mid-stream)`,
+    });
+
     if (chainStart === -1) {
       // No protected events. Consistent only if there is no stored head either.
       if (storedHead) {
         return { ...base, ok: false, firstBrokenAt: rows.length ? Number(rows[rows.length - 1].aggregate_version) : 0,
           reason: "stream_versions.head_hash is set but the stream has no protected events" };
       }
-      return base;
+      if (rows.length === 0) {
+        if (storedVersion > 0) {
+          return { ...base, ok: false, firstBrokenAt: 1,
+            reason: `stream_versions is at version ${storedVersion} but the stream has no events (events removed)` };
+        }
+        return base;
+      }
+      if (!params.allowUnprotectedPrefix) return unprotectedFailure();
+      return { ...base, unprotectedEvents: unprotected };
     }
 
     let prev = streamGenesis(secret, tenantId, aggregateName, aggregateId);
     let checked = 0;
+    let legacy = 0;
     let expectedVersion = Number(rows[chainStart].aggregate_version);
     for (let i = chainStart; i < rows.length; i++) {
       const r: any = rows[i];
@@ -666,7 +749,7 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
         return { ...base, ok: false, eventsChecked: checked, firstBrokenAt: expectedVersion,
           reason: `version gap: expected ${expectedVersion}, found ${version} (event removed)` };
       }
-      const recomputed = computeEventHash(secret, prev, {
+      const fields = {
         tenantId,
         aggregateName,
         aggregateId,
@@ -677,10 +760,21 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
         payload: r.payload,
         correlationId: r.correlation_id ?? null,
         causationId: r.causation_id ?? null,
-      });
+      };
+      // Format v2 (timestamp covered) first, then v1 for events written before
+      // it existed. The formats can't be confused: see ChainableEvent.
+      let recomputed = computeEventHash(secret, prev, { ...fields, occurredAt: hashedTimestamp(r.occurred_at_us) });
       if (!hashesEqual(recomputed, r.event_hash as Buffer)) {
+        recomputed = computeEventHash(secret, prev, fields);
+        if (!hashesEqual(recomputed, r.event_hash as Buffer)) {
+          return { ...base, ok: false, eventsChecked: checked, firstBrokenAt: version,
+            reason: "event_hash mismatch (payload, metadata or timestamp altered)" };
+        }
+        legacy++;
+      }
+      if (r.dismissed_at !== null) {
         return { ...base, ok: false, eventsChecked: checked, firstBrokenAt: version,
-          reason: "event_hash mismatch (payload or metadata altered)" };
+          reason: "event is dismissed (hidden from replay); a tamper-evident event can't be dismissed" };
       }
       prev = recomputed;
       checked++;
@@ -691,7 +785,10 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
       return { ...base, ok: false, eventsChecked: checked, firstBrokenAt: expectedVersion - 1,
         reason: "head_hash mismatch (tail event(s) removed or head tampered)" };
     }
-    return { ...base, eventsChecked: checked };
+    if (unprotected > 0 && !params.allowUnprotectedPrefix) {
+      return { ...unprotectedFailure(), eventsChecked: checked, legacyFormatEvents: legacy };
+    }
+    return { ...base, eventsChecked: checked, unprotectedEvents: unprotected, legacyFormatEvents: legacy };
   }
 
   /**
@@ -700,7 +797,7 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
    */
   async verifyAggregate(
     tx: PgTx,
-    params: { aggregateName: string }
+    params: { aggregateName: string } & VerifyStreamOptions
   ): Promise<ChainVerificationResult[]> {
     const res = await tx.client.query(
       `SELECT aggregate_id FROM ${this.streamVersionsTable}
@@ -710,7 +807,11 @@ export class PgEventStore<E extends AnyEvent> implements TamperEvidentEventStore
     );
     const out: ChainVerificationResult[] = [];
     for (const row of res.rows) {
-      out.push(await this.verifyStream(tx, { aggregateName: params.aggregateName, aggregateId: row.aggregate_id }));
+      out.push(await this.verifyStream(tx, {
+        aggregateName: params.aggregateName,
+        aggregateId: row.aggregate_id,
+        allowUnprotectedPrefix: params.allowUnprotectedPrefix,
+      }));
     }
     return out;
   }

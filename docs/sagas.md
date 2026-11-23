@@ -376,6 +376,16 @@ new SagaCommandDispatcher(uow, queue, bus, {
 });
 ```
 
+### When a round fails
+
+If a whole round of the dispatcher or the scheduler throws (for example,
+the database is unreachable), the loop does not exit. It reports the error
+through `observer.onLoopError({ component, error, consecutiveErrors,
+retryInMs })`, waits with exponential backoff, and tries again. The backoff
+resets after the next successful round. Configure it with `errorBackoff`
+(default `{ minMs: 250, maxMs: 15_000, factor: 2, jitter: 0.2 }`).
+`stop()` cuts the current sleep or backoff short.
+
 ### `SagaTimerScheduler`
 
 Polls due timers and delivers each to its saga's `reactToTimer`. The
@@ -389,6 +399,15 @@ exactly-once with its effects.
   monitoring.
 - Concurrent state advances are released back to `pending` and re-fired
   on the next round.
+- The claim commits on its own, so a timer can be cancelled or
+  re-scheduled between its claim and its delivery. The delivery
+  transaction re-checks and locks the row first (`lockClaimed`), and skips
+  a timer that is no longer claimed. The `skipped` count is returned from
+  `runOnce()`, and `onTimerSkipped` is emitted. A custom `SagaTimerStore`
+  without `lockClaimed` delivers every claimed timer.
+- A reaction can re-schedule the timer being delivered (a recurring
+  timer). The row goes back to `pending` with the new `fireAt`, because
+  `markFired` only changes a row that is still `claimed`.
 
 Configure:
 
@@ -503,7 +522,7 @@ alongside the existing watchdogs.
 
 | Method | Removes | Typical cadence |
 |---|---|---|
-| `PgSagaStateStore.cleanupTerminal({ olderThan, statuses? })` | Saga instances with `status IN ('completed','failed')` past the cutoff | Daily |
+| `PgSagaStateStore.cleanupTerminal({ olderThan, statuses?, mode? })` | Saga instances with `status IN ('completed','failed')` past the cutoff | Daily |
 | `PgSagaCommandQueue.cleanupFailed({ olderThan })` | Rows with `status='failed'` past the cutoff (dispatched commands are already ack-deleted) | Daily |
 | `PgSagaTimerStore.cleanupTerminal({ olderThan, statuses? })` | Timers with `status IN ('fired','cancelled')` past the cutoff | Daily |
 
@@ -511,6 +530,15 @@ Each method takes an optional `tenantId` to scope to a single tenant.
 The `statuses` filter on the state and timer cleanups lets you keep
 `failed` instances or `cancelled` timers around longer for triage
 while still pruning the bulk of the table.
+
+**Rebuilding after cleanup.** Deleting a finished saga's row forgets that it
+ran. If its starting event is delivered again later (you reset or rebuild
+the projection that feeds the saga), the saga starts over and sends its
+commands again. If you ever do that, pass `mode: "tombstone"` to
+`PgSagaStateStore.cleanupTerminal`: it clears the state (to JSON `null`)
+but keeps a small row with the ids and terminal status, so the replayed
+event finds a finished instance and is skipped. Tombstones can't be
+reactivated.
 
 ```ts
 import { Pool } from "pg";
@@ -643,8 +671,16 @@ Metrics emitted:
   `dispatched` / `released` / `failed`
 - `eventfabric.saga.command_dispatch_duration_ms` — histogram
 - `eventfabric.saga.timer_fire_total{result}` — counter, results
-  `fired` / `released` / `orphaned`
+  `fired` / `released` / `skipped` / `orphaned`
 - `eventfabric.saga.timer_fire_duration_ms` — histogram
+- `eventfabric.saga.loop_error_total{component}` — counter, components
+  `timer-scheduler` / `command-dispatcher`; rounds that threw and were
+  retried (see [When a round fails](#when-a-round-fails))
+
+The instance, command and timer metrics carry `eventfabric.saga` and
+`eventfabric.tenant_id` (the command metrics also `command_type` and
+`attempts`). The instance id and the timer id are on spans only, so the number
+of time series doesn't grow with the number of saga instances.
 
 ### Queue gauges
 

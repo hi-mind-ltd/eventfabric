@@ -70,6 +70,7 @@ describe("createSagaObserver — tracing", () => {
     expect(spans[0]!.name).toBe("saga:FundsTransfer.react");
     expect(spans[0]!.status.code).toBe(SpanStatusCode.OK);
     expect(spans[0]!.attributes["eventfabric.saga"]).toBe("FundsTransfer");
+    expect(spans[0]!.attributes["eventfabric.saga_instance"]).toBe("i-1");
     expect(spans[0]!.attributes["eventfabric.delivery"]).toBe("event");
     expect(spans[0]!.attributes["eventfabric.trigger"]).toBe("TransactionStarted");
   });
@@ -239,6 +240,14 @@ describe("createSagaObserver — metrics", () => {
       tenantId: "t",
       timerId: "ghost",
     });
+    observer.onTimerSkipped!({
+      sagaName: "S",
+      instanceId: "i",
+      tenantId: "t",
+      timerId: "cancelled",
+      durationMs: 1,
+      reason: "not-claimed",
+    });
 
     const metrics = await collectMetrics();
     const fire = metrics.find(
@@ -247,7 +256,56 @@ describe("createSagaObserver — metrics", () => {
     const results = fire.dataPoints.map(
       (dp) => dp.attributes["eventfabric.result"] as string
     );
-    expect(results.sort()).toEqual(["fired", "orphaned", "released"]);
+    expect(results.sort()).toEqual(["fired", "orphaned", "released", "skipped"]);
+  });
+
+  it("keeps instance and timer ids off metric attributes (unbounded cardinality)", async () => {
+    const observer = createSagaObserver({
+      tracer: tracerProvider.getTracer("test"),
+      meter: meterProvider.getMeter("test"),
+    });
+    for (const n of [1, 2, 3]) {
+      observer.onInstanceStarted!({ sagaName: "Card", instanceId: `i-${n}`, tenantId: "t" });
+      observer.onTimerFired!({ sagaName: "Card", instanceId: `i-${n}`, tenantId: "t", timerId: `reminder-${n}`, durationMs: 1 });
+      observer.onCommandDispatched!({
+        sagaName: "Card",
+        instanceId: `i-${n}`,
+        tenantId: "t",
+        rowId: `r-${n}`,
+        commandType: "Notify",
+        attempts: 1,
+        durationMs: 1,
+      });
+    }
+
+    const metrics = await collectMetrics();
+    for (const name of ["instances_started", "timer_fire_total", "command_dispatch_total"]) {
+      const metric = metrics.filter((m) => m.descriptor.name === `eventfabric.saga.${name}`).at(-1)!;
+      const points = metric.dataPoints.filter((dp) => dp.attributes["eventfabric.saga"] === "Card");
+      expect(points, name).toHaveLength(1);
+      expect(points[0]!.value, name).toBe(3);
+      expect(points[0]!.attributes, name).not.toHaveProperty("eventfabric.saga_instance");
+      expect(points[0]!.attributes, name).not.toHaveProperty("eventfabric.timer_id");
+    }
+  });
+
+  it("counts loop errors by component", async () => {
+    const observer = createSagaObserver({
+      tracer: tracerProvider.getTracer("test"),
+      meter: meterProvider.getMeter("test"),
+    });
+
+    const err = new Error("connection refused");
+    observer.onLoopError!({ component: "timer-scheduler", error: err, consecutiveErrors: 1, retryInMs: 250 });
+    observer.onLoopError!({ component: "timer-scheduler", error: err, consecutiveErrors: 2, retryInMs: 500 });
+    observer.onLoopError!({ component: "command-dispatcher", error: err, consecutiveErrors: 1, retryInMs: 250 });
+
+    const metrics = await collectMetrics();
+    const loop = metrics.find((m) => m.descriptor.name === "eventfabric.saga.loop_error_total")!;
+    const byComponent = Object.fromEntries(
+      loop.dataPoints.map((dp) => [dp.attributes["eventfabric.component"], dp.value])
+    );
+    expect(byComponent).toEqual({ "timer-scheduler": 2, "command-dispatcher": 1 });
   });
 });
 

@@ -55,6 +55,10 @@ export function createSagaObserver(opts: SagaOtelOptions): SagaObserver {
     }
   );
 
+  const loopErrorCounter = meter?.createCounter(`${prefix}.loop_error_total`, {
+    description: "Rounds of the timer scheduler or command dispatcher that threw and were retried after a backoff",
+  });
+
   const timerFireCounter = meter?.createCounter(`${prefix}.timer_fire_total`, {
     description: "Total saga timers processed by the scheduler, labelled by result",
   });
@@ -66,56 +70,64 @@ export function createSagaObserver(opts: SagaOtelOptions): SagaObserver {
     }
   );
 
-  const instanceAttrs = (info: SagaInstanceInfo): Attributes => ({
+  // Metric attributes must be low-cardinality: every distinct combination is
+  // a separate time series. Instance and timer ids go on spans only.
+  const instanceMetricAttrs = (info: SagaInstanceInfo): Attributes => ({
     "eventfabric.saga": info.sagaName,
-    "eventfabric.saga_instance": info.instanceId,
     "eventfabric.tenant_id": info.tenantId,
   });
+  const instanceAttrs = (info: SagaInstanceInfo): Attributes => ({
+    ...instanceMetricAttrs(info),
+    "eventfabric.saga_instance": info.instanceId,
+  });
 
-  const commandAttrs = (
+  const commandMetricAttrs = (
     info: Omit<SagaCommandDispatchedInfo, "durationMs">
   ): Attributes => ({
     "eventfabric.saga": info.sagaName,
-    "eventfabric.saga_instance": info.instanceId,
     "eventfabric.tenant_id": info.tenantId,
     "eventfabric.command_type": info.commandType,
     "eventfabric.attempts": info.attempts,
   });
-
-  const timerAttrs = (info: SagaTimerFiredInfo | { sagaName: string; instanceId: string; tenantId: string; timerId: string }): Attributes => ({
-    "eventfabric.saga": info.sagaName,
+  const commandAttrs = (
+    info: Omit<SagaCommandDispatchedInfo, "durationMs">
+  ): Attributes => ({
+    ...commandMetricAttrs(info),
     "eventfabric.saga_instance": info.instanceId,
+  });
+
+  const timerMetricAttrs = (info: SagaTimerFiredInfo | { sagaName: string; tenantId: string }): Attributes => ({
+    "eventfabric.saga": info.sagaName,
     "eventfabric.tenant_id": info.tenantId,
-    "eventfabric.timer_id": info.timerId,
   });
 
   return {
     onInstanceStarted(info) {
-      startedCounter?.add(1, instanceAttrs(info));
+      startedCounter?.add(1, instanceMetricAttrs(info));
     },
 
     onInstanceCompleted(info) {
-      const attrs = instanceAttrs(info);
+      const attrs = instanceMetricAttrs(info);
       completedCounter?.add(1, attrs);
       ageHistogram?.record(info.ageMs / 1000, attrs);
     },
 
     onInstanceFailed(info) {
       failedCounter?.add(1, {
-        ...instanceAttrs(info),
+        ...instanceMetricAttrs(info),
         "eventfabric.error_name": info.error.name,
       });
     },
 
     onCommandDispatched(info) {
-      const attrs = { ...commandAttrs(info), "eventfabric.result": "dispatched" };
+      const attrs = { ...commandMetricAttrs(info), "eventfabric.result": "dispatched" };
       commandDispatchCounter?.add(1, attrs);
       commandDispatchDurationHistogram?.record(info.durationMs, attrs);
     },
 
     onCommandReleased(info) {
       const attrs = {
-        ...commandAttrs(info),
+        ...commandMetricAttrs(info),
         "eventfabric.result": "released",
         "eventfabric.error_name": info.error.name,
       };
@@ -125,7 +137,7 @@ export function createSagaObserver(opts: SagaOtelOptions): SagaObserver {
 
     onCommandFailed(info) {
       const attrs = {
-        ...commandAttrs(info),
+        ...commandMetricAttrs(info),
         "eventfabric.result": "failed",
         "eventfabric.error_name": info.error.name,
       };
@@ -134,15 +146,25 @@ export function createSagaObserver(opts: SagaOtelOptions): SagaObserver {
     },
 
     onTimerFired(info) {
-      const attrs = { ...timerAttrs(info), "eventfabric.result": "fired" };
+      const attrs = { ...timerMetricAttrs(info), "eventfabric.result": "fired" };
       timerFireCounter?.add(1, attrs);
       timerFireDurationHistogram?.record(info.durationMs, attrs);
     },
 
     onTimerReleased(info) {
       const attrs = {
-        ...timerAttrs(info),
+        ...timerMetricAttrs(info),
         "eventfabric.result": "released",
+        "eventfabric.reason": info.reason,
+      };
+      timerFireCounter?.add(1, attrs);
+      timerFireDurationHistogram?.record(info.durationMs, attrs);
+    },
+
+    onTimerSkipped(info) {
+      const attrs = {
+        ...timerMetricAttrs(info),
+        "eventfabric.result": "skipped",
         "eventfabric.reason": info.reason,
       };
       timerFireCounter?.add(1, attrs);
@@ -151,8 +173,15 @@ export function createSagaObserver(opts: SagaOtelOptions): SagaObserver {
 
     onTimerOrphaned(info) {
       timerFireCounter?.add(1, {
-        ...timerAttrs(info),
+        ...timerMetricAttrs(info),
         "eventfabric.result": "orphaned",
+      });
+    },
+
+    onLoopError(info) {
+      loopErrorCounter?.add(1, {
+        "eventfabric.component": info.component,
+        "eventfabric.error_name": info.error.name,
       });
     },
 

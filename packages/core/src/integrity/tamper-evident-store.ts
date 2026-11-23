@@ -12,6 +12,27 @@ export type ChainVerificationResult = {
   firstBrokenAt: number | null;
   /** Human-readable cause when `ok` is false. */
   reason?: string;
+  /**
+   * Events in the stream that have no hash, so nothing detects a change to
+   * them. Non-zero makes `ok` false unless `allowUnprotectedPrefix` was set.
+   */
+  unprotectedEvents?: number;
+  /**
+   * Checked events hashed in format v1, which does not cover `occurred_at`:
+   * their content is verified, their timestamp is not. Events written since
+   * format v2 was introduced are not counted here.
+   */
+  legacyFormatEvents?: number;
+};
+
+export type VerifyStreamOptions = {
+  /**
+   * Accept events without a hash at the start of the stream (the stream
+   * existed before tamper-evidence was enabled). Off by default, because a
+   * stream whose hashes were stripped looks the same: without this, a stream
+   * verifies only when every event is covered.
+   */
+  allowUnprotectedPrefix?: boolean;
 };
 
 /**
@@ -32,10 +53,11 @@ export interface TamperEvidentEventStore<E extends AnyEvent, TTx extends Transac
    * Walk one stream's hash chain and report whether it is intact. Detects
    * payload/metadata mutation, event removal, and tail truncation. Reads the
    * raw stored payload (not upcasted) since the hash is over stored bytes.
+   * Fails when any event has no hash, unless `allowUnprotectedPrefix` is set.
    */
   verifyStream(
     tx: TTx,
-    params: { aggregateName: string; aggregateId: string }
+    params: { aggregateName: string; aggregateId: string } & VerifyStreamOptions
   ): Promise<ChainVerificationResult>;
 
   /**
@@ -44,6 +66,6 @@ export interface TamperEvidentEventStore<E extends AnyEvent, TTx extends Transac
    */
   verifyAggregate(
     tx: TTx,
-    params: { aggregateName: string }
+    params: { aggregateName: string } & VerifyStreamOptions
   ): Promise<ChainVerificationResult[]>;
 }

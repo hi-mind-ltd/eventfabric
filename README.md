@@ -19,7 +19,7 @@ EventFabric provides a database-agnostic core with aggregates, projections (inli
 | Package | Description |
 |---|---|
 | [`@eventfabric/mediator`](packages/mediator/) | `Command` envelope, `CommandBus`, middleware framework (idempotency + logging), `IdempotencyStore` interface, in-memory store. Backend-agnostic. See the [docs roadmap](docs/mediator.md#roadmap) for planned extensions. |
-| [`@eventfabric/mediator-postgres`](packages/mediator-postgres/) | Postgres-backed `PgIdempotencyStore` with claim-recovery + `resetStaleInFlight` watchdog, migration `010`. |
+| [`@eventfabric/mediator-postgres`](packages/mediator-postgres/) | Postgres-backed `PgIdempotencyStore` with claim-recovery + `resetStaleInFlight` watchdog, migrations `010` and `018`. |
 | [`@eventfabric/mediator-opentelemetry`](packages/mediator-opentelemetry/) | `createCommandBusObserver` middleware (tracing + metrics) and `createCommandIdempotencyGauges` (queue health). |
 
 ### Sagas (`0.2.0-beta`)
@@ -392,6 +392,7 @@ commits late is waited for rather than skipped.
 ### Guides
 
 - [Getting Started](docs/getting-started.md) — installation, database setup, first aggregate
+- [Upgrading](docs/upgrading.md) — migrations to run and behaviour changes per release
 - [Core Concepts](docs/core-concepts.md) — event sourcing fundamentals, CQRS, how EventFabric maps to them
 - [Multi-Tenancy](packages/postgres/docs/multi-tenancy.md) — conjoined (shared database) or per-database isolation
 

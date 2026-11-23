@@ -77,11 +77,29 @@ export type SagaTimerReleasedInfo = SagaTimerFiredInfo & {
   reason: "concurrent";
 };
 
+export type SagaTimerSkippedInfo = SagaTimerFiredInfo & {
+  /**
+   * The timer was no longer claimed at delivery: cancelled or re-scheduled
+   * after the claim, or already fired by another scheduler.
+   */
+  reason: "not-claimed";
+};
+
 export type SagaTimerOrphanedInfo = {
   sagaName: string;
   instanceId: string;
   tenantId: string;
   timerId: string;
+};
+
+export type SagaLoopErrorInfo = {
+  /** Which background loop failed. */
+  component: "timer-scheduler" | "command-dispatcher";
+  error: Error;
+  /** Failed rounds in a row, including this one. Resets after a successful round. */
+  consecutiveErrors: number;
+  /** How long the loop backs off before the next round. */
+  retryInMs: number;
 };
 
 export type SagaObserver = {
@@ -105,8 +123,17 @@ export type SagaObserver = {
   onTimerFired?(info: SagaTimerFiredInfo): void;
   /** Fired when the scheduler releases a timer after a concurrent state advance. */
   onTimerReleased?(info: SagaTimerReleasedInfo): void;
+  /** Fired when the scheduler skips a claimed timer that was cancelled or re-scheduled before delivery. */
+  onTimerSkipped?(info: SagaTimerSkippedInfo): void;
   /** Fired when the scheduler marks a timer fired because no saga handler is registered for its name. */
   onTimerOrphaned?(info: SagaTimerOrphanedInfo): void;
+
+  /**
+   * Fired when a round of the timer scheduler or command dispatcher throws
+   * (typically the database is unreachable). The loop keeps running: it
+   * backs off and tries again.
+   */
+  onLoopError?(info: SagaLoopErrorInfo): void;
 
   /**
    * Wraps a saga reaction (event or timer). Must invoke `react` exactly

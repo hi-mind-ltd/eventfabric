@@ -16,6 +16,7 @@ import {
 import {
   ConcurrentCommandInFlightError,
   MissingTenantIdError,
+  UnvalidatedTenantError,
   NoHandlerRegisteredError,
 } from "./errors";
 
@@ -34,16 +35,27 @@ export interface CommandBusOptions<TTx extends Transaction> {
    */
   readonly retryOptions?: ConcurrencyRetryOptions;
   /**
-   * Optional gate run before any middleware. Receives the command and
-   * decides whether to allow it; throw to reject. Use this to enforce
-   * that `cmd.metadata.tenantId` matches the authenticated caller —
-   * **the bus itself trusts `metadata.tenantId` and routes accordingly**,
-   * so without this gate a buggy or malicious caller can pivot tenants.
+   * Gate run before any middleware. Receives the command and decides
+   * whether to allow it; throw to reject. Use this to enforce that
+   * `cmd.metadata.tenantId` matches the authenticated caller: the bus
+   * routes by that field, so without a check a buggy or malicious caller
+   * can pivot tenants.
+   *
+   * A command whose tenant differs from the unit of work's own is rejected
+   * with `UnvalidatedTenantError` unless this or `trustTenantMetadata` is
+   * set.
    *
    * The validator runs OUTSIDE the bus's transaction so a thrown error
    * never opens a connection.
    */
   readonly tenantValidator?: (cmd: Command) => void | Promise<void>;
+  /**
+   * States that `metadata.tenantId` needs no check because every sender is
+   * trusted: commands are built by your own code from an authenticated
+   * identity, or come from the saga dispatcher. Without this or a
+   * `tenantValidator`, a command that would switch tenant is rejected.
+   */
+  readonly trustTenantMetadata?: boolean;
   /**
    * When `true`, every command must carry `metadata.tenantId`. Commands
    * without one throw `MissingTenantIdError` synchronously before any
@@ -156,6 +168,11 @@ export class CommandBus<TTx extends Transaction = Transaction> {
     // (tenant_id, idempotency_key) in the store, so dedup remains
     // tenant-correct even when transactional isolation is not.
     const uow = resolveTenantScopedUow(this.opts.uow, cmd.metadata.tenantId);
+    // The command moved the transaction to another tenant. That is only
+    // allowed when the application has said who vouches for the tenant.
+    if (uow !== this.opts.uow && !this.opts.tenantValidator && !this.opts.trustTenantMetadata) {
+      throw new UnvalidatedTenantError(cmd.type, cmd.metadata.tenantId as string);
+    }
 
     // In-flight retry loop. The middleware throws
     // `ConcurrentCommandInFlightError` synchronously when the slot is
@@ -173,9 +190,7 @@ export class CommandBus<TTx extends Transaction = Transaction> {
       try {
         const result = await withConcurrencyRetry(
           () =>
-            uow.withTransaction((tx) =>
-              chain(cmd, { tx, metadata: cmd.metadata })
-            ),
+            this.runInTransaction(uow, (tx) => chain(cmd, { tx, metadata: cmd.metadata })),
           this.opts.retryOptions
         );
         return result as TResult;
@@ -190,6 +205,37 @@ export class CommandBus<TTx extends Transaction = Transaction> {
         await new Promise((r) => setTimeout(r, pollIntervalMs));
       }
     }
+  }
+
+  /**
+   * Runs one attempt in a transaction and tells the idempotency store how it
+   * ended, so a store that keeps slots outside the database can follow the
+   * commit or rollback.
+   */
+  private async runInTransaction(
+    uow: UnitOfWork<TTx>,
+    fn: (tx: TTx) => Promise<unknown>
+  ): Promise<unknown> {
+    const store = this.opts.idempotencyStore;
+    let txRef: TTx | undefined;
+    let result: unknown;
+    try {
+      result = await uow.withTransaction((tx) => {
+        txRef = tx;
+        return fn(tx);
+      });
+    } catch (err) {
+      if (txRef !== undefined && store.afterRollback) {
+        try {
+          await store.afterRollback(txRef);
+        } catch {
+          // keep the original error
+        }
+      }
+      throw err;
+    }
+    if (txRef !== undefined) await store.afterCommit?.(txRef);
+    return result;
   }
 }
 

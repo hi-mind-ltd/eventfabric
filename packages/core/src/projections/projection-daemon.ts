@@ -135,7 +135,7 @@ export class ProjectionDaemon<E extends AnyEvent, TTx extends Transaction = Tran
         // Infrastructure failure (e.g. database unavailable): back off.
         this.fireHook(this.observer?.onProjectorError, { projection: "*", error: toError(err) });
         consecutiveErrors++;
-        await pause(computeBackoffMs(consecutiveErrors, this.backoff), signal);
+        await pause(computeBackoffMs(consecutiveErrors - 1, this.backoff), signal); // first retry waits minMs
         continue;
       }
       if (!didWork) await pause(this.idleSleepMs, signal);
@@ -366,7 +366,7 @@ export class ProjectionDaemon<E extends AnyEvent, TTx extends Transaction = Tran
         position,
         attempts,
         lastError: err.cause.stack || err.cause.message,
-        retryAt: Date.now() + computeBackoffMs(attempts, this.backoff)
+        retryAt: Date.now() + computeBackoffMs(attempts - 1, this.backoff)
       });
 
       // Commit everything before the failing event now, so a poison event

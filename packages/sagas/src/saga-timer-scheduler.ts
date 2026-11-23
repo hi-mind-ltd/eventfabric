@@ -1,4 +1,5 @@
-import type { AnyEvent, Transaction, UnitOfWork } from "@eventfabric/core";
+import { computeBackoffMs, type AnyEvent, type BackoffOptions, type Transaction, type UnitOfWork } from "@eventfabric/core";
+import { DEFAULT_LOOP_BACKOFF, InterruptibleSleep, toError } from "./loop-control";
 import type { Saga } from "./saga";
 import type { SagaTransitionStores } from "./saga-runner";
 import { applySagaTransition } from "./saga-runner";
@@ -93,6 +94,12 @@ export interface SagaTimerSchedulerOptions {
    * the legacy "wait forever" behaviour.
    */
   readonly gracefulShutdownMs?: number;
+  /**
+   * Backoff after a round throws (e.g. the database is unreachable). The
+   * loop reports the error via `observer.onLoopError` and retries; it never
+   * exits on its own. Default `{ minMs: 250, maxMs: 15_000, factor: 2, jitter: 0.2 }`.
+   */
+  readonly errorBackoff?: BackoffOptions;
 }
 
 export interface TimerSchedulerRoundResult {
@@ -127,6 +134,8 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
   private readonly observer?: SagaObserver;
   private readonly onOrphanedTimer: "fail" | "discard";
   private readonly gracefulShutdownMs: number;
+  private readonly errorBackoff: BackoffOptions;
+  private readonly pause = new InterruptibleSleep();
   private running = false;
   private stopRequested = false;
   private inFlightRound?: Promise<TimerSchedulerRoundResult>;
@@ -144,6 +153,7 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
     this.observer = opts?.observer;
     this.onOrphanedTimer = opts?.onOrphanedTimer ?? "fail";
     this.gracefulShutdownMs = opts?.gracefulShutdownMs ?? 25_000;
+    this.errorBackoff = opts?.errorBackoff ?? DEFAULT_LOOP_BACKOFF;
   }
 
   async runOnce(): Promise<TimerSchedulerRoundResult> {
@@ -287,6 +297,9 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
 
       const durationMs = Date.now() - startedAt;
       if (result === "stale") {
+        safeEmit(() =>
+          this.observer?.onTimerSkipped?.({ ...baseInfo, durationMs, reason: "not-claimed" })
+        );
         skipped++;
       } else if (result === "concurrent") {
         safeEmit(() =>
@@ -313,14 +326,27 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
     this.running = true;
     this.stopRequested = false;
 
+    let consecutiveErrors = 0;
     try {
       while (!this.stopRequested) {
-        this.inFlightRound = this.runOnce();
-        const round = await this.inFlightRound;
-        this.inFlightRound = undefined;
-        const sleepMs = round.claimed > 0 ? this.busySleepMs : this.idleSleepMs;
+        let sleepMs: number;
+        try {
+          this.inFlightRound = this.runOnce();
+          const round = await this.inFlightRound;
+          consecutiveErrors = 0;
+          sleepMs = round.claimed > 0 ? this.busySleepMs : this.idleSleepMs;
+        } catch (err) {
+          // A failed round (e.g. database unreachable) must not end the
+          // loop: back off, report, and try again.
+          consecutiveErrors++;
+          sleepMs = computeBackoffMs(consecutiveErrors - 1, this.errorBackoff);
+          const info = { component: "timer-scheduler" as const, error: toError(err), consecutiveErrors, retryInMs: sleepMs };
+          safeEmit(() => this.observer?.onLoopError?.(info));
+        } finally {
+          this.inFlightRound = undefined;
+        }
         if (sleepMs > 0 && !this.stopRequested) {
-          await new Promise((r) => setTimeout(r, sleepMs));
+          await this.pause.sleep(sleepMs);
         }
       }
     } finally {
@@ -337,6 +363,7 @@ export class SagaTimerScheduler<TTx extends Transaction = Transaction> {
    */
   async stop(): Promise<void> {
     this.stopRequested = true;
+    this.pause.interrupt();
     if (!this.inFlightRound) return;
     if (!isFinite(this.gracefulShutdownMs)) {
       await this.inFlightRound.catch(() => undefined);

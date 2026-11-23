@@ -130,7 +130,7 @@ while (true) {
   } catch (err) {
     attempt++;
     if (attempt >= maxAttempts || !isConcurrency(err)) throw err;
-    if (opts.backoff) await sleep(computeBackoffMs(attempt, opts.backoff));
+    if (opts.backoff) await sleep(computeBackoffMs(attempt - 1, opts.backoff)); // first retry waits minMs
   }
 }
 ```
@@ -207,7 +207,8 @@ export type BackoffOptions = {
 };
 ```
 
-The delay for attempt `n` is computed as:
+The delay before retry `n` (0 for the first retry, so the first wait is about
+`minMs`) is computed as:
 
 ```
 base = min(maxMs, minMs * factor^n)

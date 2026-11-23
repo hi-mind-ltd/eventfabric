@@ -14,9 +14,25 @@ import { createHmac, timingSafeEqual } from "crypto";
 
 const HASH_ALGO = "sha256";
 
-/** Normalize a configured secret to a Buffer. */
+/**
+ * Normalize a configured secret to a Buffer. Throws when the secret is missing
+ * or empty: an empty key gives a chain anyone can forge, and a missing one
+ * (an unset environment variable) must not quietly turn the feature off.
+ * Use at least 32 random bytes.
+ */
 export function toSecret(secret: string | Buffer): Buffer {
-  return typeof secret === "string" ? Buffer.from(secret, "utf8") : secret;
+  const key: unknown = secret;
+  if (typeof key !== "string" && !Buffer.isBuffer(key)) {
+    throw new Error(
+      `Hash-chain secret is missing (got ${key === null ? "null" : typeof key}). ` +
+        `Check the environment variable it is read from.`
+    );
+  }
+  const buf = typeof key === "string" ? Buffer.from(key, "utf8") : key;
+  if (buf.length === 0) {
+    throw new Error("Hash-chain secret is empty. Use at least 32 random bytes.");
+  }
+  return buf;
 }
 
 /**
@@ -66,11 +82,17 @@ function serialize(v: unknown): string {
 }
 
 /**
- * The deterministic, write-time-known fields covered by an event's hash.
- * Storage-assigned values (global position, server timestamp) are intentionally
- * EXCLUDED so the hash is computable in one pass before the event is persisted.
- * The integrity-critical content — identity, in-stream order (aggregateVersion +
- * the prevHash link), and payload — is fully covered.
+ * The fields covered by an event's hash: identity, in-stream order
+ * (aggregateVersion + the prevHash link), payload, and — in format v2 — the
+ * event's timestamp. The storage-assigned global position is excluded so the
+ * hash is computable in one pass before the event is persisted.
+ *
+ * Two formats exist. Which one applies is decided by `occurredAt`:
+ *  - v1 (no `occurredAt`): the original format. The timestamp is not covered.
+ *  - v2 (`occurredAt` set): the timestamp is covered, so the writer must
+ *    choose it before inserting (not leave it to the database's `now()`).
+ * The preimages differ (v2 carries `v: 2`), so a v2 hash never verifies as v1
+ * or the reverse: an event can't be moved between formats without the secret.
  */
 export type ChainableEvent = {
   tenantId: string;
@@ -83,11 +105,20 @@ export type ChainableEvent = {
   payload: unknown;
   correlationId?: string | null;
   causationId?: string | null;
+  /**
+   * The event's timestamp, exactly as it will be compared at verify time
+   * (`Date.toISOString()` form, millisecond precision, UTC). Setting it
+   * selects format v2.
+   */
+  occurredAt?: string;
 };
 
 /** HMAC(secret, prevHash || canonicalJson(event)) -> 32-byte digest. */
 export function computeEventHash(secret: Buffer, prevHash: Buffer, event: ChainableEvent): Buffer {
   const preimage = canonicalJson({
+    // undefined keys are omitted, so a v1 event's preimage is unchanged.
+    v: event.occurredAt === undefined ? undefined : 2,
+    occurredAt: event.occurredAt,
     tenantId: event.tenantId,
     aggregateName: event.aggregateName,
     aggregateId: event.aggregateId,

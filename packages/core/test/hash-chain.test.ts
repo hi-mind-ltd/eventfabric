@@ -12,6 +12,8 @@ import {
 
 const SECRET = toSecret("test-secret-key");
 const OTHER_SECRET = toSecret("different-secret-key");
+// HMAC of makeEvent() under SECRET in format v1, computed independently of this library.
+const V1_VECTOR = "19b4243d229be22517aeeb03ab0f4bfc7421a4229d4dc3eb1fbe95e2f9ee1252";
 
 function makeEvent(overrides: Partial<ChainableEvent> = {}): ChainableEvent {
   return {
@@ -28,6 +30,24 @@ function makeEvent(overrides: Partial<ChainableEvent> = {}): ChainableEvent {
     ...overrides,
   };
 }
+
+describe("toSecret", () => {
+  it("accepts a string or a Buffer", () => {
+    expect(toSecret("abc").equals(Buffer.from("abc"))).toBe(true);
+    const buf = Buffer.from([1, 2, 3]);
+    expect(toSecret(buf)).toBe(buf);
+  });
+
+  it("rejects an empty secret", () => {
+    expect(() => toSecret("")).toThrow(/empty/);
+    expect(() => toSecret(Buffer.alloc(0))).toThrow(/empty/);
+  });
+
+  it("rejects a missing secret (an unset environment variable)", () => {
+    expect(() => toSecret(undefined as unknown as string)).toThrow("missing (got undefined)");
+    expect(() => toSecret(null as unknown as string)).toThrow("missing (got null)");
+  });
+});
 
 describe("canonicalJson", () => {
   it("is independent of object key insertion order", () => {
@@ -60,6 +80,31 @@ describe("canonicalJson", () => {
   it("normalizes equal numbers to the same form (jsonb round-trip safety)", () => {
     // 1.10 and 1.1 are the same JS number; both must hash identically.
     expect(canonicalJson({ n: 1.1 })).toBe(canonicalJson({ n: 1.10 }));
+  });
+});
+
+describe("computeEventHash formats", () => {
+  const prev = streamGenesis(SECRET, "acme", "audit", "a-1");
+  const at = "2026-01-02T03:04:05.678Z";
+
+  it("keeps the v1 hash for an event without occurredAt", () => {
+    // Fixed vector: existing chains must keep verifying.
+    expect(computeEventHash(SECRET, prev, makeEvent()).toString("hex")).toBe(V1_VECTOR);
+  });
+
+  it("covers occurredAt in v2", () => {
+    const h = computeEventHash(SECRET, prev, makeEvent({ occurredAt: at }));
+    expect(hashesEqual(h, computeEventHash(SECRET, prev, makeEvent({ occurredAt: at })))).toBe(true);
+    expect(hashesEqual(h, computeEventHash(SECRET, prev, makeEvent({ occurredAt: "2026-01-02T03:04:05.679Z" })))).toBe(false);
+  });
+
+  it("never gives a v2 event the same hash as its v1 form", () => {
+    const v1 = computeEventHash(SECRET, prev, makeEvent());
+    const v2 = computeEventHash(SECRET, prev, makeEvent({ occurredAt: at }));
+    expect(hashesEqual(v1, v2)).toBe(false);
+    // A payload can't imitate the v2 marker: it sits at the top level of the preimage.
+    const fake = computeEventHash(SECRET, prev, makeEvent({ payload: { action: "login", actor: "u-1", v: 2, occurredAt: at } }));
+    expect(hashesEqual(fake, v2)).toBe(false);
   });
 });
 

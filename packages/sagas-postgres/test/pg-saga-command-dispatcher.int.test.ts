@@ -300,6 +300,8 @@ describe("PgSagaCommandQueue + SagaCommandDispatcher (integration)", () => {
     const bus = new CommandBus<PgTx>({
       uow: new PgUnitOfWork(pool),
       idempotencyStore: new PgIdempotencyStore(),
+      // Commands come from the saga dispatcher, which stamps the row tenant.
+      trustTenantMetadata: true,
     });
     bus.register({
       commandType: "Greet",
@@ -483,6 +485,7 @@ describe("PgSagaCommandQueue + SagaCommandDispatcher (integration)", () => {
     const bus = new CommandBus<PgTx>({
       uow: new PgUnitOfWork(pool),
       idempotencyStore: new PgIdempotencyStore(),
+      trustTenantMetadata: true,
     });
     bus.register({ commandType: "Greet", handle } as CommandHandler<Greet, string, PgTx>);
 

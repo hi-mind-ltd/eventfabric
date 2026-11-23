@@ -91,12 +91,19 @@ protected raise(...events: E[]): void
 Call `raise()` from command methods to record that something happened. The
 method:
 
-1. Validates the event structure in non-production environments (`type` must be
+1. Converts the event to the shape it will have once stored: a JSON round
+   trip, so a `Date` becomes its ISO string and `undefined` fields are
+   dropped. The handler therefore sees exactly what it will see when the
+   aggregate is reloaded. A value JSON can't hold (a `bigint`) throws here.
+2. Validates the event structure in non-production environments (`type` must be
    a string, `version` must be a positive integer).
-2. Calls the matching handler to apply the event to `this.state`.
-3. Pushes the event onto the internal pending list.
+3. Calls the matching handler to apply the event to `this.state`.
+4. Pushes the event onto the internal pending list.
 
 If no handler exists for the event type, `raise()` throws immediately.
+
+Write handlers against the JSON shape: if an event carries a date, type the
+field as `string` (ISO) rather than `Date`.
 
 ```typescript
 deposit(amount: number) {
@@ -143,6 +150,22 @@ the store.
 After `pullPendingEvents()` the aggregate's `state` still reflects the raised
 events, but the pending list is empty. Calling `pullPendingEvents()` a second
 time returns `[]`.
+
+## peekPendingEvents() and markCommitted()
+
+```typescript
+public peekPendingEvents(): readonly E[]
+public markCommitted(count: number, version: number): void
+```
+
+`Repository.save()` uses these instead of `pullPendingEvents()`. It reads the
+pending events with `peekPendingEvents()`, writes them, and only after the
+transaction commits calls `markCommitted()`, which drops the written events and
+sets `version`. If the save fails at any point (concurrency conflict, inline
+projection, snapshot, commit), the aggregate keeps its pending events and its
+old version, so you can retry `save()` or discard the aggregate.
+`saveChangesAsync()` likewise advances tracked aggregates' versions only after
+the commit. Use the same pair in a custom repository.
 
 ## Full example -- AccountAggregate
 

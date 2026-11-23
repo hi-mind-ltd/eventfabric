@@ -35,6 +35,7 @@ const makeCommand = (overrides: {
   idempotencyKey?: string;
   tenantId?: string;
   amount?: number;
+  principalId?: string;
 } = {}): DepositCommand => ({
   type: "Deposit",
   version: 1,
@@ -44,6 +45,7 @@ const makeCommand = (overrides: {
     idempotencyKey: overrides.idempotencyKey ?? `key-${Math.random()}`,
     issuedAt: new Date().toISOString(),
     tenantId: overrides.tenantId,
+    principalId: overrides.principalId,
   },
 });
 
@@ -127,6 +129,30 @@ describe("CommandBus + PgIdempotencyStore", () => {
     expect(handle).toHaveBeenCalledTimes(1);
     const row = await pool.query(`SELECT request_hash FROM eventfabric.command_idempotency WHERE idempotency_key = 'k-payload'`);
     expect(row.rows[0]!.request_hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("returns a stored result only to the principal that first sent the command", async () => {
+    const bus = new CommandBus<PgTx>({ uow: new PgUnitOfWork(pool), idempotencyStore: new PgIdempotencyStore() });
+    const handle = vi.fn(async () => ({ ok: true }));
+    bus.register({ commandType: "Deposit", handle } as CommandHandler<DepositCommand, { ok: boolean }, PgTx>);
+
+    await bus.send(makeCommand({ idempotencyKey: "k-principal", principalId: "alice" }));
+    expect(await bus.send(makeCommand({ idempotencyKey: "k-principal", principalId: "alice" }))).toEqual({ ok: true });
+
+    for (const other of ["bob", undefined]) {
+      const err = await bus.send(makeCommand({ idempotencyKey: "k-principal", principalId: other })).catch((e) => e);
+      expect(err).toBeInstanceOf(IdempotencyKeyConflictError);
+      expect(err).toMatchObject({ reason: "principal" });
+    }
+    expect(handle).toHaveBeenCalledTimes(1);
+
+    const row = await pool.query(`SELECT principal_id FROM eventfabric.command_idempotency WHERE idempotency_key = 'k-principal'`);
+    expect(row.rows[0]!.principal_id).toBe("alice");
+
+    // Rows written before the column existed (NULL) skip the check.
+    await pool.query(`UPDATE eventfabric.command_idempotency SET principal_id = NULL WHERE idempotency_key = 'k-principal'`);
+    expect(await bus.send(makeCommand({ idempotencyKey: "k-principal", principalId: "bob" }))).toEqual({ ok: true });
+    expect(handle).toHaveBeenCalledTimes(1);
   });
 
   it("rows written before the payload hash existed skip the payload check", async () => {

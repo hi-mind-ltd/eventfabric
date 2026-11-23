@@ -1,4 +1,5 @@
-import type { Transaction, UnitOfWork } from "@eventfabric/core";
+import { computeBackoffMs, type BackoffOptions, type Transaction, type UnitOfWork } from "@eventfabric/core";
+import { DEFAULT_LOOP_BACKOFF, InterruptibleSleep, toError } from "./loop-control";
 import type { Command, CommandBus } from "@eventfabric/mediator";
 import type { SagaCommandQueue, SagaCommandQueueItem } from "./saga-command-queue";
 import type { SagaObserver } from "./saga-observer";
@@ -39,6 +40,12 @@ export interface SagaCommandDispatcherOptions {
    * the legacy "wait forever" behaviour.
    */
   readonly gracefulShutdownMs?: number;
+  /**
+   * Backoff after a round throws (e.g. the database is unreachable). The
+   * loop reports the error via `observer.onLoopError` and retries; it never
+   * exits on its own. Default `{ minMs: 250, maxMs: 15_000, factor: 2, jitter: 0.2 }`.
+   */
+  readonly errorBackoff?: BackoffOptions;
 }
 
 function safeEmit(fn: (() => void) | undefined): void {
@@ -90,6 +97,8 @@ export class SagaCommandDispatcher<TTx extends Transaction = Transaction> {
   private readonly observer?: SagaObserver;
   private readonly retryBackoffMs: (attempts: number) => number;
   private readonly gracefulShutdownMs: number;
+  private readonly errorBackoff: BackoffOptions;
+  private readonly pause = new InterruptibleSleep();
   private running = false;
   private stopRequested = false;
   private inFlightRound?: Promise<DispatcherRoundResult>;
@@ -109,6 +118,7 @@ export class SagaCommandDispatcher<TTx extends Transaction = Transaction> {
       opts?.retryBackoffMs ??
       ((attempts) => Math.min(60_000, 250 * 2 ** Math.max(0, attempts - 1)));
     this.gracefulShutdownMs = opts?.gracefulShutdownMs ?? 25_000;
+    this.errorBackoff = opts?.errorBackoff ?? DEFAULT_LOOP_BACKOFF;
   }
 
   /**
@@ -192,14 +202,27 @@ export class SagaCommandDispatcher<TTx extends Transaction = Transaction> {
     this.running = true;
     this.stopRequested = false;
 
+    let consecutiveErrors = 0;
     try {
       while (!this.stopRequested) {
-        this.inFlightRound = this.runOnce();
-        const round = await this.inFlightRound;
-        this.inFlightRound = undefined;
-        const sleepMs = round.claimed > 0 ? this.busySleepMs : this.idleSleepMs;
+        let sleepMs: number;
+        try {
+          this.inFlightRound = this.runOnce();
+          const round = await this.inFlightRound;
+          consecutiveErrors = 0;
+          sleepMs = round.claimed > 0 ? this.busySleepMs : this.idleSleepMs;
+        } catch (err) {
+          // A failed round (e.g. database unreachable) must not end the
+          // loop: back off, report, and try again.
+          consecutiveErrors++;
+          sleepMs = computeBackoffMs(consecutiveErrors - 1, this.errorBackoff);
+          const info = { component: "command-dispatcher" as const, error: toError(err), consecutiveErrors, retryInMs: sleepMs };
+          safeEmit(() => this.observer?.onLoopError?.(info));
+        } finally {
+          this.inFlightRound = undefined;
+        }
         if (sleepMs > 0 && !this.stopRequested) {
-          await new Promise((r) => setTimeout(r, sleepMs));
+          await this.pause.sleep(sleepMs);
         }
       }
     } finally {
@@ -215,6 +238,7 @@ export class SagaCommandDispatcher<TTx extends Transaction = Transaction> {
    */
   async stop(): Promise<void> {
     this.stopRequested = true;
+    this.pause.interrupt();
     if (!this.inFlightRound) return;
     if (!isFinite(this.gracefulShutdownMs)) {
       await this.inFlightRound.catch(() => undefined);

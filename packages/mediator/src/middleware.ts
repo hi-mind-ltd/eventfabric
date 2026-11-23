@@ -87,6 +87,7 @@ export function createIdempotencyMiddleware<TTx extends Transaction>(
       commandId: cmd.metadata.commandId,
       tenantId: cmd.metadata.tenantId,
       requestHash: commandRequestHash(cmd.payload),
+      principalId: cmd.metadata.principalId,
     };
 
     // Single claim attempt per middleware call. If the slot is held by
@@ -107,6 +108,13 @@ export function createIdempotencyMiddleware<TTx extends Transaction>(
       }
       if (claim.requestHash && claim.requestHash !== claimParams.requestHash) {
         throw new IdempotencyKeyConflictError(cmd.metadata.idempotencyKey, cmd.type, cmd.type, "payload");
+      }
+      // A stored result goes back only to the principal that first sent the
+      // command. Otherwise anyone in the tenant who repeats the key and
+      // payload gets it without the handler (and any authorization in it)
+      // running. A sender without a principal doesn't match a stored one.
+      if (claim.principalId && claim.principalId !== cmd.metadata.principalId) {
+        throw new IdempotencyKeyConflictError(cmd.metadata.idempotencyKey, cmd.type, cmd.type, "principal");
       }
       return claim.result;
     }

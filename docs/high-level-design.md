@@ -304,7 +304,7 @@ The upcaster runs in `PgEventStore.mapRow()`, so every consumer — aggregates, 
 
 | Boundary | Protection |
 |---|---|
-| SQL injection (query builder) | Tagged template literals → parameterized queries. Values never touch the SQL string. |
+| SQL injection (query builder) | Tagged template literals → parameterized queries. Values never touch the SQL string. The fluent builder parameterizes values, JSONB keys, limit and offset, and rejects column names, operators and sort directions outside a fixed set. |
 | SQL injection (event store) | All queries use `$N` parameterized placeholders via `pg` driver. |
 | Concurrency conflicts | Optimistic concurrency (version check + UNIQUE constraint) → `ConcurrencyError`. |
 | Schema drift | `assertEventRow` / `assertOutboxRow` validate required fields at the DB→domain boundary before any cast. `RowShapeError` surfaces corruption loudly. |

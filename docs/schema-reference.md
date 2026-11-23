@@ -31,6 +31,7 @@ Run this before any migration. Migration `001_init.sql` includes this statement.
 | `009_per_tenant_projection_checkpoints.sql` | Replaces `projection_checkpoints.last_global_position` with per-tenant checkpoint rows |
 | `015_event_hash_chain.sql`      | Tamper-evidence (opt-in per aggregate): adds `events.event_hash`, `stream_versions.head_hash`, and the `event_chain_anchors` + `event_chain_anchor_members` tables. Dormant unless a `hashChain.secret` is configured. See [Tamper Evidence](./tamper-evidence.md). |
 | `016_projection_dead_letters.sql` | `eventfabric.projection_dead_letters` table: events the `ProjectionDaemon` gave up on after `maxAttempts` |
+| `019_outbox_dead_letter_reason.sql` | Adds `reason` to `eventfabric.outbox_dead_letters` |
 
 ### Mediator extension (shipped by `@eventfabric/mediator-postgres`)
 
@@ -38,6 +39,7 @@ Run this before any migration. Migration `001_init.sql` includes this statement.
 | ------------------------------- | -------------------------------------------------------------- |
 | `010_command_idempotency.sql`   | `eventfabric.command_idempotency` table (dedup slot per `(tenant_id, idempotency_key)`) + cleanup index |
 | `018_command_request_hash.sql`  | Adds `request_hash` to `eventfabric.command_idempotency` |
+| `020_command_principal.sql`     | Adds `principal_id` to `eventfabric.command_idempotency` |
 
 ### Sagas extension (shipped by `@eventfabric/sagas-postgres`)
 
@@ -73,6 +75,7 @@ psql "$DATABASE_URL" -f packages/postgres/migrations/001_init.sql
 # ... 002 through 009 from packages/postgres/migrations/ ...
 psql "$DATABASE_URL" -f packages/mediator-postgres/migrations/010_command_idempotency.sql
 psql "$DATABASE_URL" -f packages/mediator-postgres/migrations/018_command_request_hash.sql
+psql "$DATABASE_URL" -f packages/mediator-postgres/migrations/020_command_principal.sql
 psql "$DATABASE_URL" -f packages/sagas-postgres/migrations/011_saga_instances.sql
 psql "$DATABASE_URL" -f packages/sagas-postgres/migrations/012_saga_pending_commands.sql
 psql "$DATABASE_URL" -f packages/sagas-postgres/migrations/013_saga_scheduled_messages.sql
@@ -96,7 +99,7 @@ The append-only event log. Every domain event ever recorded lives here.
 | `type`              | `TEXT`        | NOT NULL | --        | The event type discriminator (e.g. `"AccountDeposited"`). Matches `payload.type`. |
 | `version`           | `INT`         | NOT NULL | --        | The event schema version (e.g. `1`). Matches `payload.version`. Stored as a top-level column for efficient filtering. |
 | `payload`           | `JSONB`       | NOT NULL | --        | The full event object serialized as JSON. Contains `type`, `version`, and all domain-specific fields. |
-| `occurred_at`       | `TIMESTAMPTZ` | NOT NULL | `now()`   | Timestamp of when the event was appended. Set by the database, not the application. |
+| `occurred_at`       | `TIMESTAMPTZ` | NOT NULL | `now()`   | Timestamp of when the event was appended. Set by the database, except for hash-chained events, where the store sets it from the application clock so the hash can cover it. |
 | `dismissed_at`      | `TIMESTAMPTZ` | NULL     | `NULL`    | If non-null, the event has been soft-deleted. Set by `PgEventStore.dismiss()`. |
 | `dismissed_reason`  | `TEXT`        | NULL     | `NULL`    | Optional human-readable reason for dismissal (e.g. `"GDPR erasure"`). |
 | `dismissed_by`      | `TEXT`        | NULL     | `NULL`    | Optional identifier of the actor who dismissed the event. |
@@ -339,6 +342,7 @@ trail for failed processing.
 | `topic`             | `TEXT`        | NULL     | `NULL`   | The topic of the original outbox row.                           |
 | `attempts`          | `INT`         | NOT NULL | --       | Number of processing attempts before dead-lettering.            |
 | `last_error`        | `TEXT`        | NULL     | `NULL`   | The error message from the final failed attempt.                |
+| `reason`            | `TEXT`        | NULL     | `NULL`   | Why the runner dead-lettered it (e.g. max attempts, event not found). Added by migration 019; NULL for older rows. |
 | `dead_lettered_at`  | `TIMESTAMPTZ` | NOT NULL | `now()`  | Timestamp when the message was dead-lettered.                   |
 
 ### Constraints
@@ -411,6 +415,7 @@ with the transaction rollback. Created by
 | `created_at`        | `TIMESTAMPTZ` | NOT NULL | `now()`     | When the slot was claimed. Used by both `cleanup` (retention) and `resetStaleInFlight` (watchdog window). |
 | `completed_at`      | `TIMESTAMPTZ` | NULL     | `NULL`      | Set by `complete` and by the watchdog when flipping to `'failed'`. |
 | `request_hash`      | `TEXT`        | NULL     | `NULL`      | SHA-256 (hex) of the payload the key was first used with. A later command with the same key and a different hash is rejected with `IdempotencyKeyConflictError`. NULL on rows written before migration 018 (check skipped). |
+| `principal_id`      | `TEXT`        | NULL     | `NULL`      | The `metadata.principalId` that first used the key (020). A later command with the same key from a different principal is rejected with `IdempotencyKeyConflictError`. `NULL` (older rows, commands without a principal) skips the check. |
 
 ### Constraints
 

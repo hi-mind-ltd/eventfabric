@@ -100,4 +100,32 @@ describe("withConcurrencyRetry", () => {
       vi.useRealTimers();
     }
   });
+it("waits minMs before the first retry, then grows by factor", async () => {
+    vi.useFakeTimers();
+    try {
+      const fn = vi
+        .fn()
+        .mockRejectedValueOnce(new ConcurrencyError())
+        .mockRejectedValueOnce(new ConcurrencyError())
+        .mockResolvedValueOnce("ok");
+      const p = withConcurrencyRetry(fn, {
+        maxAttempts: 3,
+        backoff: { minMs: 100, maxMs: 10_000, factor: 2, jitter: 0 },
+      });
+
+      await vi.advanceTimersByTimeAsync(99);
+      expect(fn).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fn).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(199);
+      expect(fn).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fn).toHaveBeenCalledTimes(3);
+      await expect(p).resolves.toBe("ok");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
+

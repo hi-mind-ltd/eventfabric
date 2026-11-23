@@ -973,6 +973,55 @@ describe("Session", () => {
     expect(row2.rows[0].balance).toBe(150);
   }, 15000);
 
+  it("a failed saveChangesAsync leaves tracked aggregate versions alone; a retry commits once", async () => {
+    const store = new PgEventStore<TestEvent>();
+    const factory = new SessionFactory(pool, store);
+    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account");
+
+    let failProjection = false;
+    factory.registerInlineProjector(
+      new InlineProjector<TestEvent, PgTx>([
+        {
+          name: "flaky",
+          async handle() {
+            if (failProjection) throw new Error("projection failed");
+          },
+        },
+      ])
+    );
+
+    const accountId = "acc-failed-save";
+    const s1 = factory.createSession();
+    s1.startStream(accountId, {
+      type: "AccountOpened",
+      version: 1,
+      accountId,
+      customerId: "c",
+      initialBalance: 100,
+      currency: "USD",
+    } as AccountOpenedV1);
+    await s1.saveChangesAsync();
+
+    const session = factory.createSession();
+    const account = await session.loadAggregateAsync<AccountAggregate>(accountId);
+    expect(account.version).toBe(1);
+    account.deposit(50);
+
+    failProjection = true;
+    await expect(session.saveChangesAsync()).rejects.toThrow("projection failed");
+    // Rolled back: the aggregate must still be at version 1.
+    expect(account.version).toBe(1);
+
+    failProjection = false;
+    await session.saveChangesAsync();
+    expect(account.version).toBe(2);
+
+    // Written once: a fresh load sees version 2 and one deposit.
+    const reloaded = await factory.createSession().loadAggregateAsync<AccountAggregate>(accountId);
+    expect(reloaded.version).toBe(2);
+    expect(reloaded.state.balance).toBe(150);
+  }, 15000);
+
   it("creates snapshots automatically based on snapshot policy", async () => {
     const store = new PgEventStore<TestEvent>();
     const snapshotStore = new PgSnapshotStore<AccountState>();
@@ -1045,6 +1094,32 @@ describe("Session", () => {
     );
     expect(snap.rows[0].aggregate_version).toBe(3);
     expect(snap.rows[0].state).toEqual({ customerId: "cust-d", balance: 200, currency: "USD" });
+  }, 15000);
+
+  it("snapshots when a multi-event save jumps past a multiple of everyNEvents", async () => {
+    const store = new PgEventStore<TestEvent>();
+    const snapshotStore = new PgSnapshotStore<AccountState>();
+    const factory = new SessionFactory(pool, store);
+    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account", {
+      snapshotStore, snapshotPolicy: { everyNEvents: 2 }, snapshotSchemaVersion: 1
+    });
+    const accountId = "acc-snap-jump";
+    const s1 = factory.createSession();
+    s1.startStream(accountId, { type: "AccountOpened", version: 1, accountId, customerId: "cust-j", initialBalance: 100, currency: "USD" });
+    await s1.saveChangesAsync(); // version 1: no snapshot
+
+    const s2 = factory.createSession();
+    const account = await s2.loadAggregateAsync<AccountAggregate>(accountId);
+    account.deposit(10);
+    account.deposit(10);
+    await s2.saveChangesAsync(); // 1 → 3: passes 2
+
+    const snap = await pool.query(
+      `SELECT aggregate_version, state FROM eventfabric.snapshots WHERE aggregate_name = 'Account' AND aggregate_id = $1`,
+      [accountId]
+    );
+    expect(snap.rows[0]?.aggregate_version).toBe(3);
+    expect(snap.rows[0]?.state.balance).toBe(120);
   }, 15000);
 
   it("snapshot of a loaded aggregate includes events appended directly in the same session", async () => {

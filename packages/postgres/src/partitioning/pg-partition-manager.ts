@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 export type PartitionInfo = {
   name: string;
@@ -44,21 +44,46 @@ export class PgPartitionManager {
    * No-op if the table is already partitioned.
    */
   async enablePartitioning(pool: Pool, opts?: { partitionSize?: bigint }): Promise<void> {
-    const partitionSize = opts?.partitionSize ?? 1_000_000n;
-
     if (await this.isPartitioned(pool)) return;
 
     const client = await pool.connect();
     try {
-      await client.query("BEGIN");
+      await this.enablePartitioningOn(client, opts);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Same as {@link enablePartitioning}, on a connection the caller already
+   * holds (the migrator runs everything on one locked connection). The
+   * connection must not be inside a transaction.
+   */
+  async enablePartitioningOn(client: PoolClient, opts?: { partitionSize?: bigint }): Promise<void> {
+    const partitionSize = opts?.partitionSize ?? 1_000_000n;
+
+    await client.query("BEGIN");
+    try {
       await client.query(`LOCK TABLE ${this.qualifiedTable} IN ACCESS EXCLUSIVE MODE`);
+
+      // Re-check under the lock: a concurrent caller may have partitioned the
+      // table while we waited, and renaming its new parent would break it.
+      if (await this.isPartitioned(client)) {
+        await client.query("ROLLBACK");
+        return;
+      }
 
       const seqName = await this.getSequenceName(client);
       const maxPos = await this.getMaxPosition(client);
+      // The sequence can be well past MAX(global_position): rolled-back
+      // appends consume values, and the newest events may have been deleted.
+      // Base the boundary on whichever is higher so the next position lands
+      // in an existing partition.
+      const seq = await client.query(`SELECT last_value, is_called FROM ${seqName}`);
+      const issued = seq.rows[0].is_called ? BigInt(seq.rows[0].last_value) : BigInt(seq.rows[0].last_value) - 1n;
+      const base = issued > maxPos ? issued : maxPos;
 
-      const boundary = maxPos === 0n
-        ? partitionSize
-        : ((maxPos / partitionSize) + 1n) * partitionSize;
+      const boundary = ((base / partitionSize) + 1n) * partitionSize;
 
       const firstPartName = `${this.table}_p0`;
       const nextPartName = `${this.table}_p1`;
@@ -131,8 +156,6 @@ export class PgPartitionManager {
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
-    } finally {
-      client.release();
     }
   }
 
@@ -191,7 +214,7 @@ export class PgPartitionManager {
   }
 
   /** Returns true if the events table is already partitioned. */
-  async isPartitioned(pool: Pool): Promise<boolean> {
+  async isPartitioned(pool: { query: Pool["query"] }): Promise<boolean> {
     const res = await pool.query(`
       SELECT c.relkind
       FROM pg_class c

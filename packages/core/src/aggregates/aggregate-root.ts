@@ -4,6 +4,20 @@ export type HandlerMap<E extends AnyEvent, S> = {
   [K in E["type"]]?: (state: S, event: Extract<E, { type: K }>) => void;
 };
 
+function toStoredShape<E extends AnyEvent>(event: E): E {
+  let json: string;
+  try {
+    json = JSON.stringify(event);
+  } catch (err) {
+    const type = (event as { type?: unknown })?.type;
+    throw new Error(
+      `Event '${String(type)}' can't be stored as JSON (${err instanceof Error ? err.message : String(err)}). ` +
+        `Use strings for bigint values.`
+    );
+  }
+  return JSON.parse(json) as E;
+}
+
 export abstract class AggregateRoot<S, E extends AnyEvent> {
   /**
    * Opt this aggregate's streams into tamper-evident hash chaining. A backend
@@ -38,7 +52,12 @@ export abstract class AggregateRoot<S, E extends AnyEvent> {
   }
 
   protected raise(...events: E[]) {
-    for (const e of events) {
+    for (const raised of events) {
+      // Apply the event as it will be stored and replayed (after a JSON round
+      // trip), so the live state matches the state after a reload: a Date
+      // becomes its ISO string, undefined fields disappear. Otherwise a
+      // handler can work on the live event and fail on replay.
+      const e = toStoredShape(raised);
       // In development/test mode, validate event structure
       if (process.env.NODE_ENV !== "production") {
         this.validateEvent(e);
@@ -77,5 +96,21 @@ export abstract class AggregateRoot<S, E extends AnyEvent> {
     const out = this.pending;
     this.pending = [];
     return out;
+  }
+
+  /** The events raised since the last save, oldest first. Does not clear them. */
+  public peekPendingEvents(): readonly E[] {
+    return [...this.pending];
+  }
+
+  /**
+   * Records a committed save: drops the first `count` pending events (the
+   * ones that were written) and sets the version. Call it only after the
+   * transaction commits, so a failed save leaves the aggregate as it was and
+   * can be retried.
+   */
+  public markCommitted(count: number, version: number): void {
+    this.pending.splice(0, count);
+    this.version = version;
   }
 }

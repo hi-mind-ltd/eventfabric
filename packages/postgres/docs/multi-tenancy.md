@@ -4,7 +4,7 @@ EventFabric supports two multi-tenancy strategies out of the box. Both use the s
 
 ## Strategy 1: Conjoined (shared database)
 
-All tenants share a single database. Isolation is enforced by a `tenant_id` column on every table. Every query automatically filters by tenant.
+All tenants share a single database. Isolation is enforced by a `tenant_id` column on every table. Sessions, repositories and the stores' per-tenant operations filter by the transaction's tenant; the [exceptions](#what-is-not-filtered-by-tenant) are listed below.
 
 ```typescript
 import { SessionFactory, PgEventStore, ConjoinedTenantResolver } from "@eventfabric/postgres";
@@ -19,9 +19,11 @@ const store = new PgEventStore<AppEvent>();
 const factory = new SessionFactory(resolver, store);
 factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account");
 
-// Per request — tenant from auth context
-app.post("/accounts/:id/deposit", async (req, res) => {
-  const tenantId = req.headers["x-tenant-id"] as string;
+// Per request. The tenant must come from the authenticated identity (a verified
+// token claim, the session), never from something the client can set freely
+// such as a header: whoever controls it chooses whose data they read.
+app.post("/accounts/:id/deposit", authenticate, async (req, res) => {
+  const tenantId = req.auth.tenantId;
   const session = factory.createSession(tenantId);
 
   const account = await session.loadAggregateAsync<AccountAggregate>(req.params.id);
@@ -34,11 +36,31 @@ app.post("/accounts/:id/deposit", async (req, res) => {
 
 **How it works:**
 - Migration `008_tenant_id` adds `tenant_id TEXT NOT NULL DEFAULT 'default'` to all tables
-- Every store query includes `WHERE tenant_id = $1` automatically
+- Stream, snapshot, DLQ and saga operations include `WHERE tenant_id = $1`, taken from the transaction (`tx.tenantId`)
 - Indexes have `tenant_id` as the leading column for efficient filtering
 - Existing single-tenant data uses `tenant_id = 'default'` — no migration needed
 
 **When to use:** Many tenants, shared infrastructure, simpler ops. Good for SaaS with hundreds or thousands of small customers.
+
+### What is not filtered by tenant
+
+Isolation in this mode is a `WHERE` clause added by the library, not something
+the database enforces. These read or change rows of more than one tenant, and
+must not be reachable with request input:
+
+| API | Scope |
+|---|---|
+| `PgEventStore.loadGlobal` with `allTenants: true` | Every tenant's events. Without it, the transaction's tenant (or `tenantId`) applies. |
+| `PgEventStore.loadByGlobalPositions` | Whatever positions you pass, any tenant (the outbox runner relies on this). |
+| `PgEventStore.discoverActiveTenants` | Lists tenant ids. |
+| Outbox claim / ack / stats | The outbox is one queue shared by all tenants. |
+| `query()` (query builder) | No tenant filter unless you pass the `tenantId` option, including on `eventfabric.snapshots`. |
+| `PgIdempotencyStore.cleanup`; `resetStaleInFlight` and `cleanupTerminal` without a tenant | Maintenance across tenants. |
+| Your own SQL and read-model tables | Yours to filter. |
+
+If a missed filter is not an acceptable failure mode, use the per-database
+strategy, or add PostgreSQL row-level security on `tenant_id` as a second
+layer.
 
 ## Strategy 2: Per-Database (separate databases)
 
@@ -62,9 +84,10 @@ const store = new PgEventStore<AppEvent>();
 const factory = new SessionFactory(resolver, store);
 factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account");
 
-// Per request — resolver picks the right database pool
-app.post("/accounts/:id/deposit", async (req, res) => {
-  const tenantId = req.headers["x-tenant-id"] as string;
+// Per request — resolver picks the right database pool. As above, take the
+// tenant from the authenticated identity.
+app.post("/accounts/:id/deposit", authenticate, async (req, res) => {
+  const tenantId = req.auth.tenantId;
   const session = factory.createSession(tenantId);  // uses tenant's own pool
 
   const account = await session.loadAggregateAsync<AccountAggregate>(req.params.id);

@@ -20,6 +20,14 @@ export type ClaimResult =
        * that don't record it skip the check.
        */
       requestHash?: string;
+      /**
+       * The principal (`metadata.principalId`) that first used the key. When
+       * the command being sent comes from a different principal, the
+       * middleware throws `IdempotencyKeyConflictError` instead of handing
+       * one caller another caller's result. Stores (or rows) that don't
+       * record it, and first uses without a principal, skip the check.
+       */
+      principalId?: string;
     }
   | { state: "in_flight" };
 
@@ -37,12 +45,28 @@ export type ClaimResult =
 export interface IdempotencyStore<TTx extends Transaction = Transaction> {
   claim(
     tx: TTx,
-    params: { key: string; commandType: string; commandId: string; tenantId?: string; requestHash?: string }
+    params: { key: string; commandType: string; commandId: string; tenantId?: string; requestHash?: string; principalId?: string }
   ): Promise<ClaimResult>;
 
   complete(tx: TTx, params: { key: string; tenantId?: string; result: unknown }): Promise<void>;
 
   release(tx: TTx, params: { key: string; tenantId?: string; error: Error }): Promise<void>;
+
+  /**
+   * Optional. Called by the bus after the command's transaction commits.
+   * Only stores that keep slots outside the database need it.
+   */
+  afterCommit?(tx: TTx): Promise<void> | void;
+
+  /**
+   * Optional. Called by the bus after the command's transaction rolls back
+   * (handler error, commit failure, retry). A database store doesn't need it
+   * (the rollback undoes its rows); a store that keeps slots elsewhere, like
+   * `InMemoryIdempotencyStore`, uses it to undo what that transaction
+   * claimed or completed, so a retry isn't answered from a result that was
+   * never committed.
+   */
+  afterRollback?(tx: TTx): Promise<void> | void;
 }
 
 /**

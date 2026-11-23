@@ -77,7 +77,7 @@ Key properties of this query:
 - **`FOR UPDATE SKIP LOCKED`**: Non-blocking concurrent access. If another worker already locked a row, this worker skips it instead of waiting. Multiple workers can poll simultaneously without deadlocks.
 - **Atomic lock + increment**: The `UPDATE` sets `locked_at`, `locked_by`, and increments `attempts` in one statement.
 - **Topic filter**: The optional `$3` parameter filters by topic, allowing workers to specialize.
-- **Lease**: `$4` is the runner's `leaseMs`. A row whose lock is older than the lease is treated as abandoned (its worker crashed or lost its connection after claiming) and can be claimed again. Choose a lease well above the worst-case time to process one batch; otherwise a slow-but-alive worker's rows can be reclaimed and processed twice.
+- **Lease**: `$4` is the runner's `leaseMs`. A row whose lock is older than the lease is treated as abandoned (its worker crashed or lost its connection after claiming) and can be claimed again. Choose a lease well above the worst-case time to process one batch. Otherwise a slow-but-alive worker's rows can be reclaimed, and both workers run the handlers. The slow worker's database writes are then rolled back (see [Lease fencing](#lease-fencing)), but anything its handlers did outside the database, such as sending an email or calling an API, has already happened.
 - **Insertion order, not commit order**: Rows are claimed by `id`. A row whose transaction commits late is claimed after rows inserted later. Nothing is skipped, because every row is delivered until it is acked, but delivery order across streams is not guaranteed.
 
 ### 3. Process + Ack/Release
@@ -86,6 +86,14 @@ After claiming, the runner loads the corresponding event from the event store, d
 
 - **On success**: Acknowledges the message by deleting the outbox row.
 - **On failure**: Releases the message by clearing the lock, allowing it to be reclaimed on the next poll.
+- **Batch mode** (`transactionMode: "batch"`, the default) runs the whole batch in one transaction, so a failure rolls back every row's work. Only the row that failed is released with the error and charged an attempt; the rest are released without one. One failing row therefore reaches `maxAttempts` on its own, without taking the healthy rows claimed with it to the dead-letter queue.
+
+### Lease fencing
+
+Every write after the claim carries the runner's `workerId` and only applies while that worker still holds the row's lease (`locked_by`):
+
+- `ack` and `deadLetter` throw `LeaseLostError` when another worker has taken the row over. That rolls back the transaction, including the handler's writes, so the slow worker doesn't commit its work a second time.
+- `release` and `releaseWithError` do nothing for a row the worker no longer holds, so it can't unlock a row another worker is processing.
 
 ### 4. Dead-letter
 
@@ -109,13 +117,13 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
     leaseMs?: number;
   }): Promise<OutboxRow[]>;
 
-  ack(tx: PgTx, id: OutboxRow["id"]): Promise<void>;
+  ack(tx: PgTx, id: OutboxRow["id"], workerId?: string): Promise<void>;
 
-  releaseWithError(tx: PgTx, id: OutboxRow["id"], error: string): Promise<void>;
+  releaseWithError(tx: PgTx, id: OutboxRow["id"], error: string, workerId?: string): Promise<void>;
 
-  release(tx: PgTx, ids: OutboxRow["id"][]): Promise<void>;
+  release(tx: PgTx, ids: OutboxRow["id"][], workerId?: string): Promise<void>;
 
-  deadLetter(tx: PgTx, row: OutboxRow, reason: string): Promise<void>;
+  deadLetter(tx: PgTx, row: OutboxRow, reason: string, workerId?: string): Promise<void>;
 }
 ```
 
@@ -126,6 +134,8 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
 | `releaseWithError` | Clears `locked_at` and `locked_by`, stores the error in `last_error`. The row becomes claimable again on the next poll. |
 | `release` | Unlocks claimed rows that were never attempted and undoes the claim's `attempts` increment. `last_error` is left as is. |
 | `deadLetter` | Copies the row to the DLQ table, then deletes it from the active outbox. |
+
+With `workerId`, each of these only acts while that worker holds the row's lease: `ack` and `deadLetter` throw `LeaseLostError` otherwise, and the two releases do nothing. Without it they act on the row whoever holds it. The async runner always passes it.
 
 ### OutboxRow
 
@@ -182,6 +192,7 @@ export type DlqItem = {
   topic: string | null;
   attempts: number;
   lastError: string | null;
+  reason?: string | null;   // why it was dead-lettered (migration 019)
   deadLetteredAt: string;
 };
 ```
@@ -205,7 +216,7 @@ export type ListDlqOptions = {
 | `requeue(dlqId)` | Moves a DLQ item back to the active outbox with `attempts = 0`. The runner will try again. |
 | `requeueByGlobalPosition(pos)` | Same as `requeue`, but looks up the DLQ item by its event's global position. |
 | `requeueRange(from, to)` | Requeues all DLQ items in the given global position range. |
-| `purge(options?)` | Permanently deletes DLQ items. Filterable by topic and age (`olderThan`). |
+| `purge(options?)` | Permanently deletes DLQ items. Filterable by topic and age (`olderThan`). As in `list()`, `topic: null` or no topic means **all topics**: `purge({ topic: null })` deletes the tenant's whole DLQ. |
 
 ## PgOutboxStatsService
 
