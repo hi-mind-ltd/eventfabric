@@ -33,10 +33,15 @@ export function createCatchUpObserver(opts: CatchUpOtelOptions): CatchUpProjecto
     unit: "ms"
   });
 
-  const baseAttrs = (info: CatchUpHandlerInfo): Attributes => ({
+  // Metric attributes must be low-cardinality: every distinct combination is
+  // a separate time series. Positions go on the span only.
+  const metricAttrs = (info: CatchUpHandlerInfo): Attributes => ({
     "eventfabric.runner": "catch_up",
     "eventfabric.projection": info.projection,
-    "eventfabric.event_type": info.eventType,
+    "eventfabric.event_type": info.eventType
+  });
+  const spanAttrs = (info: CatchUpHandlerInfo): Attributes => ({
+    ...metricAttrs(info),
     "eventfabric.global_position": info.globalPosition.toString()
   });
 
@@ -44,22 +49,21 @@ export function createCatchUpObserver(opts: CatchUpOtelOptions): CatchUpProjecto
     onBatchLoaded(info) {
       const attrs: Attributes = {
         "eventfabric.runner": "catch_up",
-        "eventfabric.projection": info.projection,
-        "eventfabric.from_position": info.fromPosition.toString()
+        "eventfabric.projection": info.projection
       };
       batchLoadedCounter?.add(1, attrs);
       eventsLoadedCounter?.add(info.count, attrs);
     },
 
     onEventHandled(info) {
-      const attrs = baseAttrs(info);
+      const attrs = metricAttrs(info);
       handledCounter?.add(1, attrs);
       handlerDurationHistogram?.record(info.durationMs, attrs);
     },
 
     onEventFailed(info) {
       const attrs = {
-        ...baseAttrs(info),
+        ...metricAttrs(info),
         "eventfabric.error_name": info.error.name
       };
       failedCounter?.add(1, attrs);
@@ -69,9 +73,7 @@ export function createCatchUpObserver(opts: CatchUpOtelOptions): CatchUpProjecto
     onCheckpointAdvanced(info) {
       checkpointCounter?.add(1, {
         "eventfabric.runner": "catch_up",
-        "eventfabric.projection": info.projection,
-        "eventfabric.from_position": info.fromPosition.toString(),
-        "eventfabric.to_position": info.toPosition.toString()
+        "eventfabric.projection": info.projection
       });
     },
 
@@ -86,7 +88,7 @@ export function createCatchUpObserver(opts: CatchUpOtelOptions): CatchUpProjecto
     async runHandler(handle, info) {
       return tracer.startActiveSpan(
         `${info.projection}.handle`,
-        { attributes: baseAttrs(info) },
+        { attributes: spanAttrs(info) },
         async (span) => {
           try {
             const result = await handle();

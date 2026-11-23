@@ -668,6 +668,11 @@ Metrics emitted:
   `timer-scheduler` / `command-dispatcher`; rounds that threw and were
   retried (see [When a round fails](#when-a-round-fails))
 
+The instance, command and timer metrics carry `eventfabric.saga` and
+`eventfabric.tenant_id` (the command metrics also `command_type` and
+`attempts`). The instance id and the timer id are on spans only, so the number
+of time series doesn't grow with the number of saga instances.
+
 ### Queue gauges
 
 Observable gauges polled from the DB at each metric export. The package

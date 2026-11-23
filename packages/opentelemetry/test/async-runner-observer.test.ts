@@ -149,14 +149,12 @@ describe("createAsyncRunnerObserver — metrics", () => {
     const metrics = await collectMetrics();
     const handled = metrics.find((m) => m.descriptor.name === "eventfabric.async_runner.events_handled");
     expect(handled).toBeDefined();
-    // OTel groups counter data points by unique attribute set. The two calls
-    // differ in `eventfabric.global_position`, so they split into 2 points
-    // each with value 1 — sum across to get total invocations.
-    const total = handled!.dataPoints.reduce(
-      (sum, dp) => sum + (dp.value as number),
-      0
-    );
-    expect(total).toBe(2);
+    // OTel groups data points by attribute set. The two calls differ only in
+    // global_position, which is span-only (unbounded), so they share one point.
+    const points = handled!.dataPoints.filter((dp) => dp.attributes["eventfabric.projection"] === "p1");
+    expect(points).toHaveLength(1);
+    expect(points[0]!.value).toBe(2);
+    expect(points[0]!.attributes).not.toHaveProperty("eventfabric.global_position");
 
     const duration = metrics.find(
       (m) => m.descriptor.name === "eventfabric.async_runner.handler_duration_ms"

@@ -52,14 +52,17 @@ export function createCommandBusObserver(opts: CommandBusOtelOptions): CommandMi
   });
 
   return async (cmd, _ctx, next) => {
+    // Metric attributes must be low-cardinality: every distinct combination
+    // is a separate time series. Per-command ids go on the span only.
+    const metricAttrs: Attributes = { "eventfabric.command_type": cmd.type };
+    if (cmd.metadata.tenantId !== undefined) {
+      metricAttrs["eventfabric.tenant_id"] = cmd.metadata.tenantId;
+    }
     const baseAttrs: Attributes = {
-      "eventfabric.command_type": cmd.type,
+      ...metricAttrs,
       "eventfabric.command_id": cmd.metadata.commandId,
       "eventfabric.idempotency_key": cmd.metadata.idempotencyKey,
     };
-    if (cmd.metadata.tenantId !== undefined) {
-      baseAttrs["eventfabric.tenant_id"] = cmd.metadata.tenantId;
-    }
     if (cmd.metadata.principalId !== undefined) {
       baseAttrs["eventfabric.principal_id"] = cmd.metadata.principalId;
     }
@@ -73,8 +76,8 @@ export function createCommandBusObserver(opts: CommandBusOtelOptions): CommandMi
         const result = await next();
         const durationMs = Date.now() - startedAt;
         span.setStatus({ code: SpanStatusCode.OK });
-        sentCounter?.add(1, { ...baseAttrs, "eventfabric.result": "ok" });
-        durationHistogram?.record(durationMs, { ...baseAttrs, "eventfabric.result": "ok" });
+        sentCounter?.add(1, { ...metricAttrs, "eventfabric.result": "ok" });
+        durationHistogram?.record(durationMs, { ...metricAttrs, "eventfabric.result": "ok" });
         return result;
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
@@ -82,7 +85,7 @@ export function createCommandBusObserver(opts: CommandBusOtelOptions): CommandMi
         span.recordException(error);
         span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
         const resultAttrs: Attributes = {
-          ...baseAttrs,
+          ...metricAttrs,
           "eventfabric.result": error.name,
         };
         sentCounter?.add(1, resultAttrs);

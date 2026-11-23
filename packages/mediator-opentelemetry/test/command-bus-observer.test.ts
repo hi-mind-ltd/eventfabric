@@ -163,6 +163,37 @@ describe("createCommandBusObserver — metrics", () => {
     expect(duration!.dataPointType).toBe(DataPointType.HISTOGRAM);
   });
 
+  it("keeps per-command ids off metric attributes (unbounded cardinality)", async () => {
+    const observer = createCommandBusObserver({
+      tracer: tracerProvider.getTracer("test"),
+      meter: meterProvider.getMeter("test"),
+    });
+    for (const n of [1, 2, 3]) {
+      const cmd: Command = {
+        ...makeCmd({
+          commandId: `c-${n}`,
+          idempotencyKey: `k-${n}`,
+          tenantId: "acme",
+          principalId: `user-${n}`,
+          correlationId: `corr-${n}`,
+        }),
+        type: "CardinalityProbe",
+      };
+      await observer(cmd, makeCtx(cmd), async () => "ok");
+    }
+
+    const metrics = await collectMetrics();
+    const sent = metrics.filter((m) => m.descriptor.name === "eventfabric.command.sent_total").at(-1)!;
+    const points = sent.dataPoints.filter((dp) => dp.attributes["eventfabric.command_type"] === "CardinalityProbe");
+    expect(points).toHaveLength(1);
+    expect(points[0]!.value).toBe(3);
+    expect(points[0]!.attributes).toEqual({
+      "eventfabric.command_type": "CardinalityProbe",
+      "eventfabric.tenant_id": "acme",
+      "eventfabric.result": "ok",
+    });
+  });
+
   it("labels result with the error class name when the handler throws", async () => {
     const observer = createCommandBusObserver({
       tracer: tracerProvider.getTracer("test"),

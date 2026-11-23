@@ -252,8 +252,12 @@ libraries (pg, http, fetch) automatically attach their spans as children.
 
 Metrics emitted when `meter` is set:
 
-- `eventfabric.command.sent_total{command_type, result}` — counter
-- `eventfabric.command.duration_ms{command_type, result}` — histogram
+- `eventfabric.command.sent_total{command_type, tenant_id, result}` — counter
+- `eventfabric.command.duration_ms{command_type, tenant_id, result}` — histogram
+
+(`tenant_id` only when set on the command.) The per-command ids
+(`command_id`, `idempotency_key`, `principal_id`, `correlation_id`) are on
+the span only: as metric labels each command would create a new time series.
 
 `result` is `"ok"` on success or the error's class name on failure
 (`ConcurrentCommandInFlightError`, `NoHandlerRegisteredError`,

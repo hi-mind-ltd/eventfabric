@@ -48,13 +48,18 @@ export function createAsyncRunnerObserver(opts: AsyncRunnerOtelOptions): AsyncRu
     unit: "ms"
   });
 
-  const baseAttrs = (info: AsyncHandlerInfo): Attributes => ({
+  // Metric attributes must be low-cardinality: every distinct combination is
+  // a separate time series. Per-event ids go on the span only.
+  const metricAttrs = (info: AsyncHandlerInfo): Attributes => ({
     "eventfabric.runner": "async",
     "eventfabric.worker_id": info.workerId,
     "eventfabric.projection": info.projection,
     "eventfabric.event_type": info.eventType,
-    "eventfabric.global_position": info.globalPosition.toString(),
     "eventfabric.attempts": info.attempts
+  });
+  const spanAttrs = (info: AsyncHandlerInfo): Attributes => ({
+    ...metricAttrs(info),
+    "eventfabric.global_position": info.globalPosition.toString()
   });
 
   return {
@@ -69,14 +74,14 @@ export function createAsyncRunnerObserver(opts: AsyncRunnerOtelOptions): AsyncRu
     },
 
     onEventHandled(info) {
-      const attrs = baseAttrs(info);
+      const attrs = metricAttrs(info);
       handledCounter?.add(1, attrs);
       handlerDurationHistogram?.record(info.durationMs, attrs);
     },
 
     onEventFailed(info) {
       const attrs = {
-        ...baseAttrs(info),
+        ...metricAttrs(info),
         "eventfabric.error_name": info.error.name
       };
       failedCounter?.add(1, attrs);
@@ -121,7 +126,7 @@ export function createAsyncRunnerObserver(opts: AsyncRunnerOtelOptions): AsyncRu
       // attach their own spans as children of this one.
       return tracer.startActiveSpan(
         `${info.projection}.handle`,
-        { attributes: baseAttrs(info) },
+        { attributes: spanAttrs(info) },
         async (span) => {
           try {
             const result = await handle();
