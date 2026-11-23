@@ -216,7 +216,7 @@ export type ListDlqOptions = {
 | `requeue(dlqId)` | Moves a DLQ item back to the active outbox with `attempts = 0`. The runner will try again. |
 | `requeueByGlobalPosition(pos)` | Same as `requeue`, but looks up the DLQ item by its event's global position. |
 | `requeueRange(from, to)` | Requeues all DLQ items in the given global position range. |
-| `purge(options?)` | Permanently deletes DLQ items. Filterable by topic and age (`olderThan`). |
+| `purge(options?)` | Permanently deletes DLQ items. Filterable by topic and age (`olderThan`). As in `list()`, `topic: null` or no topic means **all topics**: `purge({ topic: null })` deletes the tenant's whole DLQ. |
 
 ## PgOutboxStatsService
 

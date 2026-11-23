@@ -72,6 +72,10 @@ export interface DlqService<TTx extends Transaction = Transaction> {
 
   /**
    * Purges DLQ items, optionally filtered by topic or age.
+   *
+   * As in `list()`, `topic: null` (or omitting it) means **all topics**:
+   * `purge({ topic: null })` deletes the tenant's whole DLQ. Check for null
+   * before passing a topic that comes from a variable.
    * 
    * @param options - Purge options
    * @returns Number of items purged
