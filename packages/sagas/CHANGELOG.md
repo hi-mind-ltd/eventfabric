@@ -1,5 +1,35 @@
 # @eventfabric/sagas
 
+## 0.4.1
+
+### Patch Changes
+
+- 6d1ca13: Fix data-loss and false-alarm bugs found in review.
+
+  - **Outbox:** `ack`, `release`, `releaseWithError` and `deadLetter` take an optional `workerId` and only act while that worker still holds the lease. The async runner passes it, so a handler that outlived `leaseMs` can no longer commit twice (a late ack throws `LeaseLostError` and rolls back) or free another worker's lock. In batch mode a failure is charged only to the row that failed, so one poison row no longer sends its whole batch to the dead-letter queue.
+  - **Saga timers:** new optional `SagaTimerStore.lockClaimed`. The scheduler re-checks each claimed timer at delivery and skips one that was cancelled or re-scheduled after the claim (round result `skipped`, observer hook `onTimerSkipped`, and `result="skipped"` on `eventfabric.saga.timer_fire_total`). `PgSagaTimerStore.markFired` only changes a claimed row, so a timer that re-schedules its own id keeps running.
+  - **Session:** a snapshot written by `saveChangesAsync` now holds the state at the saved version. Before, a direct `append` snapshotted only the events of that save.
+  - **Hash chain:** a process that has not registered a tamper-evident aggregate now extends its chained streams instead of breaking them (or refuses, without `hashChain.secret`). Payloads containing a `Date` no longer fail verification.
+  - **Idempotency:** reusing an idempotency key for a different command type, or for the same type with a different payload, throws `IdempotencyKeyConflictError` instead of returning the other command's result. `@eventfabric/mediator-postgres` adds migration `018_command_request_hash` (a `request_hash` column), applied by `migrate(pool, { extensions: [commandsMigrations] })`.
+
+- 9ce0828: Fix robustness bugs found in review.
+
+  - **Query builder (postgres):** the fluent builder no longer puts column names, operators, sort direction, JSONB keys, `limit` or `offset` into the SQL text unchecked. JSONB keys, `limit` and `offset` are parameters; column names must be plain identifiers; operators and sort direction must come from a fixed set. Invalid input throws.
+  - **Migrations (postgres):** concurrent `migrate()` calls (several app instances starting at once) are serialized with an advisory lock, and `enablePartitioning()` re-checks under the table lock, so a second caller backs off instead of breaking the new partitioned table. New `PgPartitionManager.enablePartitioningOn(client)`.
+  - **Saga loops (sagas):** the timer scheduler and command dispatcher keep running after a round throws (e.g. the database is down). They report via the new `onLoopError` observer hook, back off (`errorBackoff` option), and `stop()` interrupts the sleep. `sagas-opentelemetry` counts `eventfabric.saga.loop_error_total`.
+  - **Failed saves (core, postgres):** `Repository.save()` and `saveChangesAsync()` change the in-memory aggregate only after the commit. A failed save keeps the pending events and old version, so a retry writes them instead of silently returning `null`. New `AggregateRoot.peekPendingEvents()` and `markCommitted()`.
+  - **Backoff (core):** the first retry waits `minMs`, not `minMs * factor`.
+  - **OpenTelemetry:** per-event, per-command and per-instance ids (`global_position`, positions, `command_id`, `idempotency_key`, `principal_id`, `correlation_id`, `saga_instance`, `timer_id`) are no longer metric attributes; they stay on spans. Dashboards that grouped metrics by these labels need updating.
+
+- Updated dependencies [9ce0828]
+- Updated dependencies [6d1ca13]
+- Updated dependencies [9ce0828]
+- Updated dependencies [9ce0828]
+- Updated dependencies [9ce0828]
+- Updated dependencies [9ce0828]
+  - @eventfabric/core@0.4.1
+  - @eventfabric/mediator@0.4.1
+
 ## 0.4.0
 
 ### Minor Changes

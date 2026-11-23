@@ -1,5 +1,49 @@
 # @eventfabric/core
 
+## 0.4.1
+
+### Patch Changes
+
+- 9ce0828: Harden tamper-evidence against a stripped chain and a bad secret.
+
+  - **Strict verification:** `verifyStream` / `verifyAggregate` now fail a stream that has events without an `event_hash`. Before, a stream whose hashes (and `head_hash`) had all been set to NULL verified as ok with `eventsChecked: 0`, and its next append started a fresh chain. The result reports `unprotectedEvents`. For streams that predate tamper-evidence, pass `allowUnprotectedPrefix: true`. A stream whose events were all removed while `stream_versions` still records a version also fails.
+  - **No dismissals in chained streams:** `PgEventStore.dismiss()` throws for an event in a hash-chained stream, and `verifyStream` fails a chained event marked dismissed. The `dismissed_*` columns are outside the hash and a dismissed event is hidden from replay, so a database writer could hide any event undetected.
+  - **Hash format v2 covers `occurred_at`:** `computeEventHash` includes the timestamp when `ChainableEvent.occurredAt` is set. `PgEventStore` writes new chained events in v2, taking `occurred_at` from the application clock (millisecond precision). Events in v1 keep verifying and are counted in `legacyFormatEvents`. Upgrade verifying processes before or together with appending ones: an older release reports v2 events as a mismatch.
+  - **Secret validation:** `toSecret` (used by `PgEventStore` and `PgChainAnchorSealer`) throws on a missing or empty secret. Before, `hashChain: { secret: undefined, enabledAggregates }` silently disabled chaining and an empty string was accepted.
+
+- 6d1ca13: Fix data-loss and false-alarm bugs found in review.
+
+  - **Outbox:** `ack`, `release`, `releaseWithError` and `deadLetter` take an optional `workerId` and only act while that worker still holds the lease. The async runner passes it, so a handler that outlived `leaseMs` can no longer commit twice (a late ack throws `LeaseLostError` and rolls back) or free another worker's lock. In batch mode a failure is charged only to the row that failed, so one poison row no longer sends its whole batch to the dead-letter queue.
+  - **Saga timers:** new optional `SagaTimerStore.lockClaimed`. The scheduler re-checks each claimed timer at delivery and skips one that was cancelled or re-scheduled after the claim (round result `skipped`, observer hook `onTimerSkipped`, and `result="skipped"` on `eventfabric.saga.timer_fire_total`). `PgSagaTimerStore.markFired` only changes a claimed row, so a timer that re-schedules its own id keeps running.
+  - **Session:** a snapshot written by `saveChangesAsync` now holds the state at the saved version. Before, a direct `append` snapshotted only the events of that save.
+  - **Hash chain:** a process that has not registered a tamper-evident aggregate now extends its chained streams instead of breaking them (or refuses, without `hashChain.secret`). Payloads containing a `Date` no longer fail verification.
+  - **Idempotency:** reusing an idempotency key for a different command type, or for the same type with a different payload, throws `IdempotencyKeyConflictError` instead of returning the other command's result. `@eventfabric/mediator-postgres` adds migration `018_command_request_hash` (a `request_hash` column), applied by `migrate(pool, { extensions: [commandsMigrations] })`.
+
+- 9ce0828: Fix lower-priority bugs found in review.
+
+  - **Snapshots (core, postgres):** a save that writes several events and jumps past a multiple of `everyNEvents` now snapshots (it used to snapshot only when the new version was an exact multiple). New `shouldSnapshot(policy, fromVersion, toVersion)` helper.
+  - **Dead-letter reason (postgres):** the reason passed to `deadLetter()` is now stored (migration `019_outbox_dead_letter_reason` adds `outbox_dead_letters.reason`) and returned as `DlqItem.reason`. Run `migrate()` when upgrading.
+  - **Partitioning (postgres):** `enablePartitioning()` places the first boundary above both `MAX(global_position)` and the sequence's current value, so appends don't fail with "no partition" when the sequence is ahead (rolled-back appends, deleted events).
+  - **`loadByGlobalPositions` (postgres):** positions are sent as one array parameter, so very large batches don't exceed Postgres's 65,535-parameter limit.
+  - **Anchor sealer (postgres):** members are inserted with array parameters, so a seal covering more than ~10,900 advanced streams no longer fails every time.
+  - **In-memory idempotency store (mediator):** slots claimed or completed in a transaction that rolls back (including a failed commit) are removed, so a retry runs the handler instead of returning an uncommitted result. New optional `IdempotencyStore.afterCommit` / `afterRollback`, called by the bus.
+
+- 9ce0828: Fix robustness bugs found in review.
+
+  - **Query builder (postgres):** the fluent builder no longer puts column names, operators, sort direction, JSONB keys, `limit` or `offset` into the SQL text unchecked. JSONB keys, `limit` and `offset` are parameters; column names must be plain identifiers; operators and sort direction must come from a fixed set. Invalid input throws.
+  - **Migrations (postgres):** concurrent `migrate()` calls (several app instances starting at once) are serialized with an advisory lock, and `enablePartitioning()` re-checks under the table lock, so a second caller backs off instead of breaking the new partitioned table. New `PgPartitionManager.enablePartitioningOn(client)`.
+  - **Saga loops (sagas):** the timer scheduler and command dispatcher keep running after a round throws (e.g. the database is down). They report via the new `onLoopError` observer hook, back off (`errorBackoff` option), and `stop()` interrupts the sleep. `sagas-opentelemetry` counts `eventfabric.saga.loop_error_total`.
+  - **Failed saves (core, postgres):** `Repository.save()` and `saveChangesAsync()` change the in-memory aggregate only after the commit. A failed save keeps the pending events and old version, so a retry writes them instead of silently returning `null`. New `AggregateRoot.peekPendingEvents()` and `markCommitted()`.
+  - **Backoff (core):** the first retry waits `minMs`, not `minMs * factor`.
+  - **OpenTelemetry:** per-event, per-command and per-instance ids (`global_position`, positions, `command_id`, `idempotency_key`, `principal_id`, `correlation_id`, `saga_instance`, `timer_id`) are no longer metric attributes; they stay on spans. Dashboards that grouped metrics by these labels need updating.
+
+- 9ce0828: `AggregateRoot.raise()` applies the event after a JSON round trip, the shape it is stored and replayed in. Live state now matches the state after a reload (a `Date` in an event becomes its ISO string; `undefined` fields are dropped), and a `bigint` in an event throws at `raise()` with a clear message. Handlers that relied on receiving a `Date` object from a live event must read an ISO string instead (they already had to on reload).
+- 9ce0828: Tighten tenant and caller checks.
+
+  - **Command bus (mediator):** a command whose `metadata.tenantId` would switch the transaction to another tenant is rejected with `UnvalidatedTenantError` unless the bus has a `tenantValidator` or the new `trustTenantMetadata: true`. The bus used to follow the metadata unchecked. Single-tenant setups are not affected. A multi-tenant bus that a saga dispatcher sends to needs one of the two.
+  - **Idempotency (mediator, mediator-postgres):** the principal that first used a key is stored (migration `020_command_principal` adds `command_idempotency.principal_id`). The same key from a different principal throws `IdempotencyKeyConflictError` with `reason: "principal"` instead of returning the first caller's result. Run `migrate()` before the new version handles commands.
+  - **`loadGlobal` (core, postgres):** without `tenantId` it returns the transaction's tenant only. Cross-tenant reads need `allTenants: true`.
+
 ## 0.4.0
 
 ### Minor Changes
