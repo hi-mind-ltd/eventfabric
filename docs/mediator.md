@@ -124,6 +124,14 @@ const bus = new CommandBus({
 });
 ```
 
+The in-memory store keeps its slots outside the transaction, so the bus tells
+it how each transaction ended (the optional `afterCommit(tx)` /
+`afterRollback(tx)` store methods). When a transaction rolls back, even after
+the handler succeeded (a failed commit, an outer middleware throwing), the
+slots it claimed or completed are removed, the same as a database row would
+be. A custom store that keeps slots outside the database should implement
+both methods.
+
 ## Idempotency, in detail
 
 The default is `idempotency: "required"` — every command must carry an

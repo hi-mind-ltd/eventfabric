@@ -173,9 +173,7 @@ export class CommandBus<TTx extends Transaction = Transaction> {
       try {
         const result = await withConcurrencyRetry(
           () =>
-            uow.withTransaction((tx) =>
-              chain(cmd, { tx, metadata: cmd.metadata })
-            ),
+            this.runInTransaction(uow, (tx) => chain(cmd, { tx, metadata: cmd.metadata })),
           this.opts.retryOptions
         );
         return result as TResult;
@@ -190,6 +188,37 @@ export class CommandBus<TTx extends Transaction = Transaction> {
         await new Promise((r) => setTimeout(r, pollIntervalMs));
       }
     }
+  }
+
+  /**
+   * Runs one attempt in a transaction and tells the idempotency store how it
+   * ended, so a store that keeps slots outside the database can follow the
+   * commit or rollback.
+   */
+  private async runInTransaction(
+    uow: UnitOfWork<TTx>,
+    fn: (tx: TTx) => Promise<unknown>
+  ): Promise<unknown> {
+    const store = this.opts.idempotencyStore;
+    let txRef: TTx | undefined;
+    let result: unknown;
+    try {
+      result = await uow.withTransaction((tx) => {
+        txRef = tx;
+        return fn(tx);
+      });
+    } catch (err) {
+      if (txRef !== undefined && store.afterRollback) {
+        try {
+          await store.afterRollback(txRef);
+        } catch {
+          // keep the original error
+        }
+      }
+      throw err;
+    }
+    if (txRef !== undefined) await store.afterCommit?.(txRef);
+    return result;
   }
 }
 

@@ -43,6 +43,22 @@ export interface IdempotencyStore<TTx extends Transaction = Transaction> {
   complete(tx: TTx, params: { key: string; tenantId?: string; result: unknown }): Promise<void>;
 
   release(tx: TTx, params: { key: string; tenantId?: string; error: Error }): Promise<void>;
+
+  /**
+   * Optional. Called by the bus after the command's transaction commits.
+   * Only stores that keep slots outside the database need it.
+   */
+  afterCommit?(tx: TTx): Promise<void> | void;
+
+  /**
+   * Optional. Called by the bus after the command's transaction rolls back
+   * (handler error, commit failure, retry). A database store doesn't need it
+   * (the rollback undoes its rows); a store that keeps slots elsewhere, like
+   * `InMemoryIdempotencyStore`, uses it to undo what that transaction
+   * claimed or completed, so a retry isn't answered from a result that was
+   * never committed.
+   */
+  afterRollback?(tx: TTx): Promise<void> | void;
 }
 
 /**

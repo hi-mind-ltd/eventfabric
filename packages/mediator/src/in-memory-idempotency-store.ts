@@ -12,9 +12,21 @@ type Slot =
  *
  * The map is scoped per-tenant so the same idempotency key in different
  * tenants does not collide.
+ *
+ * Slots live outside any database transaction, so the store follows the
+ * bus's `afterCommit` / `afterRollback` calls: a slot claimed or completed
+ * in a transaction that rolls back is removed, like a database row would be.
  */
 export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
   private readonly slots = new Map<string, Slot>();
+  /** Slot keys claimed or completed in a transaction that hasn't ended yet. */
+  private readonly touched = new WeakMap<object, Set<string>>();
+
+  private touch(tx: Transaction, slotKey: string): void {
+    const set = this.touched.get(tx) ?? new Set<string>();
+    set.add(slotKey);
+    this.touched.set(tx, set);
+  }
 
   private slotKey(tenantId: string | undefined, key: string): string {
     return `${tenantId ?? "default"}::${key}`;
@@ -33,6 +45,7 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
         commandType: params.commandType,
         requestHash: params.requestHash,
       });
+      this.touch(_tx, slotKey);
       return { state: "claimed" };
     }
     if (existing.status === "completed") {
@@ -58,6 +71,7 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
       commandType: prior?.commandType ?? "",
       requestHash: prior?.requestHash,
     });
+    this.touch(_tx, slotKey);
   }
 
   async release(
@@ -66,6 +80,15 @@ export class InMemoryIdempotencyStore implements IdempotencyStore<Transaction> {
   ): Promise<void> {
     const slotKey = this.slotKey(params.tenantId, params.key);
     this.slots.delete(slotKey);
+  }
+
+  afterCommit(tx: Transaction): void {
+    this.touched.delete(tx);
+  }
+
+  afterRollback(tx: Transaction): void {
+    for (const slotKey of this.touched.get(tx) ?? []) this.slots.delete(slotKey);
+    this.touched.delete(tx);
   }
 
   /** Test-only helper: drops all slots. */

@@ -602,4 +602,47 @@ describe("CommandBus.in-flight wait (outside tx)", () => {
     release("go");
     await first;
   });
+it("in-memory store: a commit that fails doesn't leave a completed slot behind", async () => {
+    // The handler and complete() succeed, then the commit itself fails.
+    let failCommit = true;
+    const uow: UnitOfWork<TxToken> = {
+      async withTransaction<T>(fn: (tx: TxToken) => Promise<T>): Promise<T> {
+        const r = await fn({ id: Math.random() });
+        if (failCommit) {
+          failCommit = false;
+          throw new Error("commit failed");
+        }
+        return r;
+      },
+    };
+    const bus = new CommandBus<TxToken>({ uow, idempotencyStore: new InMemoryIdempotencyStore() });
+    const handle = vi.fn(async () => ({ newBalance: 100 }));
+    bus.register({ commandType: "Deposit", handle } as CommandHandler<DepositCommand, { newBalance: number }, TxToken>);
+
+    await expect(bus.send(makeCommand())).rejects.toThrow("commit failed");
+    // The retry must run the handler again, not return the uncommitted result.
+    await expect(bus.send(makeCommand())).resolves.toEqual({ newBalance: 100 });
+    expect(handle).toHaveBeenCalledTimes(2);
+  });
+
+  it("in-memory store: a slot claimed in a rolled-back transaction is freed", async () => {
+    // An outer middleware fails after the idempotency middleware returned.
+    const bus = new CommandBus<TxToken>({ uow: new CountingUnitOfWork(), idempotencyStore: new InMemoryIdempotencyStore() });
+    const handle = vi.fn(async () => ({ newBalance: 100 }));
+    bus.register({ commandType: "Deposit", handle } as CommandHandler<DepositCommand, { newBalance: number }, TxToken>);
+    let failAfter = true;
+    bus.use(async (_cmd, _ctx, next) => {
+      const r = await next();
+      if (failAfter) {
+        failAfter = false;
+        throw new Error("audit write failed");
+      }
+      return r;
+    });
+
+    await expect(bus.send(makeCommand())).rejects.toThrow("audit write failed");
+    await expect(bus.send(makeCommand())).resolves.toEqual({ newBalance: 100 });
+    expect(handle).toHaveBeenCalledTimes(2);
+  });
 });
+
