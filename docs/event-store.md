@@ -232,6 +232,10 @@ Dismissed events are excluded from `loadStream()` and `loadGlobal()` by default.
 The event data remains in the database but is filtered out during reads. Pass
 `includeDismissed: true` to include them.
 
+An event in a [tamper-evident](./tamper-evidence.md) stream can't be dismissed:
+`dismiss()` throws. Hiding an event from replay would defeat the chain, so
+append a correcting event instead.
+
 This is not a hard delete -- the `payload` JSONB column is preserved. If you
 need true erasure, run an `UPDATE` to null out the payload separately.
 

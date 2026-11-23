@@ -5,7 +5,7 @@ import { PgUnitOfWork } from "../src/unitofwork/pg-unit-of-work";
 import { PgEventStore } from "../src/pg-event-store";
 import { SessionFactory } from "../src/session";
 import { migrate } from "../src/pg-migrator";
-import { AggregateRoot, type HandlerMap } from "@eventfabric/core";
+import { AggregateRoot, computeEventHash, streamGenesis, toSecret, type HandlerMap } from "@eventfabric/core";
 import { endPool } from "./helpers/end-pool";
 
 type E = { type: "A"; version: 1; n: number };
@@ -211,7 +211,7 @@ describe("PgEventStore hash chaining", () => {
     expect(result.reason).toMatch(/head_hash mismatch/);
   });
 
-  it("stays valid after a soft dismiss (dismiss does not break the chain)", async () => {
+  it("refuses to dismiss an event in a chained stream", async () => {
     const store = chainedStore();
     const uow = new PgUnitOfWork(pool);
     let ids: string[] = [];
@@ -220,11 +220,110 @@ describe("PgEventStore hash chaining", () => {
       ids = r.appended.map((e) => e.eventId);
     });
 
-    await uow.withTransaction((tx) => store.dismiss(tx, ids[1]!, { reason: "noise", by: "admin" }));
+    await expect(
+      uow.withTransaction((tx) => store.dismiss(tx, ids[1]!, { reason: "noise", by: "admin" }))
+    ).rejects.toThrow(/tamper-evident stream and can't be dismissed/);
 
+    const loaded = await uow.withTransaction((tx) => store.loadStream(tx, { aggregateName: "Audit", aggregateId: "a1" }));
+    expect(loaded).toHaveLength(3);
     const result = await uow.withTransaction((tx) => store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "a1" }));
-    expect(result.ok).toBe(true);
-    expect(result.eventsChecked).toBe(3);
+    expect(result).toMatchObject({ ok: true, eventsChecked: 3 });
+  });
+
+  it("still dismisses events of an unchained aggregate, and unknown ids are a no-op", async () => {
+    const store = chainedStore();
+    const uow = new PgUnitOfWork(pool);
+    let id = "";
+    await uow.withTransaction(async (tx) => {
+      const r = await store.append(tx, { aggregateName: "Plain", aggregateId: "p9", expectedAggregateVersion: 0, events: [ev(1)] });
+      id = r.appended[0]!.eventId;
+    });
+    await uow.withTransaction((tx) => store.dismiss(tx, id, { reason: "noise" }));
+    await uow.withTransaction((tx) => store.dismiss(tx, "00000000-0000-0000-0000-000000000000"));
+
+    const loaded = await uow.withTransaction((tx) => store.loadStream(tx, { aggregateName: "Plain", aggregateId: "p9" }));
+    expect(loaded).toHaveLength(0);
+  });
+
+  it("detects an event dismissed directly in the table (hidden from replay)", async () => {
+    const store = chainedStore();
+    const uow = new PgUnitOfWork(pool);
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "h1", expectedAggregateVersion: 0, events: [ev(1), ev(2), ev(3)] })
+    );
+    await pool.query(`UPDATE eventfabric.events SET dismissed_at = now() WHERE aggregate_id = 'h1' AND aggregate_version = 2`);
+
+    const result = await uow.withTransaction((tx) => store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "h1" }));
+    expect(result).toMatchObject({ ok: false, firstBrokenAt: 2 });
+    expect(result.reason).toMatch(/dismissed/);
+  });
+
+  it("detects a changed occurred_at, down to a microsecond", async () => {
+    const store = chainedStore();
+    const uow = new PgUnitOfWork(pool);
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "t1", expectedAggregateVersion: 0, events: [ev(1), ev(2)] })
+    );
+    const verify = () => uow.withTransaction((tx) => store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "t1" }));
+    expect(await verify()).toMatchObject({ ok: true, eventsChecked: 2, legacyFormatEvents: 0 });
+
+    await pool.query(`UPDATE eventfabric.events SET occurred_at = occurred_at - interval '1 day' WHERE aggregate_id = 't1' AND aggregate_version = 2`);
+    expect(await verify()).toMatchObject({ ok: false, firstBrokenAt: 2 });
+
+    await pool.query(`UPDATE eventfabric.events SET occurred_at = occurred_at + interval '1 day' WHERE aggregate_id = 't1' AND aggregate_version = 2`);
+    expect(await verify()).toMatchObject({ ok: true });
+
+    await pool.query(`UPDATE eventfabric.events SET occurred_at = occurred_at + interval '1 microsecond' WHERE aggregate_id = 't1' AND aggregate_version = 1`);
+    expect(await verify()).toMatchObject({ ok: false, firstBrokenAt: 1 });
+  });
+
+  it("verifies a chain independent of the session time zone", async () => {
+    const store = chainedStore();
+    const uow = new PgUnitOfWork(pool);
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "z1", expectedAggregateVersion: 0, events: [ev(1)] })
+    );
+    const result = await uow.withTransaction(async (tx) => {
+      await tx.client.query(`SET LOCAL TIME ZONE 'Asia/Kolkata'`);
+      return store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "z1" });
+    });
+    expect(result).toMatchObject({ ok: true, eventsChecked: 1 });
+  });
+
+  it("still verifies chains written in format v1, and reports them", async () => {
+    const store = chainedStore();
+    const uow = new PgUnitOfWork(pool);
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "v1", expectedAggregateVersion: 0, events: [ev(1), ev(2)] })
+    );
+    // Rewrite the chain as an earlier release wrote it: no timestamp in the hash.
+    const secret = toSecret(SECRET);
+    const rows = await pool.query(
+      `SELECT event_id, aggregate_version, type, version, payload FROM eventfabric.events WHERE aggregate_id = 'v1' ORDER BY aggregate_version`
+    );
+    let prev = streamGenesis(secret, "default", "Audit", "v1");
+    for (const r of rows.rows) {
+      prev = computeEventHash(secret, prev, {
+        tenantId: "default", aggregateName: "Audit", aggregateId: "v1",
+        aggregateVersion: Number(r.aggregate_version), eventId: r.event_id,
+        type: r.type, version: Number(r.version), payload: r.payload,
+      });
+      await pool.query(`UPDATE eventfabric.events SET event_hash = $1 WHERE event_id = $2`, [prev, r.event_id]);
+    }
+    await pool.query(`UPDATE eventfabric.stream_versions SET head_hash = $1 WHERE aggregate_id = 'v1'`, [prev]);
+
+    const verify = () => uow.withTransaction((tx) => store.verifyStream(tx, { aggregateName: "Audit", aggregateId: "v1" }));
+    expect(await verify()).toMatchObject({ ok: true, eventsChecked: 2, legacyFormatEvents: 2 });
+
+    // New events on top are written in v2.
+    await uow.withTransaction((tx) =>
+      store.append(tx, { aggregateName: "Audit", aggregateId: "v1", expectedAggregateVersion: 2, events: [ev(3)] })
+    );
+    expect(await verify()).toMatchObject({ ok: true, eventsChecked: 3, legacyFormatEvents: 2 });
+
+    // A v1 event's content is still protected.
+    await pool.query(`UPDATE eventfabric.events SET payload = jsonb_set(payload, '{n}', '99') WHERE aggregate_id = 'v1' AND aggregate_version = 1`);
+    expect(await verify()).toMatchObject({ ok: false, firstBrokenAt: 1 });
   });
 
   it("chains across multiple appends to the same stream", async () => {

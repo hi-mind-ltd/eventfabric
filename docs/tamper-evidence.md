@@ -188,9 +188,12 @@ deletion; less frequent = less background work.
 
 ## Operational notes
 
-- **Soft `dismiss()` is safe.** Dismissing an event sets `dismissed_*` columns,
-  which are **not** part of the hash preimage — the chain stays valid and the
-  event remains in the chain. (A hard delete, by contrast, *is* detected.)
+- **A chained event can't be dismissed.** A dismissed event is hidden from
+  aggregate replay, and the `dismissed_*` columns are outside the hash, so a
+  legitimate dismissal would look the same as someone hiding an event by
+  editing the table. `dismiss()` therefore throws for an event in a chained
+  stream, and `verifyStream` fails a chained event that is marked dismissed.
+  To undo something in a tamper-evident stream, append a correcting event.
 - **Enabling mid-stream.** If you turn chaining on for an aggregate that already
   has events, those pre-existing events keep `NULL` `event_hash`; the chain starts
   at the next appended event (genesis). `verifyStream` reports such a stream as
@@ -202,8 +205,20 @@ deletion; less frequent = less background work.
   within `Number.MAX_SAFE_INTEGER` (store larger values as strings). Violations
   throw at write time rather than silently producing an unverifiable chain.
 - **Coverage.** The hash covers identity, in-stream order (`aggregate_version` +
-  the prev-hash link), and payload. It deliberately excludes DB-assigned values
-  (`global_position`, `occurred_at`) so it's computable in one pass before insert.
+  the prev-hash link), payload, correlation and causation ids, and the
+  timestamp (`occurred_at`). It excludes `global_position`, which the database
+  assigns.
+- **Timestamps and hash formats.** Events written by this release use hash
+  format v2, which covers `occurred_at`. To make that possible the store sets a
+  chained event's `occurred_at` from the application clock (millisecond
+  precision) instead of the database's `now()`; unchained events still use
+  `now()`. Events hashed by earlier releases are in format v1: they keep
+  verifying, but their timestamp is not covered. `verifyStream` reports how many
+  it found as `legacyFormatEvents`. The two formats can't be confused or
+  converted without the secret, and a stream may hold both.
+- **Upgrade every process together.** A release that only knows v1 reports v2
+  events as `event_hash mismatch`. Upgrade whatever runs `verifyStream` before,
+  or together with, the processes that append.
 - **Performance.** A protected append does one extra `SELECT … FOR UPDATE` on the
   `stream_versions` row it already gates on, plus a 32-byte HMAC. Unprotected
   aggregates are unaffected. The anchor runs off the write path.
@@ -223,6 +238,11 @@ import { canonicalJson, computeEventHash, streamGenesis, hashesEqual } from "@ev
 `canonicalJson`, `computeEventHash`, `streamGenesis` / `anchorGenesis`,
 `computeAnchorHash`, `hashesEqual`, `toSecret`, and the `ChainableEvent` /
 `AnchorMember` types are all exported.
+
+`computeEventHash` picks the format from the event you pass: with `occurredAt`
+(the timestamp as `Date.toISOString()` gives it) it computes v2, without it v1.
+A custom verifier should try v2 first and fall back to v1, as `verifyStream`
+does.
 
 ## Schema
 

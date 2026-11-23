@@ -17,6 +17,12 @@ export type ChainVerificationResult = {
    * them. Non-zero makes `ok` false unless `allowUnprotectedPrefix` was set.
    */
   unprotectedEvents?: number;
+  /**
+   * Checked events hashed in format v1, which does not cover `occurred_at`:
+   * their content is verified, their timestamp is not. Events written since
+   * format v2 was introduced are not counted here.
+   */
+  legacyFormatEvents?: number;
 };
 
 export type VerifyStreamOptions = {

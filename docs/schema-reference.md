@@ -97,7 +97,7 @@ The append-only event log. Every domain event ever recorded lives here.
 | `type`              | `TEXT`        | NOT NULL | --        | The event type discriminator (e.g. `"AccountDeposited"`). Matches `payload.type`. |
 | `version`           | `INT`         | NOT NULL | --        | The event schema version (e.g. `1`). Matches `payload.version`. Stored as a top-level column for efficient filtering. |
 | `payload`           | `JSONB`       | NOT NULL | --        | The full event object serialized as JSON. Contains `type`, `version`, and all domain-specific fields. |
-| `occurred_at`       | `TIMESTAMPTZ` | NOT NULL | `now()`   | Timestamp of when the event was appended. Set by the database, not the application. |
+| `occurred_at`       | `TIMESTAMPTZ` | NOT NULL | `now()`   | Timestamp of when the event was appended. Set by the database, except for hash-chained events, where the store sets it from the application clock so the hash can cover it. |
 | `dismissed_at`      | `TIMESTAMPTZ` | NULL     | `NULL`    | If non-null, the event has been soft-deleted. Set by `PgEventStore.dismiss()`. |
 | `dismissed_reason`  | `TEXT`        | NULL     | `NULL`    | Optional human-readable reason for dismissal (e.g. `"GDPR erasure"`). |
 | `dismissed_by`      | `TEXT`        | NULL     | `NULL`    | Optional identifier of the actor who dismissed the event. |
