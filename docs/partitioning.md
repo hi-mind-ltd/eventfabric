@@ -148,6 +148,8 @@ steps atomically:
 6. Reassigns the `BIGSERIAL` sequence to the new parent table
 
 The operation is **idempotent** — calling it again after conversion is a no-op.
+It is also safe to call from several processes at once: each re-checks under the
+table lock, so only the first converts the table and the others return.
 
 **Downtime**: The lock duration depends on the number of existing rows, because
 PostgreSQL validates that all rows in `events_p0` fall within the partition
@@ -271,6 +273,8 @@ const manager = new PgPartitionManager(
 
 // One-time conversion to partitioned table
 await manager.enablePartitioning(pool, { partitionSize?: bigint });
+// Same, on a connection you already hold (not inside a transaction)
+await manager.enablePartitioningOn(client, { partitionSize?: bigint });
 
 // Create a new partition for a global_position range
 await manager.createPartition(pool, from: bigint, to: bigint): string;

@@ -38,7 +38,10 @@ pnpm build
 
 Call `migrate()` on app startup. It creates all tables, indexes, and the
 `eventfabric` schema automatically. Already-applied migrations are skipped,
-so it's safe to run every time.
+so it's safe to run every time. When several instances start at once, a
+Postgres advisory lock makes them take turns: the first applies the
+migrations, the others wait and then find nothing left to do. `migrate()`
+holds one connection from the pool while it runs.
 
 ```typescript
 import { Pool } from "pg";

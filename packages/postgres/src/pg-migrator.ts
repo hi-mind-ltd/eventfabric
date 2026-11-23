@@ -1,7 +1,7 @@
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { join, dirname } from "path";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { PgPartitionManager } from "./partitioning/pg-partition-manager";
 
 const MIGRATIONS_DIR = join(
@@ -86,6 +86,32 @@ export type MigrateResult = {
  * disabled once enabled.
  */
 export async function migrate(pool: Pool, opts?: MigrateOptions): Promise<MigrateResult> {
+  // Every instance of an app typically calls migrate() on startup. Serialize
+  // them with a session advisory lock held on one connection, and do all the
+  // work on that connection: a second caller waits, then sees the first
+  // caller's rows in schema_migrations and skips them.
+  const client = await pool.connect();
+  let broken: Error | undefined;
+  try {
+    await client.query(`SELECT pg_advisory_lock($1::bigint)`, [MIGRATION_LOCK_KEY]);
+    try {
+      return await migrateLocked(client, opts);
+    } finally {
+      await client.query(`SELECT pg_advisory_unlock($1::bigint)`, [MIGRATION_LOCK_KEY]).catch((err) => {
+        broken = err instanceof Error ? err : new Error(String(err));
+      });
+    }
+  } finally {
+    // If the unlock failed, destroy the connection so the lock dies with it
+    // instead of going back into the pool still held.
+    client.release(broken);
+  }
+}
+
+/** Advisory lock key for migrate(): the ASCII bytes of "EFmigrat". */
+const MIGRATION_LOCK_KEY = "4991797536461316468";
+
+async function migrateLocked(pool: PoolClient, opts?: MigrateOptions): Promise<MigrateResult> {
   const observer = opts?.observer;
 
   await pool.query(`CREATE SCHEMA IF NOT EXISTS eventfabric`);
@@ -130,7 +156,7 @@ export async function migrate(pool: Pool, opts?: MigrateOptions): Promise<Migrat
     const manager = new PgPartitionManager();
     const partitionSize = opts.partitioning.partitionSize ?? 1_000_000n;
     const start = Date.now();
-    await manager.enablePartitioning(pool, { partitionSize });
+    await manager.enablePartitioningOn(pool, { partitionSize });
     observer?.onPartitioningEnabled?.({ partitionSize, durationMs: Date.now() - start });
   }
 
@@ -141,7 +167,7 @@ export async function migrate(pool: Pool, opts?: MigrateOptions): Promise<Migrat
 }
 
 async function applyMigration(
-  pool: Pool,
+  pool: PoolClient,
   name: string,
   dir: string,
   source: string,
