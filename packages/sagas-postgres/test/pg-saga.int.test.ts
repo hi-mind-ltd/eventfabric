@@ -302,6 +302,54 @@ describe("PgSagaStateStore + sagaAsAsyncProjection", () => {
     ]);
   });
 
+  it("cleanupTerminal({ mode: 'tombstone' }) keeps a stateless row, so a replayed start event doesn't restart the saga", async () => {
+    const stateStore = new PgSagaStateStore<CounterState>();
+    const stores = {
+      stateStore,
+      commandQueue: new InMemorySagaCommandQueue(),
+      timerStore: new InMemorySagaTimerStore(),
+    };
+    const projection = sagaAsAsyncProjection(counterSaga, stores);
+    const uow = new PgUnitOfWork(pool);
+    const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+
+    await uow.withTransaction((tx: PgTx) =>
+      stateStore.insert(tx, {
+        tenantId: "default", sagaName: "Counter", instanceId: "done-1",
+        state: { count: 5 }, stateVersion: 5, status: "failed",
+        schemaVersion: 1, lastEventPos: 5n, createdAt: old, updatedAt: old,
+      })
+    );
+
+    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const n = await uow.withTransaction((tx: PgTx) =>
+      stateStore.cleanupTerminal(tx, { olderThan: cutoff, mode: "tombstone" })
+    );
+    expect(n).toBe(1);
+    // A second run doesn't count the tombstone again.
+    expect(await uow.withTransaction((tx: PgTx) =>
+      stateStore.cleanupTerminal(tx, { olderThan: cutoff, mode: "tombstone" })
+    )).toBe(0);
+
+    const row = await pool.query(
+      `SELECT state, status FROM eventfabric.saga_instances WHERE instance_id = 'done-1'`
+    );
+    expect(row.rows[0]).toEqual({ state: null, status: "failed" });
+
+    // Replaying the starting event (projection rebuild) must not create a new instance.
+    pos = 100n;
+    await uow.withTransaction((tx: PgTx) => projection.handle(tx, env("done-1")));
+    const after = await pool.query(
+      `SELECT state, status FROM eventfabric.saga_instances WHERE instance_id = 'done-1'`
+    );
+    expect(after.rows[0]).toEqual({ state: null, status: "failed" });
+
+    // And a tombstone can't be reactivated.
+    expect(await uow.withTransaction((tx: PgTx) =>
+      stateStore.reactivate(tx, { sagaName: "Counter", instanceId: "done-1", tenantId: "default" })
+    )).toBe(false);
+  });
+
   it("cleanupTerminal() respects the statuses filter when given", async () => {
     const stateStore = new PgSagaStateStore<CounterState>();
     const uow = new PgUnitOfWork(pool);

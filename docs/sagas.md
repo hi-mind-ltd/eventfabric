@@ -522,7 +522,7 @@ alongside the existing watchdogs.
 
 | Method | Removes | Typical cadence |
 |---|---|---|
-| `PgSagaStateStore.cleanupTerminal({ olderThan, statuses? })` | Saga instances with `status IN ('completed','failed')` past the cutoff | Daily |
+| `PgSagaStateStore.cleanupTerminal({ olderThan, statuses?, mode? })` | Saga instances with `status IN ('completed','failed')` past the cutoff | Daily |
 | `PgSagaCommandQueue.cleanupFailed({ olderThan })` | Rows with `status='failed'` past the cutoff (dispatched commands are already ack-deleted) | Daily |
 | `PgSagaTimerStore.cleanupTerminal({ olderThan, statuses? })` | Timers with `status IN ('fired','cancelled')` past the cutoff | Daily |
 
@@ -530,6 +530,15 @@ Each method takes an optional `tenantId` to scope to a single tenant.
 The `statuses` filter on the state and timer cleanups lets you keep
 `failed` instances or `cancelled` timers around longer for triage
 while still pruning the bulk of the table.
+
+**Rebuilding after cleanup.** Deleting a finished saga's row forgets that it
+ran. If its starting event is delivered again later (you reset or rebuild
+the projection that feeds the saga), the saga starts over and sends its
+commands again. If you ever do that, pass `mode: "tombstone"` to
+`PgSagaStateStore.cleanupTerminal`: it clears the state (to JSON `null`)
+but keeps a small row with the ids and terminal status, so the replayed
+event finds a finished instance and is skipped. Tombstones can't be
+reactivated.
 
 ```ts
 import { Pool } from "pg";

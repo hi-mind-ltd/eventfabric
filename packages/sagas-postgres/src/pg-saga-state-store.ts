@@ -132,7 +132,16 @@ export class PgSagaStateStore<TState> implements SagaStateStore<TState, PgTx> {
    *
    * `statuses` defaults to both terminal statuses; pass a narrower set
    * (e.g. `["completed"]`) if you want to keep `failed` rows around
-   * longer for triage. Returns the number of rows deleted.
+   * longer for triage. Returns the number of rows deleted (or tombstoned).
+   *
+   * `mode`:
+   * - `"delete"` (default): removes the rows. If a deleted saga's starting
+   *   event is delivered again later (a projection reset or rebuild), the
+   *   saga starts over and sends its commands again.
+   * - `"tombstone"`: clears the state (to JSON `null`) but keeps the row's
+   *   ids and terminal status, so a replayed event finds a finished instance
+   *   and is skipped. Use it if you ever reset or rebuild the projection
+   *   that feeds your sagas. Tombstones can't be reactivated.
    */
   async cleanupTerminal(
     tx: PgTx,
@@ -140,26 +149,22 @@ export class PgSagaStateStore<TState> implements SagaStateStore<TState, PgTx> {
       olderThan: Date;
       tenantId?: string;
       statuses?: readonly ("completed" | "failed")[];
+      mode?: "delete" | "tombstone";
     }
   ): Promise<number> {
     const statuses = params.statuses ?? ["completed", "failed"];
     if (statuses.length === 0) return 0;
+    const values: unknown[] = [[...statuses], params.olderThan.toISOString()];
+    let where = `status = ANY($1::text[]) AND updated_at < $2::timestamptz`;
     if (params.tenantId !== undefined) {
-      const res = await tx.client.query(
-        `DELETE FROM ${this.tableName}
-          WHERE status = ANY($1::text[])
-            AND updated_at < $2::timestamptz
-            AND tenant_id = $3`,
-        [[...statuses], params.olderThan.toISOString(), params.tenantId]
-      );
-      return res.rowCount ?? 0;
+      values.push(params.tenantId);
+      where += ` AND tenant_id = $3`;
     }
-    const res = await tx.client.query(
-      `DELETE FROM ${this.tableName}
-        WHERE status = ANY($1::text[])
-          AND updated_at < $2::timestamptz`,
-      [[...statuses], params.olderThan.toISOString()]
-    );
+    const sql =
+      params.mode === "tombstone"
+        ? `UPDATE ${this.tableName} SET state = 'null'::jsonb WHERE ${where} AND state <> 'null'::jsonb`
+        : `DELETE FROM ${this.tableName} WHERE ${where}`;
+    const res = await tx.client.query(sql, values);
     return res.rowCount ?? 0;
   }
 
@@ -185,7 +190,8 @@ export class PgSagaStateStore<TState> implements SagaStateStore<TState, PgTx> {
         WHERE tenant_id = $1
           AND saga_name = $2
           AND instance_id = $3
-          AND status = 'failed'`,
+          AND status = 'failed'
+          AND state <> 'null'::jsonb`,
       [params.tenantId, params.sagaName, params.instanceId]
     );
     return (res.rowCount ?? 0) > 0;
