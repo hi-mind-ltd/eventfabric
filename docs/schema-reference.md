@@ -31,6 +31,7 @@ Run this before any migration. Migration `001_init.sql` includes this statement.
 | `009_per_tenant_projection_checkpoints.sql` | Replaces `projection_checkpoints.last_global_position` with per-tenant checkpoint rows |
 | `015_event_hash_chain.sql`      | Tamper-evidence (opt-in per aggregate): adds `events.event_hash`, `stream_versions.head_hash`, and the `event_chain_anchors` + `event_chain_anchor_members` tables. Dormant unless a `hashChain.secret` is configured. See [Tamper Evidence](./tamper-evidence.md). |
 | `016_projection_dead_letters.sql` | `eventfabric.projection_dead_letters` table: events the `ProjectionDaemon` gave up on after `maxAttempts` |
+| `019_outbox_dead_letter_reason.sql` | Adds `reason` to `eventfabric.outbox_dead_letters` |
 
 ### Mediator extension (shipped by `@eventfabric/mediator-postgres`)
 
@@ -339,6 +340,7 @@ trail for failed processing.
 | `topic`             | `TEXT`        | NULL     | `NULL`   | The topic of the original outbox row.                           |
 | `attempts`          | `INT`         | NOT NULL | --       | Number of processing attempts before dead-lettering.            |
 | `last_error`        | `TEXT`        | NULL     | `NULL`   | The error message from the final failed attempt.                |
+| `reason`            | `TEXT`        | NULL     | `NULL`   | Why the runner dead-lettered it (e.g. max attempts, event not found). Added by migration 019; NULL for older rows. |
 | `dead_lettered_at`  | `TIMESTAMPTZ` | NOT NULL | `now()`  | Timestamp when the message was dead-lettered.                   |
 
 ### Constraints

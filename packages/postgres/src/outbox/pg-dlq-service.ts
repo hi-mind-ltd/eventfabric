@@ -28,7 +28,7 @@ export class PgDlqService implements DlqService {
       );
 
       const res = await tx.client.query(
-        `SELECT id, outbox_id, global_position, topic, attempts, last_error, dead_lettered_at
+        `SELECT id, outbox_id, global_position, topic, attempts, last_error, reason, dead_lettered_at
          FROM ${this.dlqTable}
          WHERE ${where}
          ORDER BY dead_lettered_at DESC
@@ -45,6 +45,7 @@ export class PgDlqService implements DlqService {
           topic: r.topic ?? null,
           attempts: Number(r.attempts),
           lastError: r.last_error ?? null,
+          reason: r.reason ?? null,
           deadLetteredAt: new Date(r.dead_lettered_at).toISOString()
         }))
       };
@@ -54,7 +55,7 @@ export class PgDlqService implements DlqService {
   async get(dlqId: DlqItem["id"]): Promise<DlqItem | null> {
     return this.uow.withTransaction(async (tx) => {
       const res = await tx.client.query(
-        `SELECT id, outbox_id, global_position, topic, attempts, last_error, dead_lettered_at
+        `SELECT id, outbox_id, global_position, topic, attempts, last_error, reason, dead_lettered_at
          FROM ${this.dlqTable}
          WHERE tenant_id = $1 AND id = $2`,
         [tx.tenantId, dlqId]
@@ -68,6 +69,7 @@ export class PgDlqService implements DlqService {
         topic: r.topic ?? null,
         attempts: Number(r.attempts),
         lastError: r.last_error ?? null,
+        reason: r.reason ?? null,
         deadLetteredAt: new Date(r.dead_lettered_at).toISOString()
       };
     });

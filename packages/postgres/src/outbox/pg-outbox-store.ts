@@ -106,7 +106,7 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
     );
   }
 
-  async deadLetter(tx: PgTx, row: OutboxRow, _reason: string, workerId?: string): Promise<void> {
+  async deadLetter(tx: PgTx, row: OutboxRow, reason: string, workerId?: string): Promise<void> {
     // Delete first so the lease check and the removal are one statement, then
     // copy the deleted row's details into the DLQ.
     const del = await tx.client.query(
@@ -121,9 +121,9 @@ export class PgOutboxStore implements OutboxStore<PgTx> {
     }
     const r = del.rows[0];
     await tx.client.query(
-      `INSERT INTO ${this.dlqTable} (tenant_id, outbox_id, global_position, topic, attempts, last_error, dead_lettered_at)
-       VALUES ($1, $2, $3, $4, $5, $6, now())`,
-      [r.tenant_id, r.id, r.global_position, r.topic, r.attempts, r.last_error]
+      `INSERT INTO ${this.dlqTable} (tenant_id, outbox_id, global_position, topic, attempts, last_error, reason, dead_lettered_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now())`,
+      [r.tenant_id, r.id, r.global_position, r.topic, r.attempts, r.last_error, reason]
     );
   }
 }

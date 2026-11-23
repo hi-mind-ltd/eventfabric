@@ -41,6 +41,7 @@ describe("migrate() — fresh database", () => {
       "009_per_tenant_projection_checkpoints",
       "015_event_hash_chain",
       "016_projection_dead_letters",
+      "019_outbox_dead_letter_reason",
     ]);
     expect(result.partitioned).toBe(false);
   });
@@ -156,6 +157,7 @@ describe("migrate() — partitioning from scratch", () => {
       "009_per_tenant_projection_checkpoints",
       "015_event_hash_chain",
       "016_projection_dead_letters",
+      "019_outbox_dead_letter_reason",
       "007_partitioning",
     ]);
     expect(result.partitioned).toBe(true);
@@ -480,6 +482,7 @@ describe("migrate() — concurrent callers", () => {
         "009_per_tenant_projection_checkpoints",
         "015_event_hash_chain",
         "016_projection_dead_letters",
+        "019_outbox_dead_letter_reason",
         "007_partitioning",
       ])
     );

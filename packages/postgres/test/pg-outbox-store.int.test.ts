@@ -419,6 +419,7 @@ describe("PgOutboxStore", () => {
       expect(dlqCheck.rows[0].topic).toBe("user");
       expect(dlqCheck.rows[0].attempts).toBe(3);
       expect(dlqCheck.rows[0].last_error).toBe("Previous error");
+      expect(dlqCheck.rows[0].reason).toBe("Max attempts exceeded");
       expect(dlqCheck.rows[0].dead_lettered_at).not.toBeNull();
     });
 

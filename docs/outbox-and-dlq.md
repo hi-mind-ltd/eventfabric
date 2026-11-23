@@ -192,6 +192,7 @@ export type DlqItem = {
   topic: string | null;
   attempts: number;
   lastError: string | null;
+  reason?: string | null;   // why it was dead-lettered (migration 019)
   deadLetteredAt: string;
 };
 ```

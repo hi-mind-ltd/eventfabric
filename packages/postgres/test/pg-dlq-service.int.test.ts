@@ -77,8 +77,8 @@ describe("PgDlqService", () => {
     const service = new PgDlqService(pool);
 
     const insertResult = await pool.query(`
-      INSERT INTO eventfabric.outbox_dead_letters (outbox_id, global_position, topic, attempts, last_error, dead_lettered_at)
-      VALUES (10, 1000, 'test', 7, 'Test error', now())
+      INSERT INTO eventfabric.outbox_dead_letters (outbox_id, global_position, topic, attempts, last_error, reason, dead_lettered_at)
+      VALUES (10, 1000, 'test', 7, 'Test error', 'max attempts', now())
       RETURNING id
     `);
     const dlqId = Number(insertResult.rows[0].id);
@@ -91,6 +91,7 @@ describe("PgDlqService", () => {
     expect(item!.topic).toBe("test");
     expect(item!.attempts).toBe(7);
     expect(item!.lastError).toBe("Test error");
+    expect(item!.reason).toBe("max attempts");
     expect(item!.deadLetteredAt).toBeTruthy();
 
     const notFound = await service.get(99999);

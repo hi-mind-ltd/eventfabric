@@ -10,6 +10,8 @@ export type DlqItem = {
   topic: string | null;
   attempts: number;
   lastError: string | null;
+  /** Why it was dead-lettered, as passed to `deadLetter()`. Null for rows written before migration 019. */
+  reason?: string | null;
   deadLetteredAt: string;
 };
 
