@@ -65,7 +65,7 @@ maintenance-jobs table above.)
 
 | Job | Frequency | Purpose |
 |---|---|---|
-| `PgSagaStateStore.cleanupTerminal({ olderThan, statuses? })` | daily | Delete saga instances with `status IN ('completed','failed')` past the cutoff. `statuses` defaults to both — pass `["completed"]` to keep `failed` rows around longer for triage. |
+| `PgSagaStateStore.cleanupTerminal({ olderThan, statuses?, mode? })` | daily | Delete saga instances with `status IN ('completed','failed')` past the cutoff. `statuses` defaults to both — pass `["completed"]` to keep `failed` rows around longer for triage. If you ever reset or rebuild the projection that feeds your sagas, pass `mode: "tombstone"`: deleted sagas would otherwise restart when their starting event is replayed. |
 | `PgSagaCommandQueue.cleanupFailed({ olderThan })` | daily | Delete `status='failed'` rows past the cutoff. Successful dispatches are already ack-deleted. |
 | `PgSagaTimerStore.cleanupTerminal({ olderThan, statuses? })` | daily | Delete timers with `status IN ('fired','cancelled')` past the cutoff. `statuses` defaults to both — pass `["fired"]` to keep cancelled timers for "why didn't this fire?" triage. |
 

@@ -392,6 +392,7 @@ commits late is waited for rather than skipped.
 ### Guides
 
 - [Getting Started](docs/getting-started.md) — installation, database setup, first aggregate
+- [Upgrading](docs/upgrading.md) — migrations to run and behaviour changes per release
 - [Core Concepts](docs/core-concepts.md) — event sourcing fundamentals, CQRS, how EventFabric maps to them
 - [Multi-Tenancy](packages/postgres/docs/multi-tenancy.md) — conjoined (shared database) or per-database isolation
 
