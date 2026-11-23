@@ -2,7 +2,7 @@ import type { AnyEvent, EventStore, EventEnvelope, Transaction, UnitOfWork } fro
 import type { AggregateRoot } from "./aggregates/aggregate-root";
 import type { InlineProjector } from "./projections/inline-projector";
 import type { SnapshotStore } from "./snapshots/snapshot-store";
-import type { SnapshotPolicy } from "./snapshots/snapshot-policy";
+import { shouldSnapshot as shouldSnapshotAt, type SnapshotPolicy } from "./snapshots/snapshot-policy";
 import type { AsyncProcessorConfig } from "./projections/async-processor-config";
 
 export class Repository<
@@ -87,7 +87,7 @@ export class Repository<
       const shouldSnapshot =
         !!this.opts.snapshotStore &&
         (params?.forceSnapshot ||
-          (policy.everyNEvents > 0 && nextVersion % policy.everyNEvents === 0));
+          shouldSnapshotAt(policy, agg.version, nextVersion));
 
       if (shouldSnapshot && this.opts.snapshotStore) {
         await this.opts.snapshotStore.save(tx, {

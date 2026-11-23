@@ -114,11 +114,13 @@ a snapshot after appending events:
 export type SnapshotPolicy = { everyNEvents: number };
 ```
 
-When `aggregateVersion % everyNEvents === 0`, the session saves a snapshot
-inside the same transaction as the event append.
+When a save reaches or passes a multiple of `everyNEvents`, the session saves a
+snapshot at the new version, inside the same transaction as the event append.
 
-Example: with `{ everyNEvents: 50 }`, snapshots are taken at versions 50, 100,
-150, and so on.
+Example: with `{ everyNEvents: 50 }`, a save that ends at version 50 snapshots
+at 50, and a save that writes versions 48–52 in one go snapshots at 52. So
+there is a snapshot at least once every 50 events. `shouldSnapshot(policy,
+fromVersion, toVersion)` from `@eventfabric/core` is the same check.
 
 ### Choosing a policy value
 
@@ -260,7 +262,7 @@ const account = await session.loadAggregateAsync<AccountAggregate>("acc-1");
 // If a snapshot exists at version 100, only events 101+ are replayed.
 account.deposit(250);
 await session.saveChangesAsync();
-// If the new version is a multiple of 50, a snapshot is saved automatically.
+// If this save reaches or passes a multiple of 50, a snapshot is saved automatically.
 ```
 
 ## Related documentation

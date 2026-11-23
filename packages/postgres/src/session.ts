@@ -1,6 +1,7 @@
 import type { AnyEvent, EventEnvelope } from "@eventfabric/core";
 import type { AggregateRoot } from "@eventfabric/core";
 import type { InlineProjector } from "@eventfabric/core";
+import { shouldSnapshot as shouldSnapshotAt } from "@eventfabric/core";
 import type { PgTx } from "./unitofwork/pg-transaction";
 import { PgEventStore } from "./pg-event-store";
 import { PgUnitOfWork } from "./unitofwork/pg-unit-of-work";
@@ -680,7 +681,12 @@ export class Session<E extends AnyEvent> {
         const snapshotSchemaVersion = this.config.snapshotSchemaVersionRegistry.get(aggregateName) ?? 1;
 
         if (snapshotStore && snapshotPolicy && snapshotPolicy.everyNEvents > 0) {
-          const shouldSnapshot = newVersion % snapshotPolicy.everyNEvents === 0;
+          // The version before this save: one below the lowest version written.
+          const written = aggregateEvents.get(aggregateId) ?? [];
+          const fromVersion = written.length
+            ? Math.min(...written.map((e) => Number(e.aggregateVersion))) - 1
+            : newVersion;
+          const shouldSnapshot = shouldSnapshotAt(snapshotPolicy, fromVersion, newVersion);
           
           if (shouldSnapshot) {
             // The snapshot must hold the state AT newVersion. A tracked

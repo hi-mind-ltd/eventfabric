@@ -187,6 +187,28 @@ describe("Repository with Snapshot", () => {
     expect(snapshot!.state.count).toBe(5);
   });
 
+  it("snapshots when a multi-event save jumps past a multiple of everyNEvents", async () => {
+    const snapshotStore = new MemSnapshotStore();
+    const repo = new Repository<Counter, S, E, MemTx>(
+      "Counter",
+      new MemUow(),
+      new MemStore(),
+      (id, snap) => new Counter(id, snap),
+      { snapshotStore, snapshotPolicy: { everyNEvents: 5 } }
+    );
+
+    const c = await repo.load("jump");
+    for (let i = 0; i < 4; i++) c.inc(1);
+    await repo.save(c); // 0 → 4: no snapshot
+    expect(await snapshotStore.load(new MemTx(), "Counter", "jump")).toBeNull();
+
+    for (let i = 0; i < 3; i++) c.inc(1);
+    await repo.save(c); // 4 → 7: passes 5
+    const snapshot = await snapshotStore.load(new MemTx(), "Counter", "jump");
+    expect(snapshot!.aggregateVersion).toBe(7);
+    expect(snapshot!.state.count).toBe(7);
+  });
+
   it("does not create snapshot when policy is 0", async () => {
     const snapshotStore = new MemSnapshotStore();
     const repo = new Repository<Counter, S, E, MemTx>(

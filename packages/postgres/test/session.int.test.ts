@@ -1096,6 +1096,32 @@ describe("Session", () => {
     expect(snap.rows[0].state).toEqual({ customerId: "cust-d", balance: 200, currency: "USD" });
   }, 15000);
 
+  it("snapshots when a multi-event save jumps past a multiple of everyNEvents", async () => {
+    const store = new PgEventStore<TestEvent>();
+    const snapshotStore = new PgSnapshotStore<AccountState>();
+    const factory = new SessionFactory(pool, store);
+    factory.registerAggregate(AccountAggregate, ["AccountOpened", "AccountDeposited"], "account", {
+      snapshotStore, snapshotPolicy: { everyNEvents: 2 }, snapshotSchemaVersion: 1
+    });
+    const accountId = "acc-snap-jump";
+    const s1 = factory.createSession();
+    s1.startStream(accountId, { type: "AccountOpened", version: 1, accountId, customerId: "cust-j", initialBalance: 100, currency: "USD" });
+    await s1.saveChangesAsync(); // version 1: no snapshot
+
+    const s2 = factory.createSession();
+    const account = await s2.loadAggregateAsync<AccountAggregate>(accountId);
+    account.deposit(10);
+    account.deposit(10);
+    await s2.saveChangesAsync(); // 1 → 3: passes 2
+
+    const snap = await pool.query(
+      `SELECT aggregate_version, state FROM eventfabric.snapshots WHERE aggregate_name = 'Account' AND aggregate_id = $1`,
+      [accountId]
+    );
+    expect(snap.rows[0]?.aggregate_version).toBe(3);
+    expect(snap.rows[0]?.state.balance).toBe(120);
+  }, 15000);
+
   it("snapshot of a loaded aggregate includes events appended directly in the same session", async () => {
     const store = new PgEventStore<TestEvent>();
     const snapshotStore = new PgSnapshotStore<AccountState>();
